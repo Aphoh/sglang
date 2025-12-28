@@ -264,11 +264,28 @@ class SchedulerMigrationMixin:
 
         # Store num_tokens for later when we call init() and send()
         # We need to wait for the receiver to connect first (status = WaitingForInput)
-        req.migration_num_tokens = len(req.fill_ids)
+        # IMPORTANT: fill_ids is stale from initial prefill transfer, so we must compute
+        # the actual token count from origin_input_ids + output_ids
+        actual_computed_tokens = len(req.origin_input_ids) + len(req.output_ids)
+        req.migration_num_tokens = actual_computed_tokens
         req.migration_kv_sent = False
         
         # #region agent log
-        open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "migration.py:_setup_migration_sender", "message": "Migration sender created, waiting for receiver", "data": {"rid": req.rid, "num_fill_ids": req.migration_num_tokens}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "K"}) + "\n")
+        open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({
+            "location": "migration.py:_setup_migration_sender", 
+            "message": "Migration sender created, waiting for receiver", 
+            "data": {
+                "rid": req.rid, 
+                "stale_fill_ids_len": len(req.fill_ids),
+                "origin_input_ids_len": len(req.origin_input_ids),
+                "output_ids_len": len(req.output_ids),
+                "actual_computed_tokens": actual_computed_tokens,
+                "migration_num_tokens": req.migration_num_tokens,
+            }, 
+            "timestamp": __import__("time").time() * 1000, 
+            "sessionId": "debug-session", 
+            "hypothesisId": "K"
+        }) + "\n")
         # #endregion
 
     def _send_migration_kv(self: "Scheduler", req: Req) -> None:
@@ -277,9 +294,23 @@ class SchedulerMigrationMixin:
         Args:
             req: The request whose KV cache to send.
         """
+        # Use migration_num_tokens which was computed from origin_input_ids + output_ids
+        # fill_ids is stale from initial prefill transfer and doesn't reflect generated tokens
+        num_tokens_to_send = req.migration_num_tokens
+        
+        # Verify we're not trying to send more than what's allocated
+        # The last generated token doesn't have KV yet, so we may need to adjust
+        if hasattr(req, 'kv_allocated_len') and num_tokens_to_send > req.kv_allocated_len:
+            # Clamp to what's actually allocated
+            num_tokens_to_send = req.kv_allocated_len
+        
+        # Update fill_ids to reflect actual computed tokens before sending
+        # This ensures the request metadata is consistent for the receiver
+        req.fill_ids = list(req.origin_input_ids) + list(req.output_ids)
+        
         # Get the KV indices for this request
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(req.fill_ids)
+            req.req_pool_idx, :num_tokens_to_send
         ]
         
         # Convert to page indices (same as prefill does)
@@ -303,6 +334,9 @@ class SchedulerMigrationMixin:
             "message": "Sending migration KV with metadata", 
             "data": {
                 "rid": req.rid, 
+                "num_tokens_to_send": num_tokens_to_send,
+                "migration_num_tokens": req.migration_num_tokens,
+                "kv_allocated_len": getattr(req, 'kv_allocated_len', 'N/A'),
                 "num_kv_indices": len(kv_indices), 
                 "num_page_indices": len(page_indices), 
                 "page_size": page_size, 
@@ -310,10 +344,9 @@ class SchedulerMigrationMixin:
                 "kv_indices_first_4": kv_indices[:4].tolist() if len(kv_indices) >= 4 else kv_indices.tolist(),
                 "page_indices_first_4": page_indices[:4].tolist() if len(page_indices) >= 4 else page_indices.tolist(),
                 "kv_sample_layer0": kv_sample,
-                "fill_ids_len": len(req.fill_ids),
-                "fill_ids_first_10": list(req.fill_ids[:10]) if len(req.fill_ids) >= 10 else list(req.fill_ids),
-                "origin_input_ids_len": len(req.origin_input_ids) if hasattr(req, 'origin_input_ids') else None,
-                "sampling_params_max_new_tokens": req.sampling_params.max_new_tokens if hasattr(req, 'sampling_params') else None,
+                "updated_fill_ids_len": len(req.fill_ids),
+                "origin_input_ids_len": len(req.origin_input_ids),
+                "output_ids_len": len(req.output_ids),
             }, 
             "timestamp": __import__("time").time() * 1000, 
             "sessionId": "debug-session", 

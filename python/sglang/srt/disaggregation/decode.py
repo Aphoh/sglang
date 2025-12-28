@@ -626,6 +626,25 @@ class DecodePreallocQueue:
 
         # Alloc all tokens for the prebuilt req (except for the reserved input token for decoding)
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        # #region agent log
+        import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({
+            "location": "decode.py:_pre_alloc", 
+            "message": "Receiver pre-allocating KV for request",
+            "data": {
+                "rid": req.rid,
+                "origin_input_ids_len": len(req.origin_input_ids),
+                "output_ids_len": len(req.output_ids),
+                "fill_len": fill_len,
+                "origin_input_ids_first_10": list(req.origin_input_ids[:10]) if len(req.origin_input_ids) >= 10 else list(req.origin_input_ids),
+                "output_ids": list(req.output_ids) if len(req.output_ids) < 20 else list(req.output_ids[:20]),
+                "bootstrap_host": getattr(req, 'bootstrap_host', None),
+                "bootstrap_port": getattr(req, 'bootstrap_port', None),
+            },
+            "timestamp": __import__("time").time() * 1000,
+            "sessionId": "debug-session",
+            "hypothesisId": "RECEIVER"
+        }) + "\n")
+        # #endregion
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
         if self.token_to_kv_pool_allocator.page_size == 1:
@@ -696,6 +715,36 @@ class DecodeTransferQueue:
             output_topk_index,
             output_hidden_states,
         ) = self.metadata_buffers.get_buf(idx)
+
+        # #region agent log
+        # Sample the received KV cache to compare with sender
+        kv_sample = None
+        try:
+            token_to_kv_pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
+            kv_indices = self.scheduler.req_to_token_pool.req_to_token[
+                decode_req.req.req_pool_idx, :min(4, len(decode_req.req.origin_input_ids))
+            ]
+            k_cache = token_to_kv_pool.k_buffer[0]  # First layer
+            kv_sample = k_cache[kv_indices[0].item(), :4].tolist() if len(kv_indices) > 0 else None
+        except Exception as e:
+            kv_sample = f"error: {e}"
+        import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({
+            "location": "decode.py:_commit_transfer_to_req", 
+            "message": "Transfer committed on receiver",
+            "data": {
+                "rid": decode_req.req.rid,
+                "output_id_from_metadata": output_id[0].item(),
+                "cached_tokens": cached_tokens[0].item(),
+                "origin_input_ids_len": len(decode_req.req.origin_input_ids),
+                "output_ids_before": list(decode_req.req.output_ids),
+                "fill_ids_len": len(decode_req.req.fill_ids) if hasattr(decode_req.req, 'fill_ids') else None,
+                "kv_sample_layer0": kv_sample,
+            },
+            "timestamp": __import__("time").time() * 1000,
+            "sessionId": "debug-session",
+            "hypothesisId": "RECEIVER_COMMIT"
+        }) + "\n")
+        # #endregion
 
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
