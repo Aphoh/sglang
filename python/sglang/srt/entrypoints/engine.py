@@ -593,6 +593,34 @@ class Engine(EngineBase):
 
         self.loop.run_until_complete(self.tokenizer_manager.freeze_gc())
 
+    def migrate_request(
+        self,
+        rid: str,
+        bootstrap_host: str,
+        bootstrap_port: int,
+        bootstrap_room: int,
+    ) -> None:
+        """Initiate migration of an in-flight request's KV cache to another worker.
+
+        This sends a MigrateReq to the scheduler which will:
+        1. Find and remove the request from active processing
+        2. Setup a KV sender with the provided bootstrap info
+        3. Transfer the KV cache to the destination worker
+
+        Args:
+            rid: The request ID to migrate.
+            bootstrap_host: Destination worker's bootstrap host.
+            bootstrap_port: Destination worker's bootstrap port.
+            bootstrap_room: Unique room ID for this migration transfer.
+        """
+        self.tokenizer_manager.migrate_request(
+            rid=rid,
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
+        )
+
+
     """
     Execute an RPC call on all scheduler processes.
     """

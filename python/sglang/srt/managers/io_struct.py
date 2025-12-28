@@ -1295,6 +1295,14 @@ class AbortReq(BaseReq):
         if self.rid is None:
             self.rid = ""
 
+@dataclass
+class MigrateReq(BaseReq):
+    """Request to migrate an in-flight request's KV cache to another worker."""
+
+    # Bootstrap connection info for KV transfer
+    bootstrap_host: str = ""
+    bootstrap_port: int = 0
+    bootstrap_room: int = 0
 
 @dataclass
 class GetInternalStateReq(BaseReq):
