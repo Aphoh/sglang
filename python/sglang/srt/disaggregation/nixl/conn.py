@@ -135,34 +135,28 @@ class NixlKVManager(CommonKVManager):
         self.agent = nixl_agent(str(uuid.uuid4()))
         self.register_buffer_to_engine()
 
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._start_bootstrap_thread()
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
-                TransferStatus
-            )
-            self.heartbeat_failures = {}
-            self.session_pool = defaultdict(requests.Session)
-            self.session_pool_lock = threading.Lock()
-            self.addr_to_rooms_tracker = defaultdict(set)
-            self.connection_lock = threading.Lock()
+        # Receiver infrastructure - always initialize for both modes
+        # (decode uses it for receiving, prefill doesn't but it's harmless)
+        self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(TransferStatus)
+        self.heartbeat_failures: Dict[str, int] = {}
+        self.session_pool = defaultdict(requests.Session)
+        self.session_pool_lock = threading.Lock()
+        self.addr_to_rooms_tracker = defaultdict(set)
 
-            # Heartbeat interval should be at least 2 seconds
-            self.heartbeat_interval = max(
-                float(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
-            )
-            # Heartbeat failure should be at least 1
-            self.max_failures = max(
-                get_int_env_var("SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE", 2), 1
-            )
-            self.waiting_timeout = get_int_env_var(
-                "SGLANG_DISAGGREGATION_WAITING_TIMEOUT", 300
-            )
-            self._start_heartbeat_checker_thread()
-        else:
-            raise ValueError(
-                f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
-            )
+        # Heartbeat/timeout settings
+        self.heartbeat_interval = max(
+            float(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
+        )
+        self.max_failures = max(
+            get_int_env_var("SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE", 2), 1
+        )
+        self.waiting_timeout = get_int_env_var(
+            "SGLANG_DISAGGREGATION_WAITING_TIMEOUT", 300
+        )
+
+        # Start both threads - enables any node to act as sender or receiver
+        self._start_bootstrap_thread()
+        self._start_heartbeat_checker_thread()
 
     def _start_heartbeat_checker_thread(self):
         """
@@ -559,8 +553,12 @@ class NixlKVManager(CommonKVManager):
         chunk_id: int,
         aux_index: Optional[int] = None,
     ):
-        assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last or (is_last and aux_index is not None)
+        # Only require aux_index if we have aux data to send (e.g., for EAGLE speculation)
+        has_aux_data = len(self.kv_args.aux_data_ptrs) > 0
+        # #region agent log
+        import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "nixl/conn.py:add_transfer_request", "message": "Checking aux_data", "data": {"is_last": is_last, "has_aux_data": has_aux_data, "aux_index": aux_index, "aux_data_ptrs_len": len(self.kv_args.aux_data_ptrs)}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "M"}) + "\n")
+        # #endregion
+        assert not is_last or not has_aux_data or aux_index is not None
 
         reqs_to_be_processed = self.transfer_infos[bootstrap_room].values()
         handles = []
@@ -605,7 +603,7 @@ class NixlKVManager(CommonKVManager):
 
             handles.append(kv_xfer_handle)
             # Only the last chunk we need to send the aux data.
-            if is_last:
+            if is_last and self.pp_group.is_last_rank and has_aux_data:
                 assert aux_index is not None
                 aux_xfer_handle = self.send_aux(
                     req.agent_name,
@@ -645,10 +643,16 @@ class NixlKVManager(CommonKVManager):
 
     def _start_bootstrap_thread(self):
         def bootstrap_thread():
-            """This thread recvs transfer info from the decode engine"""
+            """This thread recvs transfer info from the receiver (decode engine)"""
+            # #region agent log
+            import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "nixl/conn.py:bootstrap_thread:started", "message": "Bootstrap thread started, listening for transfer requests", "data": {"local_ip": self.local_ip, "rank_port": self.rank_port}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "H"}) + "\n")
+            # #endregion
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
-                logger.debug(
+                # #region agent log
+                open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "nixl/conn.py:bootstrap_thread:received", "message": "Received ZMQ message", "data": {"total_bytes": sum(len(x) for x in waiting_req_bytes), "num_parts": len(waiting_req_bytes)}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "H"}) + "\n")
+                # #endregion
+                logger.info(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )
                 assert (
@@ -659,12 +663,18 @@ class NixlKVManager(CommonKVManager):
                 agent_name = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     # Register new peer and save KV base pointers.
+                    # #region agent log
+                    open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "nixl/conn.py:bootstrap_thread:register_peer", "message": "Registering new peer", "data": {"agent_name": agent_name}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "H"}) + "\n")
+                    # #endregion
                     self._add_remote_peer(
                         KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     )
-                    logger.debug(f"Register KVArgs from {agent_name} successfully")
+                    logger.info(f"Register KVArgs from {agent_name} successfully")
                     continue
                 room = int(room)
+                # #region agent log
+                open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "nixl/conn.py:bootstrap_thread:transfer_info", "message": "Received transfer request", "data": {"room": room, "agent_name": agent_name}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "H"}) + "\n")
+                # #endregion
                 if room not in self.transfer_infos:
                     self.transfer_infos[room] = {}
                 self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
@@ -673,12 +683,12 @@ class NixlKVManager(CommonKVManager):
                 required_dst_info_num = self.transfer_infos[room][
                     agent_name
                 ].required_dst_info_num
-                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
+                logger.info(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
-                    logger.debug(f"{room=} is bootstrapped")
+                    logger.info(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread).start()
+        threading.Thread(target=bootstrap_thread, daemon=True).start()
 
 
 class NixlKVSender(CommonKVSender):
@@ -765,13 +775,16 @@ class NixlKVReceiver(CommonKVReceiver):
             return
 
         for bootstrap_info in self.bootstrap_infos:
-            logger.debug(
+            logger.info(
                 f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
             )
+            # #region agent log
+            import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "nixl/conn.py:NixlKVReceiver.init:sending", "message": "Sending transfer request to sender", "data": {"bootstrap_info": bootstrap_info, "bootstrap_room": self.bootstrap_room, "kv_indices_len": len(kv_indices), "aux_index": aux_index}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "G"}) + "\n")
+            # #endregion
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
-            logger.debug(
-                f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
+            logger.info(
+                f"Sending to sender with bootstrap room {self.bootstrap_room} {is_dummy=}"
             )
             with lock:
                 sock.send_multipart(
@@ -786,9 +799,15 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.required_dst_info_num).encode("ascii"),
                     ]
                 )
+            # #region agent log
+            open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "nixl/conn.py:NixlKVReceiver.init:sent", "message": "Transfer request sent via ZMQ", "data": {"bootstrap_room": self.bootstrap_room, "target_ip": bootstrap_info.get("rank_ip"), "target_port": bootstrap_info.get("rank_port")}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "G"}) + "\n")
+            # #endregion
 
         self.started_transfer = True
         self.init_time = time.time()
+        # #region agent log
+        open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "nixl/conn.py:NixlKVReceiver.init:complete", "message": "Receiver init complete, waiting for transfer", "data": {"bootstrap_room": self.bootstrap_room}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "G"}) + "\n")
+        # #endregion
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -830,7 +849,13 @@ class NixlKVReceiver(CommonKVReceiver):
         return KVPoll.WaitingForInput  # type: ignore
 
     def _register_kv_args(self):
+        # #region agent log
+        import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "nixl/conn.py:_register_kv_args:entry", "message": "Registering KV args with sender", "data": {"num_bootstrap_infos": len(self.bootstrap_infos), "agent_name": self.kv_mgr.agent.name}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "G"}) + "\n")
+        # #endregion
         for bootstrap_info in self.bootstrap_infos:
+            # #region agent log
+            open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "nixl/conn.py:_register_kv_args:sending", "message": "Sending KV args to sender endpoint", "data": {"target_ip": bootstrap_info.get("rank_ip"), "target_port": bootstrap_info.get("rank_port")}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "G"}) + "\n")
+            # #endregion
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
@@ -856,6 +881,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
                     ]
                 )
+            logger.info(f"Sent KV args to sender at {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')}")
 
     def failure_exception(self):
         raise RuntimeError("NIXL KVReceiver Exception")
