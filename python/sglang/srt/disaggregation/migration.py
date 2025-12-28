@@ -404,7 +404,9 @@ class SchedulerMigrationMixin:
                 # #region agent log
                 open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "migration.py:process_migration_inflight_queue:waiting_for_input", "message": "Receiver connected, initializing sender", "data": {"rid": req.rid, "migration_num_tokens": getattr(req, 'migration_num_tokens', 'not_set'), "num_pages": num_pages, "page_size": page_size}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "N"}) + "\n")
                 # #endregion
-                # Allocate a metadata buffer index for aux data transfer if we have aux buffers
+                # Allocate metadata buffer and populate with the last output token.
+                # The receiver expects to receive the next token via aux data (like prefill does).
+                # For migration, this should be the last token decode1 generated.
                 aux_index = None
                 if (
                     hasattr(self, "req_to_metadata_buffer_idx_allocator")
@@ -414,6 +416,16 @@ class SchedulerMigrationMixin:
                 ):
                     aux_index = self.req_to_metadata_buffer_idx_allocator.alloc()
                     req.metadata_buffer_index = aux_index
+                    # Populate the aux buffer with the last output token
+                    # For migration, the receiver will append this token to its output_ids
+                    if len(req.output_ids) > 0:
+                        last_output_token = req.output_ids[-1]
+                        self.disagg_metadata_buffers.output_ids[aux_index][0] = last_output_token
+                        # Also set cached_tokens to 0 (similar to prefill)
+                        self.disagg_metadata_buffers.cached_tokens[aux_index][0] = 0
+                        # #region agent log
+                        import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "migration.py:waiting_for_input", "message": "Populated aux buffer with last token", "data": {"rid": req.rid, "aux_index": aux_index, "last_output_token": last_output_token}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "AUX"}) + "\n")
+                        # #endregion
                 
                 # Initialize sender with num_pages (not num_tokens)
                 req.disagg_kv_sender.init(num_pages, aux_index=aux_index)
