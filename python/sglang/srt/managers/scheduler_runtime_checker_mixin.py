@@ -294,6 +294,9 @@ class SchedulerRuntimeCheckerMixin:
             )
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
+            # Also skip if there are migration inflight requests
+            if hasattr(self, 'disagg_migration_inflight_queue'):
+                queue_size += len(self.disagg_migration_inflight_queue)
             if queue_size:
                 return
 
