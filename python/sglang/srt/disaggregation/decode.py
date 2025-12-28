@@ -283,6 +283,11 @@ class DecodePreallocQueue:
             kv_args.state_item_lens = []
             kv_args.state_type = "none"
 
+        # Add sender-specific fields needed for decode->decode migration
+        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        kv_args.kv_head_num = self.token_to_kv_pool.head_num
+        kv_args.page_size = self.token_to_kv_pool.page_size
+
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class: Type[BaseKVManager] = get_kv_class(
