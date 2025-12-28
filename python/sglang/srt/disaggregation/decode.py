@@ -794,6 +794,8 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
             self.process_decode_queue()
+            # Process any in-flight migration transfers (decode->decode)
+            self.process_migration_inflight_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
@@ -817,6 +819,8 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
             self.process_decode_queue()
+            # Process any in-flight migration transfers (decode->decode)
+            self.process_migration_inflight_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 

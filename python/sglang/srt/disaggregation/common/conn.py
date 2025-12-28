@@ -80,43 +80,56 @@ class CommonKVManager(BaseKVManager):
 
         self.request_status: Dict[int, KVPoll] = {}
 
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._register_to_bootstrap()
-            self.transfer_infos = {}
-            self.decode_kv_args_table = {}
-            self.pp_group = get_pp_group()
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
-            self.connection_lock = threading.Lock()
-            self.required_prefill_response_num_table: Dict[int, int] = {}
-            self.prefill_attn_tp_size_table: Dict[str, int] = {}
-            self.prefill_dp_size_table: Dict[str, int] = {}
-            self.prefill_pp_size_table: Dict[str, int] = {}
-        else:
-            raise ValueError(
-                f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
-            )
+        # Sender infrastructure (used by prefill, and by decode for migration)
+        self.transfer_infos: Dict = {}
+        self.decode_kv_args_table: Dict = {}
+        self.pp_group = get_pp_group()
 
-    def _register_to_bootstrap(self):
-        """Register KVSender to bootstrap server via HTTP POST."""
-        if self.dist_init_addr:
-            # Multi-node case: bootstrap server's host is dist_init_addr
-            if self.dist_init_addr.startswith("["):  # [ipv6]:port or [ipv6]
-                if self.dist_init_addr.endswith("]"):
-                    host = self.dist_init_addr
+        # Receiver infrastructure (used by decode)
+        self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
+        self.connection_lock = threading.Lock()
+        self.required_prefill_response_num_table: Dict[int, int] = {}
+        self.prefill_attn_tp_size_table: Dict[str, int] = {}
+        self.prefill_dp_size_table: Dict[str, int] = {}
+        self.prefill_pp_size_table: Dict[str, int] = {}
+
+        # #region agent log
+        import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "conn.py:CommonKVManager.__init__", "message": "KVManager initialized", "data": {"mode": str(self.disaggregation_mode), "bootstrap_host": self.bootstrap_host, "bootstrap_port": self.bootstrap_port, "attn_tp_size": self.attn_tp_size, "pp_size": self.pp_size}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "A"}) + "\n")
+        # #endregion
+
+        # Register to bootstrap server - needed for both prefill (always a sender)
+        # and decode (can be a sender for migration)
+        self._register_to_bootstrap()
+
+    def _register_to_bootstrap(self, bootstrap_addr: Optional[str] = None):
+        """Register as a KV sender to a bootstrap server via HTTP PUT.
+
+        Args:
+            bootstrap_addr: Optional bootstrap server address (host:port).
+                           If not provided, uses self.bootstrap_host:self.bootstrap_port.
+        """
+        if bootstrap_addr is not None:
+            bootstrap_server_url = bootstrap_addr
+        else:
+            if self.dist_init_addr:
+                # Multi-node case: bootstrap server's host is dist_init_addr
+                if self.dist_init_addr.startswith("["):  # [ipv6]:port or [ipv6]
+                    if self.dist_init_addr.endswith("]"):
+                        host = self.dist_init_addr
+                    else:
+                        host, _ = self.dist_init_addr.rsplit(":", 1)
                 else:
-                    host, _ = self.dist_init_addr.rsplit(":", 1)
+                    host = socket.gethostbyname(self.dist_init_addr.rsplit(":", 1)[0])
             else:
-                host = socket.gethostbyname(self.dist_init_addr.rsplit(":", 1)[0])
-        else:
-            # Single-node case: bootstrap server's host is the same as http server's host
-            host = self.bootstrap_host
-            host = maybe_wrap_ipv6_address(host)
+                # Single-node case: bootstrap server's host is the same as http server's host
+                host = self.bootstrap_host
+                host = maybe_wrap_ipv6_address(host)
+            bootstrap_server_url = f"{host}:{self.bootstrap_port}"
 
-        bootstrap_server_url = f"{host}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
+        role = "Prefill" if self.disaggregation_mode == DisaggregationMode.PREFILL else "Decode"
         payload = {
-            "role": "Prefill",
+            "role": role,
             "attn_tp_size": self.attn_tp_size,
             "attn_tp_rank": self.attn_tp_rank,
             "attn_dp_size": self.attn_dp_size,
@@ -129,18 +142,24 @@ class CommonKVManager(BaseKVManager):
             "rank_port": self.rank_port,
         }
 
+        # #region agent log
+        import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "conn.py:_register_to_bootstrap:attempt", "message": "Attempting to register to bootstrap", "data": {"url": url, "payload": payload}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "A"}) + "\n")
+        # #endregion
         try:
             response = requests.put(url, json=payload, timeout=5)
+            # #region agent log
+            open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "conn.py:_register_to_bootstrap:result", "message": "Registration result", "data": {"status_code": response.status_code, "response_text": response.text[:200] if response.text else None}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "A"}) + "\n")
+            # #endregion
             if response.status_code == 200:
-                logger.debug("Prefill successfully registered to bootstrap server.")
+                logger.info(
+                    f"Successfully registered to bootstrap server at {bootstrap_server_url}"
+                )
             else:
                 logger.error(
-                    f"Prefill instance failed to connect to bootstrap server: {response.status_code}, {response.text}"
+                    f"Failed to register to bootstrap server: {response.status_code}, {response.text}"
                 )
         except Exception as e:
-            logger.error(
-                f"Prefill instance failed to register to bootstrap server: {e}"
-            )
+            logger.error(f"Failed to register to bootstrap server: {e}")
 
     @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):
@@ -408,14 +427,23 @@ class CommonKVReceiver(BaseKVReceiver):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&target_dp_group={target_dp_group}&target_pp_rank={target_pp_rank}"
+            # #region agent log
+            import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "conn.py:_get_bootstrap_info_from_server:entry", "message": "Fetching sender endpoint", "data": {"url": url, "engine_rank": engine_rank, "target_dp_group": target_dp_group, "target_pp_rank": target_pp_rank}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "F"}) + "\n")
+            # #endregion
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
+                # #region agent log
+                open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "conn.py:_get_bootstrap_info_from_server:success", "message": "Got sender endpoint", "data": {"bootstrap_info": bootstrap_info}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "F"}) + "\n")
+                # #endregion
                 return bootstrap_info
             else:
                 logger.error(
                     f"Failed to get prefill server info: {response.status_code}, {response.text}"
                 )
+                # #region agent log
+                open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "conn.py:_get_bootstrap_info_from_server:failed", "message": "Failed to get sender endpoint", "data": {"status_code": response.status_code, "response_text": response.text[:200] if response.text else None}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "F"}) + "\n")
+                # #endregion
                 return None
         except Exception as e:
             logger.error(f"Error fetching prefill info from bootstrap: {e}")
@@ -424,12 +452,21 @@ class CommonKVReceiver(BaseKVReceiver):
     def _get_prefill_parallel_info_from_server(
         self,
     ) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-        """Fetch the prefill parallel info from the bootstrap server."""
+        """Fetch the sender's parallel info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}"
-            response = requests.get(url)
+            # #region agent log
+            import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "conn.py:_get_prefill_parallel_info_from_server:entry", "message": "Querying bootstrap for parallel info", "data": {"url": url, "bootstrap_addr": self.bootstrap_addr, "bootstrap_room": self.bootstrap_room}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "B,D"}) + "\n")
+            # #endregion
+            response = requests.get(url, timeout=5)
+            # #region agent log
+            open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "conn.py:_get_prefill_parallel_info_from_server:response", "message": "Got response from bootstrap", "data": {"status_code": response.status_code, "response_text": response.text[:500] if response.text else None}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "C,E"}) + "\n")
+            # #endregion
             if response.status_code == 200:
                 prefill_parallel_info = response.json()
+                # #region agent log
+                open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "conn.py:_get_prefill_parallel_info_from_server:parsed", "message": "Parsed parallel info", "data": {"prefill_parallel_info": prefill_parallel_info, "tp_is_none": prefill_parallel_info.get("prefill_attn_tp_size") is None, "dp_is_none": prefill_parallel_info.get("prefill_dp_size") is None, "pp_is_none": prefill_parallel_info.get("prefill_pp_size") is None}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "A,C"}) + "\n")
+                # #endregion
                 return (
                     int(prefill_parallel_info["prefill_attn_tp_size"]),
                     int(prefill_parallel_info["prefill_dp_size"]),
@@ -536,26 +573,26 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.pp_size is None:
             self.pp_size = pp_size
 
-        if role == "Prefill":
-            if system_dp_size == 1:
-                dp_group = attn_dp_rank
-            else:
-                dp_group = system_dp_rank
+        # Handle registration from any sender (Prefill or Decode acting as migration source)
+        if system_dp_size == 1:
+            dp_group = attn_dp_rank
+        else:
+            dp_group = system_dp_rank
 
-            # Add lock to make sure thread-safe
-            async with self.lock:
-                if dp_group not in self.prefill_port_table:
-                    self.prefill_port_table[dp_group] = {}
-                if attn_tp_rank not in self.prefill_port_table[dp_group]:
-                    self.prefill_port_table[dp_group][attn_tp_rank] = {}
+        # Add lock to make sure thread-safe
+        async with self.lock:
+            if dp_group not in self.prefill_port_table:
+                self.prefill_port_table[dp_group] = {}
+            if attn_tp_rank not in self.prefill_port_table[dp_group]:
+                self.prefill_port_table[dp_group][attn_tp_rank] = {}
 
-            self.prefill_port_table[dp_group][attn_tp_rank][pp_rank] = {
-                "rank_ip": rank_ip,
-                "rank_port": rank_port,
-            }
-            logger.debug(
-                f"Register prefill bootstrap: DP{dp_group} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
-            )
+        self.prefill_port_table[dp_group][attn_tp_rank][pp_rank] = {
+            "rank_ip": rank_ip,
+            "rank_port": rank_port,
+        }
+        logger.debug(
+            f"Register {role} bootstrap: DP{dp_group} TP{attn_tp_rank} PP{pp_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"
+        )
 
         return web.Response(text="OK", status=200)
 
@@ -572,12 +609,16 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             and int(target_dp_group) == -1
             and int(target_pp_rank) == -1
         ):
-            prefill_parallel_info = {
+            # Return sender's parallel info (works for both prefill and decode senders)
+            parallel_info = {
                 "prefill_attn_tp_size": self.attn_tp_size,
                 "prefill_dp_size": self.dp_size,
                 "prefill_pp_size": self.pp_size,
             }
-            return web.json_response(prefill_parallel_info, status=200)
+            # #region agent log
+            import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "conn.py:_handle_route_get:parallel_info", "message": "Bootstrap server returning parallel info", "data": {"parallel_info": parallel_info, "host": self.host, "port": self.port}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "A,C"}) + "\n")
+            # #endregion
+            return web.json_response(parallel_info, status=200)
 
         # Find corresponding prefill info
         async with self.lock:
