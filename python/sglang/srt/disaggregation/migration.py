@@ -144,9 +144,6 @@ class SchedulerMigrationMixin:
         kv_manager_class: Type[BaseKVManager] = get_kv_class(
             transfer_backend, KVClassType.MANAGER
         )
-        # #region agent log
-        import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "migration.py:_get_migration_kv_manager", "message": "Creating migration KV manager", "data": {"kv_manager_class": str(kv_manager_class), "bootstrap_port": self.server_args.disaggregation_bootstrap_port}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "E"}) + "\n")
-        # #endregion
         # Use PREFILL mode since we're sending KV cache (like prefill does)
         self._migration_kv_manager = kv_manager_class(
             kv_args,
@@ -154,9 +151,6 @@ class SchedulerMigrationMixin:
             self.server_args,
             is_mla_backend(token_to_kv_pool),
         )
-        # #region agent log
-        open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "migration.py:_get_migration_kv_manager", "message": "Migration KV manager created", "data": {"manager_id": id(self._migration_kv_manager)}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "E"}) + "\n")
-        # #endregion
         return self._migration_kv_manager
 
     def process_migrate_request(self: "Scheduler", recv_req: MigrateReq) -> None:
@@ -168,9 +162,6 @@ class SchedulerMigrationMixin:
         Args:
             recv_req: The migration request with rid and bootstrap info.
         """
-        # #region agent log
-        import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "migration.py:process_migrate_request:entry", "message": "process_migrate_request called", "data": {"rid": recv_req.rid, "bootstrap_host": recv_req.bootstrap_host, "bootstrap_port": recv_req.bootstrap_port, "bootstrap_room": recv_req.bootstrap_room}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "K"}) + "\n")
-        # #endregion
         rid = recv_req.rid
         bootstrap_host = recv_req.bootstrap_host
         bootstrap_port = recv_req.bootstrap_port
@@ -183,9 +174,6 @@ class SchedulerMigrationMixin:
 
         # Find the request in running_batch
         req = self._find_and_remove_request(rid)
-        # #region agent log
-        open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "migration.py:process_migrate_request", "message": "Find request result", "data": {"rid": rid, "found": req is not None, "running_batch_size": len(self.running_batch.reqs) if hasattr(self, 'running_batch') and self.running_batch else 0}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "K"}) + "\n")
-        # #endregion
         if req is None:
             logger.warning(f"Migration failed: request {rid} not found in running_batch")
             return
@@ -236,9 +224,6 @@ class SchedulerMigrationMixin:
             bootstrap_port: Destination bootstrap port.
             bootstrap_room: Destination bootstrap room ID.
         """
-        # #region agent log
-        import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "migration.py:_setup_migration_sender", "message": "Setting up migration sender", "data": {"rid": req.rid, "bootstrap_host": bootstrap_host, "bootstrap_port": bootstrap_port, "bootstrap_room": bootstrap_room, "tp_rank": self.tp_rank}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "B,D"}) + "\n")
-        # #endregion
         transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
@@ -249,10 +234,6 @@ class SchedulerMigrationMixin:
 
         kv_sender_class = get_kv_class(transfer_backend, KVClassType.SENDER)
         dest_tp_ranks = [self.tp_rank]
-
-        # #region agent log
-        open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "migration.py:_setup_migration_sender", "message": "Creating KV sender", "data": {"kv_sender_class": str(kv_sender_class), "bootstrap_addr": f"{bootstrap_host}:{bootstrap_port}", "bootstrap_room": bootstrap_room, "dest_tp_ranks": dest_tp_ranks}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "B,D"}) + "\n")
-        # #endregion
 
         req.disagg_kv_sender = kv_sender_class(
             mgr=kv_manager,
@@ -269,24 +250,6 @@ class SchedulerMigrationMixin:
         actual_computed_tokens = len(req.origin_input_ids) + len(req.output_ids)
         req.migration_num_tokens = actual_computed_tokens
         req.migration_kv_sent = False
-        
-        # #region agent log
-        open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({
-            "location": "migration.py:_setup_migration_sender", 
-            "message": "Migration sender created, waiting for receiver", 
-            "data": {
-                "rid": req.rid, 
-                "stale_fill_ids_len": len(req.fill_ids),
-                "origin_input_ids_len": len(req.origin_input_ids),
-                "output_ids_len": len(req.output_ids),
-                "actual_computed_tokens": actual_computed_tokens,
-                "migration_num_tokens": req.migration_num_tokens,
-            }, 
-            "timestamp": __import__("time").time() * 1000, 
-            "sessionId": "debug-session", 
-            "hypothesisId": "K"
-        }) + "\n")
-        # #endregion
 
     def _send_migration_kv(self: "Scheduler", req: Req) -> None:
         """Send the KV cache for a migration request.
@@ -327,40 +290,11 @@ class SchedulerMigrationMixin:
             kv_sample = k_cache[sample_indices[0], :4].tolist() if sample_indices else None
         except Exception as e:
             kv_sample = f"error: {e}"
-        
-        # #region agent log
-        import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({
-            "location": "migration.py:_send_migration_kv", 
-            "message": "Sending migration KV with metadata", 
-            "data": {
-                "rid": req.rid, 
-                "num_tokens_to_send": num_tokens_to_send,
-                "migration_num_tokens": req.migration_num_tokens,
-                "kv_allocated_len": getattr(req, 'kv_allocated_len', 'N/A'),
-                "num_kv_indices": len(kv_indices), 
-                "num_page_indices": len(page_indices), 
-                "page_size": page_size, 
-                "req_pool_idx": req.req_pool_idx,
-                "kv_indices_first_4": kv_indices[:4].tolist() if len(kv_indices) >= 4 else kv_indices.tolist(),
-                "page_indices_first_4": page_indices[:4].tolist() if len(page_indices) >= 4 else page_indices.tolist(),
-                "kv_sample_layer0": kv_sample,
-                "updated_fill_ids_len": len(req.fill_ids),
-                "origin_input_ids_len": len(req.origin_input_ids),
-                "output_ids_len": len(req.output_ids),
-            }, 
-            "timestamp": __import__("time").time() * 1000, 
-            "sessionId": "debug-session", 
-            "hypothesisId": "KV_VERIFY"
-        }) + "\n")
-        # #endregion
 
         # Send the KV cache using page indices
         req.disagg_kv_sender.send(
             kv_indices=page_indices,
         )
-        # #region agent log
-        open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "migration.py:_send_migration_kv", "message": "KV send completed", "data": {"rid": req.rid}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "L"}) + "\n")
-        # #endregion
 
     @torch.no_grad()
     def process_migration_inflight_queue(self: "Scheduler") -> List[Req]:
@@ -374,10 +308,6 @@ class SchedulerMigrationMixin:
         if len(self.disagg_migration_inflight_queue) == 0:
             return []
 
-        # #region agent log
-        import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "migration.py:process_migration_inflight_queue:entry", "message": "Processing migration queue", "data": {"queue_len": len(self.disagg_migration_inflight_queue), "rids": [r.rid for r in self.disagg_migration_inflight_queue]}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "N"}) + "\n")
-        # #endregion
-
         done_reqs = []
         undone_reqs: List[Req] = []
 
@@ -385,9 +315,6 @@ class SchedulerMigrationMixin:
             [req.disagg_kv_sender for req in self.disagg_migration_inflight_queue],
             self.attn_tp_cpu_group,
         )
-        # #region agent log
-        open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "migration.py:process_migration_inflight_queue:polls", "message": "Poll results", "data": {"polls": [str(p) for p in polls], "rids": [r.rid for r in self.disagg_migration_inflight_queue]}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "N"}) + "\n")
-        # #endregion
 
         for req, poll in zip(self.disagg_migration_inflight_queue, polls):
             # Still waiting for receiver to connect
@@ -400,10 +327,6 @@ class SchedulerMigrationMixin:
                 # Compute num_pages from num_tokens (same as prefill does)
                 page_size = self.token_to_kv_pool_allocator.get_kvcache().page_size
                 num_pages = kv_to_page_num(req.migration_num_tokens, page_size)
-                
-                # #region agent log
-                open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "migration.py:process_migration_inflight_queue:waiting_for_input", "message": "Receiver connected, initializing sender", "data": {"rid": req.rid, "migration_num_tokens": getattr(req, 'migration_num_tokens', 'not_set'), "num_pages": num_pages, "page_size": page_size}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "N"}) + "\n")
-                # #endregion
                 # Allocate metadata buffer and populate with the last output token.
                 # The receiver expects to receive the next token via aux data (like prefill does).
                 # For migration, this should be the last token decode1 generated.
@@ -423,9 +346,6 @@ class SchedulerMigrationMixin:
                         self.disagg_metadata_buffers.output_ids[aux_index][0] = last_output_token
                         # Also set cached_tokens to 0 (similar to prefill)
                         self.disagg_metadata_buffers.cached_tokens[aux_index][0] = 0
-                        # #region agent log
-                        import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "migration.py:waiting_for_input", "message": "Populated aux buffer with last token", "data": {"rid": req.rid, "aux_index": aux_index, "last_output_token": last_output_token}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "AUX"}) + "\n")
-                        # #endregion
                 
                 # Initialize sender with num_pages (not num_tokens)
                 req.disagg_kv_sender.init(num_pages, aux_index=aux_index)

@@ -1192,13 +1192,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             bootstrap_port: Destination worker's bootstrap port.
             bootstrap_room: Unique room ID for this migration transfer.
         """
-        # #region agent log
-        import json as _json; open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "tokenizer_manager.py:migrate_request", "message": "migrate_request called", "data": {"rid": rid, "rid_in_state": rid in self.rid_to_state, "rid_to_state_keys": list(self.rid_to_state.keys())[:10]}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "J"}) + "\n")
-        # #endregion
         if rid not in self.rid_to_state:
-            # #region agent log
-            open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "tokenizer_manager.py:migrate_request", "message": "rid NOT found, returning early", "data": {"rid": rid}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "J"}) + "\n")
-            # #endregion
             return
         req = MigrateReq(
             rid=rid,
@@ -1207,9 +1201,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             bootstrap_room=bootstrap_room,
         )
         self.send_to_scheduler.send_pyobj(req)
-        # #region agent log
-        open("/home/warnold/proj/dynamo/.cursor/debug.log", "a").write(_json.dumps({"location": "tokenizer_manager.py:migrate_request", "message": "MigrateReq sent to scheduler", "data": {"rid": rid, "bootstrap_room": bootstrap_room}, "timestamp": __import__("time").time() * 1000, "sessionId": "debug-session", "hypothesisId": "J"}) + "\n")
-        # #endregion
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
