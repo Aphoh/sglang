@@ -235,6 +235,9 @@ class SchedulerMigrationMixin:
     def _find_and_remove_request(self: "Scheduler", rid: str) -> Optional[Req]:
         """Find a request by ID in running_batch and remove it.
         
+        This properly updates all batch tensors (req_pool_indices, seq_lens, etc.)
+        to maintain consistency with the reqs list.
+        
         Args:
             rid: The request ID to find.
             
@@ -244,15 +247,36 @@ class SchedulerMigrationMixin:
         if self.running_batch.is_empty():
             return None
 
-        # Find the request in running_batch
-        for i, req in enumerate(self.running_batch.reqs):
-            if req.rid == rid:
-                # Remove from running_batch
-                self.running_batch.reqs.pop(i)
-                logger.debug(f"Removed request {rid} from running_batch")
-                return req
+        # Find the request index in running_batch
+        req_index = None
+        req = None
+        for i, r in enumerate(self.running_batch.reqs):
+            if r.rid == rid:
+                req_index = i
+                req = r
+                break
+        
+        if req_index is None:
+            return None
 
-        return None
+        # Build keep_indices (all indices except the one to remove)
+        keep_indices = [i for i in range(len(self.running_batch.reqs)) if i != req_index]
+        
+        if len(keep_indices) == 0:
+            # Removing the last request
+            self.running_batch.reqs = []
+            self.running_batch.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
+            self.running_batch.seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
+            self.running_batch.seq_lens_cpu = torch.empty(0, dtype=torch.int32)
+            self.running_batch.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
+            self.running_batch.output_ids = torch.empty(0, dtype=torch.int64, device=self.device)
+            self.running_batch.seq_lens_sum = 0
+        else:
+            # Use filter_batch with explicit keep_indices to properly update all tensors
+            self.running_batch.filter_batch(keep_indices=keep_indices)
+        
+        logger.info(f"Removed request {rid} from running_batch, remaining={len(self.running_batch.reqs)}")
+        return req
 
     def _setup_migration_sender(
         self: "Scheduler",
