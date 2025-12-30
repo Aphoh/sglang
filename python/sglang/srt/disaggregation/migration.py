@@ -224,7 +224,13 @@ class SchedulerMigrationMixin:
 
         # Add to migration inflight queue
         self.disagg_migration_inflight_queue.append(req)
-        logger.info(f"Request {rid} added to migration queue")
+        logger.info(
+            f"Request {rid} added to migration queue: "
+            f"queue_size={len(self.disagg_migration_inflight_queue)}, "
+            f"kv_allocated_len={req.kv_allocated_len}, "
+            f"kv_committed_len={req.kv_committed_len}, "
+            f"req_pool_idx={req.req_pool_idx}"
+        )
 
     def _find_and_remove_request(self: "Scheduler", rid: str) -> Optional[Req]:
         """Find a request by ID in running_batch and remove it.
@@ -423,6 +429,14 @@ class SchedulerMigrationMixin:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:
                 # Transfer completed successfully
+                logger.info(
+                    f"Migration KV transfer success: rid={req.rid}, "
+                    f"kv_allocated_len={req.kv_allocated_len}, "
+                    f"kv_committed_len={req.kv_committed_len}, "
+                    f"origin_input_ids_len={len(req.origin_input_ids)}, "
+                    f"output_ids_len={len(req.output_ids)}, "
+                    f"req_pool_idx={req.req_pool_idx}"
+                )
                 release_kv_cache(req, self.tree_cache)
                 req.finished_reason = FINISH_LENGTH(length=0)
                 if hasattr(req.disagg_kv_sender, "clear"):
@@ -436,7 +450,7 @@ class SchedulerMigrationMixin:
                     self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
                     req.metadata_buffer_index = -1
                 done_reqs.append(req)
-                logger.info(f"Migration completed for request {req.rid}")
+                logger.info(f"Migration cleanup completed for request {req.rid}")
             elif poll == KVPoll.Failed:
                 error_message = (
                     f"Migration transfer failed for request {req.rid} "
