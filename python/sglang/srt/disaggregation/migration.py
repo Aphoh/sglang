@@ -186,7 +186,7 @@ class SchedulerMigrationMixin:
                 success=False,
                 error=f"Request {rid} not found in running_batch",
             )
-            self.send_to_tokenizer.send_pyobj(output)
+            self.send_to_tokenizer.send_output(output, recv_req)
             return
 
         # Calculate pending output tokens
@@ -217,7 +217,7 @@ class SchedulerMigrationMixin:
             total_tokens=total_tokens,
             success=True,
         )
-        self.send_to_tokenizer.send_pyobj(output)
+        self.send_to_tokenizer.send_output(output, recv_req)
 
         # Setup KV sender for migration
         self._setup_migration_sender(req, bootstrap_host, bootstrap_port, bootstrap_room)
