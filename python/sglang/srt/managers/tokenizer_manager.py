@@ -61,6 +61,7 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     MigrateReq,
+    MigrateReqOutput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     SessionParams,
@@ -397,11 +398,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
                 ),
+                (MigrateReqOutput, self._handle_migrate_req_output),
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
             ]
         )
+        
+        # Futures for migration responses (keyed by rid)
+        self._migrate_futures: Dict[str, asyncio.Future] = {}
         self.init_communicators(server_args)
 
     async def generate_request(
@@ -1172,35 +1177,96 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self.metrics_collector.labels
             )
 
-    def migrate_request(
+    async def migrate_request(
         self,
         rid: str,
         bootstrap_host: str,
         bootstrap_port: int,
         bootstrap_room: int,
-    ) -> None:
+        tokens_seen: int = 0,
+    ) -> List[Dict[str, Any]]:
         """Initiate migration of an in-flight request's KV cache to another worker.
 
         This sends a MigrateReq to the scheduler which will:
         1. Find and remove the request from active processing
         2. Setup a KV sender with the provided bootstrap info
         3. Transfer the KV cache to the destination worker
+        4. Return the pending outputs (tokens after tokens_seen)
 
         Args:
             rid: The request ID to migrate.
             bootstrap_host: Destination worker's bootstrap host.
             bootstrap_port: Destination worker's bootstrap port.
             bootstrap_room: Unique room ID for this migration transfer.
+            tokens_seen: Number of tokens the frontend has already seen/yielded.
+
+        Returns:
+            List of pending outputs (token chunks the frontend hasn't seen yet).
+            Each output is a dict with 'token_ids', 'text', etc.
         """
         if rid not in self.rid_to_state:
-            return
+            logger.warning(f"migrate_request: rid={rid} not found in rid_to_state")
+            return []
+
+        logger.info(
+            f"migrate_request: rid={rid}, tokens_seen={tokens_seen}"
+        )
+
+        # Create a future to receive the response from scheduler
+        future = asyncio.get_event_loop().create_future()
+        self._migrate_futures[rid] = future
+
+        # Send migrate request to scheduler
         req = MigrateReq(
             rid=rid,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            tokens_seen=tokens_seen,
         )
         self.send_to_scheduler.send_pyobj(req)
+
+        # Wait for response from scheduler (with timeout)
+        try:
+            migrate_output: MigrateReqOutput = await asyncio.wait_for(future, timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.error(f"migrate_request: timeout waiting for response for rid={rid}")
+            self._migrate_futures.pop(rid, None)
+            return []
+        finally:
+            self._migrate_futures.pop(rid, None)
+
+        if not migrate_output.success:
+            logger.error(
+                f"migrate_request: failed for rid={rid}, error={migrate_output.error}"
+            )
+            return []
+
+        logger.info(
+            f"migrate_request: rid={rid}, success=True, "
+            f"total_tokens={migrate_output.total_tokens}, "
+            f"pending_output_ids_len={len(migrate_output.pending_output_ids)}"
+        )
+
+        # Return pending outputs as list of dicts
+        pending_outputs = []
+        if migrate_output.pending_output_ids:
+            pending_outputs.append({
+                "token_ids": migrate_output.pending_output_ids,
+            })
+
+        return pending_outputs
+
+    def _handle_migrate_req_output(self, recv_obj: MigrateReqOutput) -> None:
+        """Handle MigrateReqOutput from scheduler."""
+        rid = recv_obj.rid
+        future = self._migrate_futures.get(rid)
+        if future is not None and not future.done():
+            future.set_result(recv_obj)
+        else:
+            logger.warning(
+                f"_handle_migrate_req_output: no future found for rid={rid}"
+            )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:

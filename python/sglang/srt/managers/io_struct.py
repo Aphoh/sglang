@@ -16,6 +16,7 @@ The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Scheduler).
 """
 
+import dataclasses
 import copy
 import uuid
 from abc import ABC
@@ -1384,6 +1385,25 @@ class MigrateReq(BaseReq):
     bootstrap_host: str = ""
     bootstrap_port: int = 0
     bootstrap_room: int = 0
+    # Number of tokens the frontend has already seen/yielded to client.
+    # The migrate response will include outputs after this index.
+    tokens_seen: int = 0
+
+
+@dataclass
+class MigrateReqOutput(BaseReq):
+    """Response from migration request with pending outputs."""
+
+    # Output token IDs that the frontend hasn't seen yet (based on tokens_seen in request)
+    # This is output_ids[tokens_seen - len(origin_input_ids):] from the scheduler's Req
+    pending_output_ids: List[int] = dataclasses.field(default_factory=list)
+    # Total tokens in the request (origin_input_ids + output_ids) at time of migration
+    total_tokens: int = 0
+    # Success flag
+    success: bool = True
+    # Error message if failed
+    error: Optional[str] = None
+
 
 @dataclass
 class GetInternalStateReq(BaseReq):

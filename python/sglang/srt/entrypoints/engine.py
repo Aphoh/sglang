@@ -596,13 +596,14 @@ class Engine(EngineBase):
 
         self.loop.run_until_complete(self.tokenizer_manager.freeze_gc())
 
-    def migrate_request(
+    async def migrate_request(
         self,
         rid: str,
         bootstrap_host: str,
         bootstrap_port: int,
         bootstrap_room: int,
-    ) -> None:
+        tokens_seen: int = 0,
+    ) -> list:
         """Initiate migration of an in-flight request's KV cache to another worker.
 
         This sends a MigrateReq to the scheduler which will:
@@ -615,12 +616,17 @@ class Engine(EngineBase):
             bootstrap_host: Destination worker's bootstrap host.
             bootstrap_port: Destination worker's bootstrap port.
             bootstrap_room: Unique room ID for this migration transfer.
+            tokens_seen: Number of tokens the frontend has already seen/yielded.
+
+        Returns:
+            List of pending outputs (token chunks the frontend hasn't seen yet).
         """
-        self.tokenizer_manager.migrate_request(
+        return await self.tokenizer_manager.migrate_request(
             rid=rid,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            tokens_seen=tokens_seen,
         )
 
 

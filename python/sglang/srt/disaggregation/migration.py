@@ -34,7 +34,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.io_struct import MigrateReq
+from sglang.srt.managers.io_struct import MigrateReq, MigrateReqOutput
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
     Req,
@@ -158,6 +158,7 @@ class SchedulerMigrationMixin:
         
         Finds the request in running_batch, removes it from active processing,
         sets up KV sender, and adds it to the migration inflight queue.
+        Also sends a MigrateReqOutput back to tokenizer with the pending output_ids.
         
         Args:
             recv_req: The migration request with rid and bootstrap info.
@@ -166,9 +167,10 @@ class SchedulerMigrationMixin:
         bootstrap_host = recv_req.bootstrap_host
         bootstrap_port = recv_req.bootstrap_port
         bootstrap_room = recv_req.bootstrap_room
+        tokens_seen = recv_req.tokens_seen
 
         logger.info(
-            f"Processing migration request: {rid=}, "
+            f"Processing migration request: {rid=}, tokens_seen={tokens_seen}, "
             f"bootstrap={bootstrap_host}:{bootstrap_port}, room={bootstrap_room}"
         )
 
@@ -176,7 +178,46 @@ class SchedulerMigrationMixin:
         req = self._find_and_remove_request(rid)
         if req is None:
             logger.warning(f"Migration failed: request {rid} not found in running_batch")
+            # Send error response back to tokenizer
+            output = MigrateReqOutput(
+                rid=rid,
+                pending_output_ids=[],
+                total_tokens=0,
+                success=False,
+                error=f"Request {rid} not found in running_batch",
+            )
+            self.send_to_tokenizer.send_pyobj(output)
             return
+
+        # Calculate pending output tokens
+        # tokens_seen is total tokens frontend has seen (origin_input_ids + output tokens yielded)
+        # We need to send output_ids that the frontend hasn't seen yet
+        origin_input_len = len(req.origin_input_ids)
+        total_tokens = origin_input_len + len(req.output_ids)
+        
+        # How many output tokens has frontend seen?
+        output_tokens_seen = max(0, tokens_seen - origin_input_len)
+        # Pending output tokens are everything after that
+        pending_output_ids = list(req.output_ids[output_tokens_seen:])
+
+        logger.info(
+            f"Migration request found: rid={rid}, "
+            f"origin_input_ids_len={origin_input_len}, "
+            f"output_ids_len={len(req.output_ids)}, "
+            f"total_tokens={total_tokens}, "
+            f"tokens_seen_by_frontend={tokens_seen}, "
+            f"output_tokens_seen={output_tokens_seen}, "
+            f"pending_output_ids_len={len(pending_output_ids)}"
+        )
+
+        # Send response back to tokenizer with pending outputs
+        output = MigrateReqOutput(
+            rid=rid,
+            pending_output_ids=pending_output_ids,
+            total_tokens=total_tokens,
+            success=True,
+        )
+        self.send_to_tokenizer.send_pyobj(output)
 
         # Setup KV sender for migration
         self._setup_migration_sender(req, bootstrap_host, bootstrap_port, bootstrap_room)
@@ -265,6 +306,9 @@ class SchedulerMigrationMixin:
         # The last generated token doesn't have KV yet, so we may need to adjust
         if hasattr(req, 'kv_allocated_len') and num_tokens_to_send > req.kv_allocated_len:
             # Clamp to what's actually allocated
+            logger.info(
+                f"_send_migration_kv: clamping num_tokens_to_send from {num_tokens_to_send} to {req.kv_allocated_len}"
+            )
             num_tokens_to_send = req.kv_allocated_len
         
         # Update fill_ids to reflect actual computed tokens before sending
@@ -280,6 +324,17 @@ class SchedulerMigrationMixin:
         token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = token_to_kv_pool.page_size
         page_indices = kv_to_page_indices(kv_indices.cpu().numpy(), page_size)
+        
+        logger.info(
+            f"_send_migration_kv: rid={req.rid}, "
+            f"num_tokens_to_send={num_tokens_to_send}, "
+            f"origin_input_ids_len={len(req.origin_input_ids)}, "
+            f"output_ids_len={len(req.output_ids)}, "
+            f"kv_indices_len={len(kv_indices)}, "
+            f"page_size={page_size}, "
+            f"page_indices_len={len(page_indices)}, "
+            f"sender_num_kv_indices={req.disagg_kv_sender.num_kv_indices}"
+        )
         
         # Sample first few KV values for verification
         kv_sample = None
@@ -327,6 +382,14 @@ class SchedulerMigrationMixin:
                 # Compute num_pages from num_tokens (same as prefill does)
                 page_size = self.token_to_kv_pool_allocator.get_kvcache().page_size
                 num_pages = kv_to_page_num(req.migration_num_tokens, page_size)
+                logger.info(
+                    f"process_migration_inflight_queue: rid={req.rid}, "
+                    f"migration_num_tokens={req.migration_num_tokens}, "
+                    f"page_size={page_size}, "
+                    f"num_pages={num_pages}, "
+                    f"origin_input_ids_len={len(req.origin_input_ids)}, "
+                    f"output_ids_len={len(req.output_ids)}"
+                )
                 # Allocate metadata buffer and populate with the last output token.
                 # The receiver expects to receive the next token via aux data (like prefill does).
                 # For migration, this should be the last token decode1 generated.

@@ -564,7 +564,21 @@ class NixlKVManager(CommonKVManager):
             if req.is_dummy():
                 continue
 
+            logger.info(
+                f"add_transfer_request: room={bootstrap_room}, "
+                f"index_slice={index_slice}, "
+                f"kv_indices_len={len(kv_indices)}, "
+                f"dst_kv_indices_total_len={len(req.dst_kv_indices)}, "
+                f"chunk_id={chunk_id}, is_last={is_last}"
+            )
             chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
+            if len(chunked_dst_kv_indice) != len(kv_indices):
+                logger.error(
+                    f"KV indices mismatch! chunked_dst_kv_indice_len={len(chunked_dst_kv_indice)}, "
+                    f"kv_indices_len={len(kv_indices)}, "
+                    f"dst_kv_indices={req.dst_kv_indices.tolist()}, "
+                    f"index_slice={index_slice}"
+                )
             assert len(chunked_dst_kv_indice) == len(kv_indices)
             assert req.agent_name in self.decode_kv_args_table
 
@@ -695,6 +709,13 @@ class NixlKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
     ):
+        logger.info(
+            f"NixlKVSender.send: room={self.bootstrap_room}, "
+            f"kv_indices_len={len(kv_indices)}, "
+            f"curr_idx={self.curr_idx}, "
+            f"num_kv_indices={self.num_kv_indices}, "
+            f"chunk_id={self.chunk_id}"
+        )
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
@@ -752,6 +773,11 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
+        logger.info(
+            f"NixlKVReceiver.init: room={self.bootstrap_room}, "
+            f"kv_indices_len={len(kv_indices)}, "
+            f"aux_index={aux_index}"
+        )
         if self.bootstrap_infos is None:
             logger.error(
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
