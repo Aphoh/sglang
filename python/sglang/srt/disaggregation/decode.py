@@ -285,7 +285,8 @@ class DecodePreallocQueue:
 
         # Add sender-specific fields needed for decode->decode migration
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
-        kv_args.kv_head_num = self.token_to_kv_pool.head_num
+        if not self.is_mla_backend:
+            kv_args.kv_head_num = self.token_to_kv_pool.head_num
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
