@@ -38,6 +38,7 @@ CMD=(
   docker buildx build
   --platform "${PLATFORM}"
   --build-arg "CUDA_VERSION=${CUDA_VERSION}"
+  --build-arg "BRANCH_TYPE=local"
   --cache-from "type=registry,ref=${CACHE_REF}"
   --cache-to "type=registry,ref=${CACHE_REF},mode=max"
   -t "${IMAGE_TAG}"
