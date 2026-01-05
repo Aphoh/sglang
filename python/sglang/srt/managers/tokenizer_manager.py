@@ -406,7 +406,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
         
         # Futures for migration responses (keyed by rid)
-        self._migrate_futures: Dict[str, asyncio.Future] = {}
+        # Each entry is a tuple: (future, failure_count)
+        # We track failure counts to fail fast when all DP workers report failure
+        self._migrate_futures: Dict[str, Tuple[asyncio.Future, int]] = {}
         self.init_communicators(server_args)
 
     async def generate_request(
@@ -1213,8 +1215,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
 
         # Create a future to receive the response from scheduler
+        # Store as tuple: (future, failure_count)
         future = asyncio.get_event_loop().create_future()
-        self._migrate_futures[rid] = future
+        self._migrate_futures[rid] = (future, 0)
 
         # Send migrate request to scheduler
         req = MigrateReq(
@@ -1258,15 +1261,49 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         return pending_outputs
 
     def _handle_migrate_req_output(self, recv_obj: MigrateReqOutput) -> None:
-        """Handle MigrateReqOutput from scheduler."""
+        """Handle MigrateReqOutput from scheduler.
+        
+        In DP attention setups, migration requests are broadcast to all DP workers,
+        but only one worker has the request. We track responses to:
+        1. Set the future immediately on success=True
+        2. Fail fast when ALL workers have responded with failure
+        """
         rid = recv_obj.rid
-        future = self._migrate_futures.get(rid)
-        if future is not None and not future.done():
+        state = self._migrate_futures.get(rid)
+        
+        if state is None:
+            logger.warning(
+                f"_handle_migrate_req_output: no pending state for rid={rid}"
+            )
+            return
+        
+        future, failure_count = state
+        
+        if future.done():
+            # Already resolved (success from another worker)
+            return
+        
+        if recv_obj.success:
+            # Success - set the future with the result
             future.set_result(recv_obj)
         else:
-            logger.warning(
-                f"_handle_migrate_req_output: no future found for rid={rid}"
-            )
+            # Failure (e.g., request not found on this DP worker)
+            # Track the failure and check if all workers have responded
+            failure_count += 1
+            self._migrate_futures[rid] = (future, failure_count)
+            
+            dp_size = self.server_args.dp_size
+            if failure_count >= dp_size:
+                # All DP workers have responded with failure - fail fast
+                logger.debug(
+                    f"_handle_migrate_req_output: all {dp_size} workers failed for rid={rid}"
+                )
+                future.set_result(recv_obj)
+            else:
+                logger.debug(
+                    f"_handle_migrate_req_output: failure {failure_count}/{dp_size} for rid={rid} "
+                    f"(waiting for other workers)"
+                )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:

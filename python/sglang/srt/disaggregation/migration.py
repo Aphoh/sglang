@@ -177,7 +177,7 @@ class SchedulerMigrationMixin:
         # Find the request in running_batch
         req = self._find_and_remove_request(rid)
         if req is None:
-            logger.warning(f"Migration failed: request {rid} not found in running_batch")
+            logger.debug(f"Migration: request {rid} not found on this worker (expected in DP setups)")
             # Send error response back to tokenizer
             output = MigrateReqOutput(
                 rid=rid,
