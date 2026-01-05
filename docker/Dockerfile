@@ -520,26 +520,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     && rm -rf /var/lib/apt/lists/*
 
 # =============================================================================
-# Copy sglang source and do editable install
-# =============================================================================
-
-COPY --from=local_src /src /tmp/local_src
-RUN if [ "$BRANCH_TYPE" = "local" ]; then \
-        cp -r /tmp/local_src /sgl-workspace/sglang; \
-    elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
-        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
-    else \
-        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
-    fi \
-    && rm -rf /tmp/local_src
-
-# Editable install (fast - dependencies already installed)
-RUN --mount=type=cache,target=/root/.cache/pip \
-    cd /sgl-workspace/sglang \
-    && python3 -m pip install --no-deps -e "python"
-
-# =============================================================================
-# Final setup
+# Final setup (before source copy for better caching)
 # =============================================================================
 
 # Install essential Python packages (use constraints to prevent conflicts)
@@ -590,6 +571,25 @@ RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-p
         rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
         ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
     fi
+
+# =============================================================================
+# Copy sglang source and do editable install (LAST for better caching)
+# =============================================================================
+
+COPY --from=local_src /src /tmp/local_src
+RUN if [ "$BRANCH_TYPE" = "local" ]; then \
+        cp -r /tmp/local_src /sgl-workspace/sglang; \
+    elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
+        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    else \
+        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+    fi \
+    && rm -rf /tmp/local_src
+
+# Editable install (fast - dependencies already installed)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    cd /sgl-workspace/sglang \
+    && python3 -m pip install --no-deps -e "python"
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
