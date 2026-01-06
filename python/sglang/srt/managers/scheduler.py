@@ -2365,6 +2365,21 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        # Skip aborting requests that are in the migration inflight queue.
+        # These requests are being migrated to another tier and should not be aborted.
+        # The migration flow will handle cleanup when the transfer completes.
+        if (
+            hasattr(self, 'disagg_migration_inflight_queue')
+            and not recv_req.abort_all
+        ):
+            for req in self.disagg_migration_inflight_queue:
+                if req.rid.startswith(recv_req.rid):
+                    logger.warning(
+                        f"Skipping abort for request {recv_req.rid} - "
+                        f"request is in migration inflight queue"
+                    )
+                    return
+
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
