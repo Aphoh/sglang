@@ -16,6 +16,7 @@ Life cycle of a migration request:
 from __future__ import annotations
 
 import logging
+import random
 import time
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Type
@@ -166,8 +167,16 @@ class SchedulerMigrationMixin:
         rid = recv_req.rid
         bootstrap_host = recv_req.bootstrap_host
         bootstrap_port = recv_req.bootstrap_port
-        bootstrap_room = recv_req.bootstrap_room
         tokens_seen = recv_req.tokens_seen
+
+        # Generate bootstrap_room that encodes this worker's DP rank.
+        # The receiver will use: bootstrap_room % dp_size == src_dp_rank
+        # This allows the receiver to target the correct source DP rank without
+        # needing a separate data_parallel_rank field (which would also affect routing).
+        dp_rank = getattr(self, "dp_rank", 0) or 0
+        dp_size = getattr(self.server_args, "dp_size", 1) or 1
+        base = random.randint(0, 2**62)
+        bootstrap_room = base - (base % dp_size) + dp_rank
 
         logger.info(
             f"Processing migration request: {rid=}, tokens_seen={tokens_seen}, "
@@ -188,6 +197,7 @@ class SchedulerMigrationMixin:
                 rid=rid,
                 src_dp_rank=getattr(self, "dp_rank", None),
                 src_tp_rank=getattr(self, "tp_rank", None),
+                bootstrap_room=bootstrap_room,
                 pending_output_ids=[],
                 total_tokens=0,
                 success=False,
@@ -222,6 +232,7 @@ class SchedulerMigrationMixin:
             rid=rid,
             src_dp_rank=getattr(self, "dp_rank", None),
             src_tp_rank=getattr(self, "tp_rank", None),
+            bootstrap_room=bootstrap_room,
             pending_output_ids=pending_output_ids,
             total_tokens=total_tokens,
             success=True,

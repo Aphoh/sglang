@@ -1287,6 +1287,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         return {
             "pending_outputs": pending_outputs,
             "src_dp_rank": migrate_output.src_dp_rank,
+            "bootstrap_room": migrate_output.bootstrap_room,
         }
 
     def _handle_migrate_req_output(self, recv_obj: MigrateReqOutput) -> None:
