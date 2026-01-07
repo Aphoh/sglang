@@ -1394,6 +1394,10 @@ class MigrateReq(BaseReq):
 class MigrateReqOutput(BaseReq):
     """Response from migration request with pending outputs."""
 
+    # Debug: identify which worker produced this output (useful because DP migrations are broadcast)
+    src_dp_rank: Optional[int] = None
+    src_tp_rank: Optional[int] = None
+
     # Output token IDs that the frontend hasn't seen yet (based on tokens_seen in request)
     # This is output_ids[tokens_seen - len(origin_input_ids):] from the scheduler's Req
     pending_output_ids: List[int] = dataclasses.field(default_factory=list)

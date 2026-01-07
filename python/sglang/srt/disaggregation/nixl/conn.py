@@ -776,7 +776,10 @@ class NixlKVReceiver(CommonKVReceiver):
         logger.info(
             f"NixlKVReceiver.init: room={self.bootstrap_room}, "
             f"kv_indices_len={len(kv_indices)}, "
-            f"aux_index={aux_index}"
+            f"aux_index={aux_index}, "
+            f"bootstrap_addr={self.bootstrap_addr}, "
+            f"engine_rank={getattr(self.kv_mgr.kv_args, 'engine_rank', None)}, "
+            f"prefill_dp_rank={self.prefill_dp_rank}"
         )
         if self.bootstrap_infos is None:
             logger.error(
@@ -839,13 +842,21 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.bootstrap_room
             )
             # Check if the transfer failed
+            elapsed = None
+            if self.init_time is not None:
+                elapsed = time.time() - self.init_time
             if self.kv_mgr.transfer_statuses[self.bootstrap_room].is_failed():
                 self.conclude_state = KVPoll.Failed
                 logger.error(
-                    f"Transfer for room {self.bootstrap_room} failed due to node failure"
+                    f"NixlKVReceiver.transfer_done: room={self.bootstrap_room} FAILED "
+                    f"elapsed_s={elapsed} due to node failure"
                 )
             else:
                 self.conclude_state = KVPoll.Success
+                logger.info(
+                    f"NixlKVReceiver.transfer_done: room={self.bootstrap_room} SUCCESS "
+                    f"elapsed_s={elapsed}"
+                )
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore

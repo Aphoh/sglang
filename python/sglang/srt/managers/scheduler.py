@@ -2376,7 +2376,10 @@ class Scheduler(
                 if req.rid.startswith(recv_req.rid):
                     logger.warning(
                         f"Skipping abort for request {recv_req.rid} - "
-                        f"request is in migration inflight queue"
+                        f"request is in migration inflight queue "
+                        f"(dp_rank={getattr(self, 'dp_rank', None)}, tp_rank={getattr(self, 'tp_rank', None)}, "
+                        f"queue_size={len(self.disagg_migration_inflight_queue)}, "
+                        f"room={getattr(req, 'migration_bootstrap_room', None)})"
                     )
                     return
 

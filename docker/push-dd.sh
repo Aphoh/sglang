@@ -12,6 +12,16 @@ set -euo pipefail
 # - TAG_VERSION (default: v1)
 # - IMAGE_REPO (default: nvcr.io/nvidian/dynamo-dev/warnold-utils)
 # - DRY_RUN=1 (print command only)
+#
+# Flags:
+# - --local: Build locally without buildx/push, tag as sgl-dd-local
+
+LOCAL_BUILD=0
+for arg in "$@"; do
+  case "$arg" in
+    --local) LOCAL_BUILD=1 ;;
+  esac
+done
 
 CUDA_VERSION="${CUDA_VERSION:-13.0.1}"
 TAG_VERSION="${TAG_VERSION:-v1}"
@@ -34,23 +44,36 @@ IMAGE_TAG="${IMAGE_REPO}:sglang-dd-base-img-${TAG_VERSION}-${ARCH_TAG}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-CMD=(
-  docker buildx build
-  --platform "${PLATFORM}"
-  --build-arg "CUDA_VERSION=${CUDA_VERSION}"
-  --build-arg "BRANCH_TYPE=local"
-  --cache-from "type=registry,ref=${CACHE_REF}"
-  --cache-to "type=registry,ref=${CACHE_REF},mode=max"
-  -t "${IMAGE_TAG}"
-  --push
-  -f docker/Dockerfile
-  .
-)
-
-echo "Building/pushing: ${IMAGE_TAG}"
-echo "  platform: ${PLATFORM}"
-echo "  cache:    ${CACHE_REF}"
-echo "  cuda:     ${CUDA_VERSION}"
+if [[ "$LOCAL_BUILD" == "1" ]]; then
+  IMAGE_TAG="sgl-dd-local"
+  CMD=(
+    docker build
+    --build-arg "CUDA_VERSION=${CUDA_VERSION}"
+    --build-arg "BRANCH_TYPE=local"
+    -t "${IMAGE_TAG}"
+    -f docker/Dockerfile
+    .
+  )
+  echo "Building locally: ${IMAGE_TAG}"
+  echo "  cuda: ${CUDA_VERSION}"
+else
+  CMD=(
+    docker buildx build
+    --platform "${PLATFORM}"
+    --build-arg "CUDA_VERSION=${CUDA_VERSION}"
+    --build-arg "BRANCH_TYPE=local"
+    --cache-from "type=registry,ref=${CACHE_REF}"
+    --cache-to "type=registry,ref=${CACHE_REF},mode=max"
+    -t "${IMAGE_TAG}"
+    --push
+    -f docker/Dockerfile
+    .
+  )
+  echo "Building/pushing: ${IMAGE_TAG}"
+  echo "  platform: ${PLATFORM}"
+  echo "  cache:    ${CACHE_REF}"
+  echo "  cuda:     ${CUDA_VERSION}"
+fi
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   printf 'DRY_RUN: %q ' "${CMD[@]}"

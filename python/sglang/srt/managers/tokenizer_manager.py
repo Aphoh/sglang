@@ -409,6 +409,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Each entry is a tuple: (future, failure_count)
         # We track failure counts to fail fast when all DP workers report failure
         self._migrate_futures: Dict[str, Tuple[asyncio.Future, int]] = {}
+        # Extra per-rid metadata for migration debugging (do not affect logic)
+        self._migrate_debug: Dict[str, Dict[str, Any]] = {}
         self.init_communicators(server_args)
 
     async def generate_request(
@@ -1211,13 +1213,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             return []
 
         logger.info(
-            f"migrate_request: rid={rid}, tokens_seen={tokens_seen}"
+            f"migrate_request: start rid={rid}, tokens_seen={tokens_seen}, "
+            f"bootstrap={bootstrap_host}:{bootstrap_port}, room={bootstrap_room}"
         )
 
         # Create a future to receive the response from scheduler
         # Store as tuple: (future, failure_count)
         future = asyncio.get_event_loop().create_future()
         self._migrate_futures[rid] = (future, 0)
+        self._migrate_debug[rid] = {
+            "bootstrap_host": bootstrap_host,
+            "bootstrap_port": bootstrap_port,
+            "bootstrap_room": bootstrap_room,
+            "tokens_seen": tokens_seen,
+            "ts_start": time.time(),
+        }
 
         # Send migrate request to scheduler
         req = MigrateReq(
@@ -1233,32 +1243,51 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         try:
             migrate_output: MigrateReqOutput = await asyncio.wait_for(future, timeout=5.0)
         except asyncio.TimeoutError:
-            logger.error(f"migrate_request: timeout waiting for response for rid={rid}")
+            ts0 = self._migrate_debug.get(rid, {}).get("ts_start", None)
+            waited_s = (time.time() - ts0) if ts0 else None
+            logger.error(
+                f"migrate_request: timeout waiting for response for rid={rid} "
+                f"waited_s={waited_s} room={bootstrap_room}"
+            )
             self._migrate_futures.pop(rid, None)
+            self._migrate_debug.pop(rid, None)
             return []
         finally:
             self._migrate_futures.pop(rid, None)
+            self._migrate_debug.pop(rid, None)
 
         if not migrate_output.success:
             logger.error(
-                f"migrate_request: failed for rid={rid}, error={migrate_output.error}"
+                f"migrate_request: failed rid={rid}, "
+                f"src_dp_rank={getattr(migrate_output, 'src_dp_rank', None)}, "
+                f"src_tp_rank={getattr(migrate_output, 'src_tp_rank', None)}, "
+                f"error={migrate_output.error}"
             )
             return []
 
+        ts0 = time.time()
+        # `ts_start` was popped in finally; so use current time and log what we know.
         logger.info(
-            f"migrate_request: rid={rid}, success=True, "
+            f"migrate_request: success rid={rid}, "
+            f"src_dp_rank={getattr(migrate_output, 'src_dp_rank', None)}, "
+            f"src_tp_rank={getattr(migrate_output, 'src_tp_rank', None)}, "
             f"total_tokens={migrate_output.total_tokens}, "
             f"pending_output_ids_len={len(migrate_output.pending_output_ids)}"
         )
 
-        # Return pending outputs as list of dicts
+        # Return pending outputs as list of dicts along with source dp_rank
+        # The src_dp_rank is needed so the destination worker's KV receiver
+        # can target the correct DP rank on the source worker to fetch the KV cache
         pending_outputs = []
         if migrate_output.pending_output_ids:
             pending_outputs.append({
                 "token_ids": migrate_output.pending_output_ids,
             })
 
-        return pending_outputs
+        return {
+            "pending_outputs": pending_outputs,
+            "src_dp_rank": migrate_output.src_dp_rank,
+        }
 
     def _handle_migrate_req_output(self, recv_obj: MigrateReqOutput) -> None:
         """Handle MigrateReqOutput from scheduler.
@@ -1272,9 +1301,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         state = self._migrate_futures.get(rid)
         
         if state is None:
-            logger.warning(
-                f"_handle_migrate_req_output: no pending state for rid={rid}"
+            # This can happen in DP broadcast setups: late failures arriving after the future
+            # has already been resolved/popped. It's only alarming if a SUCCESS gets dropped.
+            msg = (
+                f"_handle_migrate_req_output: dropped output (no pending state) rid={rid} "
+                f"success={recv_obj.success} "
+                f"src_dp_rank={getattr(recv_obj, 'src_dp_rank', None)} "
+                f"src_tp_rank={getattr(recv_obj, 'src_tp_rank', None)} "
+                f"error={getattr(recv_obj, 'error', None)}"
             )
+            if recv_obj.success:
+                logger.warning(msg)
+            else:
+                logger.debug(msg)
             return
         
         future, failure_count = state
@@ -1285,6 +1324,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         
         if recv_obj.success:
             # Success - set the future with the result
+            logger.info(
+                f"_handle_migrate_req_output: SUCCESS rid={rid} "
+                f"src_dp_rank={getattr(recv_obj, 'src_dp_rank', None)} "
+                f"src_tp_rank={getattr(recv_obj, 'src_tp_rank', None)} "
+                f"pending_output_ids_len={len(recv_obj.pending_output_ids)} total_tokens={recv_obj.total_tokens}"
+            )
             future.set_result(recv_obj)
         else:
             # Failure (e.g., request not found on this DP worker)
@@ -1296,13 +1341,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if failure_count >= dp_size:
                 # All DP workers have responded with failure - fail fast
                 logger.debug(
-                    f"_handle_migrate_req_output: all {dp_size} workers failed for rid={rid}"
+                    f"_handle_migrate_req_output: all {dp_size} workers failed for rid={rid} "
+                    f"last_src_dp_rank={getattr(recv_obj, 'src_dp_rank', None)} "
+                    f"last_src_tp_rank={getattr(recv_obj, 'src_tp_rank', None)} "
+                    f"last_error={getattr(recv_obj, 'error', None)}"
                 )
                 future.set_result(recv_obj)
             else:
                 logger.debug(
                     f"_handle_migrate_req_output: failure {failure_count}/{dp_size} for rid={rid} "
-                    f"(waiting for other workers)"
+                    f"(waiting for other workers) "
+                    f"src_dp_rank={getattr(recv_obj, 'src_dp_rank', None)} "
+                    f"src_tp_rank={getattr(recv_obj, 'src_tp_rank', None)} "
+                    f"error={getattr(recv_obj, 'error', None)}"
                 )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
