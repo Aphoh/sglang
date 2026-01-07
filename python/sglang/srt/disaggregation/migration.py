@@ -243,6 +243,8 @@ class SchedulerMigrationMixin:
         self._setup_migration_sender(req, bootstrap_host, bootstrap_port, bootstrap_room)
 
         # Add to migration inflight queue
+        # Mark as migrating so normal completion path won't release KV cache
+        req.is_migrating = True
         self.disagg_migration_inflight_queue.append(req)
         # Debug/timing metadata for migration instrumentation
         req.migration_bootstrap_room = bootstrap_room

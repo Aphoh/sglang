@@ -55,7 +55,9 @@ class SchedulerOutputProcessorMixin:
                     req.rid,
                     thread_finish_flag=True,
                 )
-                release_kv_cache(req, self.tree_cache)
+                # Skip KV release for migrating requests - migration owns the cleanup
+                if not req.is_migrating:
+                    release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
@@ -112,7 +114,9 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
+                        # Skip KV release for migrating requests - migration owns the cleanup
+                        if not req.is_migrating:
+                            release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
@@ -241,7 +245,9 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
+                        # Skip KV release for migrating requests - migration owns the cleanup
+                        if not req.is_migrating:
+                            release_kv_cache(req, self.tree_cache)
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
@@ -302,7 +308,9 @@ class SchedulerOutputProcessorMixin:
             req.check_finished()
 
             if req.finished():
-                release_kv_cache(req, self.tree_cache)
+                # Skip KV release for migrating requests - migration owns the cleanup
+                if not req.is_migrating:
+                    release_kv_cache(req, self.tree_cache)
                 req.time_stats.completion_time = time.perf_counter()
                 break
 
@@ -362,12 +370,14 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
-                if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                    # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
-                    if not self.decode_offload_manager.offload_kv_cache(req):
+                # Skip KV release for migrating requests - migration owns the cleanup
+                if not req.is_migrating:
+                    if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                        # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
+                        if not self.decode_offload_manager.offload_kv_cache(req):
+                            release_kv_cache(req, self.tree_cache)
+                    else:
                         release_kv_cache(req, self.tree_cache)
-                else:
-                    release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.completion_time = time.perf_counter()
 

@@ -601,6 +601,9 @@ class Req:
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
+        # For decode->decode migration: when True, migration owns KV cache release
+        self.is_migrating = False
+
         # Incremental streamining
         self.send_token_offset: int = 0
         self.send_decode_id_offset: int = 0
