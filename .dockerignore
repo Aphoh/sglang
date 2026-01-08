@@ -2,12 +2,21 @@
 .git
 .gitignore
 
-# Python
+# Python bytecode and caches (many small files that slow down layer export)
+**/__pycache__
 __pycache__
 *.py[cod]
 *$py.class
-*.so
+**/*.pyc
+**/*.pyo
 .Python
+
+# Compiled shared libraries (rebuilt in container)
+*.so
+**/*.so
+**/*.abi3.so
+
+# Python build artifacts
 build/
 develop-eggs/
 dist/
@@ -24,10 +33,18 @@ wheels/
 .installed.cfg
 *.egg
 
+# Type checking and linting caches
+**/.mypy_cache
+.mypy_cache/
+**/.ruff_cache
+.ruff_cache/
+
 # Virtual environments
 .venv
 venv/
 ENV/
+**/.venv
+**/venv
 
 # IDE
 .vscode/
@@ -43,14 +60,19 @@ ENV/
 .coverage.*
 htmlcov/
 .pytest_cache/
+**/.pytest_cache
 .hypothesis/
 
 # Docs
 docs/_build/
 
-# Logs
+# Logs and debug artifacts
 *.log
+**/*.log
 logs/
+**/check_fingerprint.log
+**/metadata_debug.log
+**/build-logs
 
 # Docker
 Dockerfile*
@@ -61,6 +83,11 @@ docker-compose*.yml
 .github/
 .gitlab-ci.yml
 .travis.yml
+
+# Rust build artifacts
+sgl-router/target/
+target/
+**/target/
 
 # Misc
 .DS_Store
