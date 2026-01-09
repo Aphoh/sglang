@@ -291,7 +291,7 @@ class NixlKVManager(CommonKVManager):
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
         agent_name = decode_kv_args.agent_name
         if agent_name in self.decode_kv_args_table:
-            logger.info(f"Peer {agent_name} was already registered, ignoring.")
+            logger.debug(f"Peer {agent_name} was already registered, ignoring.")
             return
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
@@ -564,7 +564,7 @@ class NixlKVManager(CommonKVManager):
             if req.is_dummy():
                 continue
 
-            logger.info(
+            logger.debug(
                 f"add_transfer_request: room={bootstrap_room}, "
                 f"index_slice={index_slice}, "
                 f"kv_indices_len={len(kv_indices)}, "
@@ -657,7 +657,7 @@ class NixlKVManager(CommonKVManager):
             """This thread recvs transfer info from the receiver (decode engine)"""
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
-                logger.info(
+                logger.debug(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )
                 assert (
@@ -671,7 +671,7 @@ class NixlKVManager(CommonKVManager):
                     self._add_remote_peer(
                         KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     )
-                    logger.info(f"Register KVArgs from {agent_name} successfully")
+                    logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
                 room = int(room)
                 if room not in self.transfer_infos:
@@ -682,9 +682,9 @@ class NixlKVManager(CommonKVManager):
                 required_dst_info_num = self.transfer_infos[room][
                     agent_name
                 ].required_dst_info_num
-                logger.info(f"got info {room=} {agent_name=} {required_dst_info_num=}")
+                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
-                    logger.info(f"{room=} is bootstrapped")
+                    logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread, daemon=True).start()
@@ -709,7 +709,7 @@ class NixlKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
     ):
-        logger.info(
+        logger.debug(
             f"NixlKVSender.send: room={self.bootstrap_room}, "
             f"kv_indices_len={len(kv_indices)}, "
             f"curr_idx={self.curr_idx}, "
@@ -773,7 +773,7 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
-        logger.info(
+        logger.debug(
             f"NixlKVReceiver.init: room={self.bootstrap_room}, "
             f"kv_indices_len={len(kv_indices)}, "
             f"aux_index={aux_index}, "
@@ -789,12 +789,12 @@ class NixlKVReceiver(CommonKVReceiver):
             return
 
         for bootstrap_info in self.bootstrap_infos:
-            logger.info(
+            logger.debug(
                 f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
             )
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
-            logger.info(
+            logger.debug(
                 f"Sending to sender with bootstrap room {self.bootstrap_room} {is_dummy=}"
             )
             with lock:
@@ -853,7 +853,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 )
             else:
                 self.conclude_state = KVPoll.Success
-                logger.info(
+                logger.debug(
                     f"NixlKVReceiver.transfer_done: room={self.bootstrap_room} SUCCESS "
                     f"elapsed_s={elapsed}"
                 )
@@ -888,7 +888,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
                     ]
                 )
-            logger.info(f"Sent KV args to sender at {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')}")
+            logger.debug(f"Sent KV args to sender at {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')}")
 
     def failure_exception(self):
         raise RuntimeError("NIXL KVReceiver Exception")

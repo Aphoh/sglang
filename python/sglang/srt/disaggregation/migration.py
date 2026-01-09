@@ -178,7 +178,7 @@ class SchedulerMigrationMixin:
         base = random.randint(0, 2**62)
         bootstrap_room = base - (base % dp_size) + dp_rank
 
-        logger.info(
+        logger.debug(
             f"Processing migration request: {rid=}, tokens_seen={tokens_seen}, "
             f"bootstrap={bootstrap_host}:{bootstrap_port}, room={bootstrap_room}, "
             f"src_dp_rank={getattr(self, 'dp_rank', None)}, src_tp_rank={getattr(self, 'tp_rank', None)}"
@@ -187,7 +187,7 @@ class SchedulerMigrationMixin:
         # Find the request in running_batch
         req = self._find_and_remove_request(rid)
         if req is None:
-            logger.info(
+            logger.debug(
                 f"Migration: request {rid} not found on this worker (expected in DP setups) "
                 f"src_dp_rank={getattr(self, 'dp_rank', None)}, src_tp_rank={getattr(self, 'tp_rank', None)}, "
                 f"room={bootstrap_room}"
@@ -217,7 +217,7 @@ class SchedulerMigrationMixin:
         # Pending output tokens are everything after that
         pending_output_ids = list(req.output_ids[output_tokens_seen:])
 
-        logger.info(
+        logger.debug(
             f"Migration request found: rid={rid}, "
             f"origin_input_ids_len={origin_input_len}, "
             f"output_ids_len={len(req.output_ids)}, "
@@ -251,7 +251,7 @@ class SchedulerMigrationMixin:
         req.migration_ts_enqueued = time.time()
         req.migration_ts_send_called = None
         req.migration_ts_success = None
-        logger.info(
+        logger.debug(
             f"Request {rid} added to migration queue: "
             f"room={bootstrap_room}, "
             f"src_dp_rank={getattr(self, 'dp_rank', None)}, src_tp_rank={getattr(self, 'tp_rank', None)}, "
@@ -304,7 +304,7 @@ class SchedulerMigrationMixin:
             # Use filter_batch with explicit keep_indices to properly update all tensors
             self.running_batch.filter_batch(keep_indices=keep_indices)
         
-        logger.info(f"Removed request {rid} from running_batch, remaining={len(self.running_batch.reqs)}")
+        logger.debug(f"Removed request {rid} from running_batch, remaining={len(self.running_batch.reqs)}")
         return req
 
     def _setup_migration_sender(
@@ -365,7 +365,7 @@ class SchedulerMigrationMixin:
         # The last generated token doesn't have KV yet, so we may need to adjust
         if hasattr(req, 'kv_allocated_len') and num_tokens_to_send > req.kv_allocated_len:
             # Clamp to what's actually allocated
-            logger.info(
+            logger.debug(
                 f"_send_migration_kv: clamping num_tokens_to_send from {num_tokens_to_send} to {req.kv_allocated_len}"
             )
             num_tokens_to_send = req.kv_allocated_len
@@ -384,7 +384,7 @@ class SchedulerMigrationMixin:
         page_size = token_to_kv_pool.page_size
         page_indices = kv_to_page_indices(kv_indices.cpu().numpy(), page_size)
         
-        logger.info(
+        logger.debug(
             f"_send_migration_kv: rid={req.rid}, "
             f"num_tokens_to_send={num_tokens_to_send}, "
             f"origin_input_ids_len={len(req.origin_input_ids)}, "
@@ -410,7 +410,7 @@ class SchedulerMigrationMixin:
             kv_indices=page_indices,
         )
         req.migration_ts_send_called = time.time()
-        logger.info(
+        logger.debug(
             f"_send_migration_kv: send called: rid={req.rid}, "
             f"room={getattr(req, 'migration_bootstrap_room', None)}, "
             f"src_dp_rank={getattr(self, 'dp_rank', None)}, src_tp_rank={getattr(self, 'tp_rank', None)}, "
@@ -450,7 +450,7 @@ class SchedulerMigrationMixin:
                 num_pages = kv_to_page_num(req.migration_num_tokens, page_size)
                 enq_ts = getattr(req, "migration_ts_enqueued", None)
                 t_enqueued_s = (time.time() - enq_ts) if enq_ts else None
-                logger.info(
+                logger.debug(
                     f"process_migration_inflight_queue: rid={req.rid}, "
                     f"room={getattr(req, 'migration_bootstrap_room', None)}, "
                     f"src_dp_rank={getattr(self, 'dp_rank', None)}, src_tp_rank={getattr(self, 'tp_rank', None)}, "
@@ -503,7 +503,7 @@ class SchedulerMigrationMixin:
                     if (send_called is not None)
                     else None
                 )
-                logger.info(
+                logger.debug(
                     f"Migration KV transfer success: rid={req.rid}, "
                     f"room={getattr(req, 'migration_bootstrap_room', None)}, "
                     f"src_dp_rank={getattr(self, 'dp_rank', None)}, src_tp_rank={getattr(self, 'tp_rank', None)}, "
@@ -527,7 +527,7 @@ class SchedulerMigrationMixin:
                     self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
                     req.metadata_buffer_index = -1
                 done_reqs.append(req)
-                logger.info(f"Migration cleanup completed for request {req.rid}")
+                logger.debug(f"Migration cleanup completed for request {req.rid}")
             elif poll == KVPoll.Failed:
                 error_message = (
                     f"Migration transfer failed for request {req.rid} "

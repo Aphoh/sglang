@@ -705,7 +705,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if len(page_indices) == 0:
-            logger.info(
+            logger.debug(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return

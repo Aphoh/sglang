@@ -338,11 +338,30 @@ class EAGLEDraftCudaGraphRunner:
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
 
+        # Bounds check: if index exceeds capture_bs, clamp to max
+        if index >= len(self.capture_bs):
+            if os.environ.get("EAGLE_DEBUG", "0") == "1":
+                print(f"[EAGLE DEBUG] ERROR: index={index} >= len(capture_bs)={len(self.capture_bs)}!")
+                if self.require_mlp_tp_gather:
+                    print(f"[EAGLE DEBUG]   max_batch_size={max_batch_size}, max_capture_bs={max(self.capture_bs)}")
+                else:
+                    print(f"[EAGLE DEBUG]   raw_bs={raw_bs}, max_capture_bs={max(self.capture_bs)}")
+            index = len(self.capture_bs) - 1
+
         bs = self.capture_bs[index]
 
         # DEBUG: Log batch size mismatch warning for DP debugging
         if os.environ.get("EAGLE_DEBUG", "0") == "1":
-            print(f"[EAGLE DEBUG] Selected bs={bs} (from capture_bs index={index})")
+            max_capture_bs = max(self.capture_bs) if self.capture_bs else 0
+            if self.require_mlp_tp_gather:
+                if max_batch_size > max_capture_bs:
+                    print(f"[EAGLE DEBUG] ERROR: max_batch_size={max_batch_size} > max_capture_bs={max_capture_bs}!")
+                if raw_bs > bs:
+                    print(f"[EAGLE DEBUG] ERROR: raw_bs={raw_bs} > bs={bs}!")
+            else:
+                if raw_bs > max_capture_bs:
+                    print(f"[EAGLE DEBUG] ERROR: raw_bs={raw_bs} > max_capture_bs={max_capture_bs}!")
+            print(f"[EAGLE DEBUG] Selected bs={bs} (from capture_bs index={index}, max_capture={max_capture_bs})")
             if self.require_mlp_tp_gather and raw_bs != bs:
                 print(f"[EAGLE DEBUG] WARNING: Batch size mismatch! raw_bs={raw_bs} != bs={bs}")
                 print(f"[EAGLE DEBUG]   topk_p shape: {forward_batch.spec_info.topk_p.shape}")
