@@ -679,6 +679,8 @@ class Scheduler(
             self.recv_from_rpc = None
             self.send_to_tokenizer = SenderWrapper(None)
             self.send_to_detokenizer = SenderWrapper(None)
+            self.send_to_dp_controller = None
+            self.max_reqs_per_dp_worker = None
 
         if self.current_scheduler_metrics_enabled():
             self.send_metrics_from_scheduler = get_zmq_socket(
