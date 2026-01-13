@@ -4198,6 +4198,20 @@ class ServerArgs:
             self.schedule_conservativeness >= 0
         ), "schedule_conservativeness must be non-negative"
 
+        # Check max_reqs_per_dp_worker requires shortest_queue load balancing
+        if (
+            self.max_reqs_per_dp_worker is not None
+            and self.dp_size > 1
+            and self.load_balance_method != "shortest_queue"
+        ):
+            raise ValueError(
+                f"--max-reqs-per-dp-worker requires --load-balance-method shortest_queue, "
+                f"but got '{self.load_balance_method}'. "
+                f"Without shortest_queue load balancing, requests cannot be efficiently "
+                f"routed away from full workers, which may cause requests to hang. "
+                f"Please set --load-balance-method shortest_queue when using --max-reqs-per-dp-worker."
+            )
+
         if self.model_impl == "mindspore":
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
 

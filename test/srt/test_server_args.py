@@ -270,5 +270,54 @@ class TestPortArgs(unittest.TestCase):
         self.assertIn("expected ':' after ']'", str(context.exception))
 
 
+class TestServerArgsValidation(unittest.TestCase):
+    def test_max_reqs_per_dp_worker_requires_shortest_queue(self):
+        """Test that max_reqs_per_dp_worker requires shortest_queue load balancing."""
+        server_args = ServerArgs(model_path="dummy")
+        server_args.dp_size = 2
+        server_args.max_reqs_per_dp_worker = 10
+        server_args.load_balance_method = "round_robin"
+
+        with self.assertRaises(ValueError) as context:
+            server_args.check_server_args()
+
+        self.assertIn("--max-reqs-per-dp-worker requires --load-balance-method shortest_queue", str(context.exception))
+        self.assertIn("round_robin", str(context.exception))
+
+    def test_max_reqs_per_dp_worker_with_shortest_queue_passes(self):
+        """Test that max_reqs_per_dp_worker with shortest_queue passes validation."""
+        server_args = ServerArgs(model_path="dummy")
+        server_args.dp_size = 2
+        server_args.max_reqs_per_dp_worker = 10
+        server_args.load_balance_method = "shortest_queue"
+
+        # Should not raise an error for this specific check
+        # Note: check_server_args may still fail for other reasons (like missing model config)
+        # but we're testing that this specific validation passes
+        try:
+            server_args.check_server_args()
+        except ValueError as e:
+            # Make sure the error is NOT about max_reqs_per_dp_worker
+            self.assertNotIn("--max-reqs-per-dp-worker", str(e))
+        except Exception:
+            # Other errors are fine - we just care that our validation passed
+            pass
+
+    def test_max_reqs_per_dp_worker_with_dp_size_1_passes(self):
+        """Test that max_reqs_per_dp_worker is allowed with dp_size=1 (no DP)."""
+        server_args = ServerArgs(model_path="dummy")
+        server_args.dp_size = 1
+        server_args.max_reqs_per_dp_worker = 10
+        server_args.load_balance_method = "round_robin"
+
+        # Should not raise the max_reqs_per_dp_worker error
+        try:
+            server_args.check_server_args()
+        except ValueError as e:
+            self.assertNotIn("--max-reqs-per-dp-worker", str(e))
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     unittest.main()
