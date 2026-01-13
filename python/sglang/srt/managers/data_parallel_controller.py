@@ -30,6 +30,7 @@ import zmq
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     BlockReqInput,
+    RedirectReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
@@ -137,11 +138,32 @@ class DataParallelController:
         self.global_balance_id = 0
 
         # Init inter-process communication
-        self.context = zmq.Context(1 + server_args.dp_size)
+        self.context = zmq.Context(2 + server_args.dp_size)
         if server_args.node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
+
+        # Feedback channel for redirect messages from workers (when using max_reqs_per_dp_worker)
+        self.recv_from_workers = None
+        self.max_reqs_per_dp_worker = server_args.max_reqs_per_dp_worker
+        if (
+            self.max_reqs_per_dp_worker is not None
+            and server_args.node_rank == 0
+            and port_args.dp_controller_feedback_ipc_name is not None
+        ):
+            self.recv_from_workers = get_zmq_socket(
+                self.context,
+                zmq.PULL,
+                port_args.dp_controller_feedback_ipc_name,
+                True,  # bind=True since controller is the server
+            )
+            logger.info(
+                f"DP Controller: Enabled redirect handling with max_reqs_per_dp_worker={self.max_reqs_per_dp_worker}"
+            )
+
+        # Pending queue for requests when all workers are at capacity
+        self.pending_queue: deque = deque()
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -182,6 +204,8 @@ class DataParallelController:
 
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
+        # Try to dispatch pending requests after load update (workers may have capacity now)
+        self._process_pending_queue()
 
     def dispatching_with_trace(self, req: Req):
         if self.server_args.enable_trace:
@@ -215,6 +239,10 @@ class DataParallelController:
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
+            # Share the feedback channel with all schedulers
+            tmp_port_args.dp_controller_feedback_ipc_name = (
+                port_args.dp_controller_feedback_ipc_name
+            )
 
             # This port is checked free in PortArgs.init_new.
             # We hold it first so that the next dp worker gets a different port
@@ -423,6 +451,10 @@ class DataParallelController:
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
+                    # Share the feedback channel with all schedulers
+                    rank_port_args.dp_controller_feedback_ipc_name = (
+                        port_args.dp_controller_feedback_ipc_name
+                    )
 
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
@@ -505,14 +537,70 @@ class DataParallelController:
         )
         self.round_robin_scheduler(req)
 
+    def _handle_redirect(self, redirect_req: RedirectReq):
+        """Handle a redirect request from a worker that was at capacity.
+
+        Tries to find another worker that hasn't been tried yet.
+        If all workers have been tried, queue the request locally.
+        """
+        original_req = redirect_req.original_req
+        tried_dp_ranks = set(redirect_req.tried_dp_ranks)
+        tried_dp_ranks.add(redirect_req.source_dp_rank)
+
+        # Find an untried worker
+        for dp_rank in range(self.server_args.dp_size):
+            if dp_rank not in tried_dp_ranks:
+                # Update the tried_dp_ranks on the request in case it bounces again
+                # We attach this info to the request so the next worker can include it
+                # if it also needs to redirect
+                original_req.tried_dp_ranks = list(tried_dp_ranks)
+                self.workers[dp_rank].send_pyobj(original_req)
+                logger.debug(
+                    f"Redirected request {original_req.rid} to DP worker {dp_rank} "
+                    f"(tried: {tried_dp_ranks})"
+                )
+                return
+
+        # All workers have been tried - queue at controller level
+        self.pending_queue.append(original_req)
+        logger.info(
+            f"All DP workers at capacity (max_reqs_per_dp_worker={self.max_reqs_per_dp_worker}). "
+            f"Request {original_req.rid} queued at DP controller. "
+            f"Pending queue size: {len(self.pending_queue)}"
+        )
+
+    def _process_pending_queue(self):
+        """Try to dispatch requests from the pending queue to workers."""
+        # This is called after receiving new requests or redirects
+        # Try to dispatch pending requests using round-robin
+        while self.pending_queue:
+            req = self.pending_queue[0]
+            # Reset tried_dp_ranks for a fresh dispatch attempt
+            if hasattr(req, "tried_dp_ranks"):
+                req.tried_dp_ranks = []
+            # Use round-robin for pending requests
+            self.workers[self.round_robin_counter].send_pyobj(req)
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
+            self.pending_queue.popleft()
+
     def event_loop(self):
         while True:
+            # Process incoming requests from tokenizer
             while True:
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
+
+            # Process redirect messages from workers (if enabled)
+            if self.recv_from_workers is not None:
+                while True:
+                    try:
+                        redirect_req = self.recv_from_workers.recv_pyobj(zmq.NOBLOCK)
+                    except zmq.ZMQError:
+                        break
+                    self._handle_redirect(redirect_req)
 
 
 def run_data_parallel_controller_process(

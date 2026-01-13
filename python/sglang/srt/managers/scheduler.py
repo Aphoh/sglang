@@ -108,6 +108,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    RedirectReq,
     SlowDownReqInput,
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
@@ -647,6 +648,24 @@ class Scheduler(
 
             self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
             self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
+
+            # Socket for sending redirects back to DP controller (when max_reqs_per_dp_worker is set)
+            self.send_to_dp_controller = None
+            self.max_reqs_per_dp_worker = server_args.max_reqs_per_dp_worker
+            if (
+                self.max_reqs_per_dp_worker is not None
+                and port_args.dp_controller_feedback_ipc_name is not None
+            ):
+                self.send_to_dp_controller = get_zmq_socket(
+                    context,
+                    zmq.PUSH,
+                    port_args.dp_controller_feedback_ipc_name,
+                    False,  # bind=False since scheduler is the client
+                )
+                logger.info(
+                    f"Scheduler DP{self.dp_rank}: Enabled redirect with "
+                    f"max_reqs_per_dp_worker={self.max_reqs_per_dp_worker}"
+                )
 
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
@@ -1293,6 +1312,10 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        # Check if we should redirect to another DP worker (when max_reqs_per_dp_worker is set)
+        if self._should_redirect_request(recv_req):
+            return
+
         # Create a new request
         if (
             recv_req.session_params is None
@@ -1548,6 +1571,44 @@ class Scheduler(
             return False
         return True
 
+    def _should_redirect_request(
+        self, recv_req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
+    ) -> bool:
+        """Check if this request should be redirected to another DP worker.
+
+        Returns True if the request was redirected, False otherwise.
+        """
+        # Skip if redirect is not enabled
+        if self.send_to_dp_controller is None or self.max_reqs_per_dp_worker is None:
+            return False
+
+        # Count current requests (running + waiting)
+        current_reqs = len(self.running_batch.reqs) + len(self.waiting_queue)
+
+        # Check if we're at capacity
+        if current_reqs < self.max_reqs_per_dp_worker:
+            return False
+
+        # Build the list of tried DP ranks
+        tried_dp_ranks = list(recv_req.tried_dp_ranks or [])
+        tried_dp_ranks.append(self.dp_rank)
+
+        # Send redirect back to DP controller
+        redirect_req = RedirectReq(
+            rid=recv_req.rid,
+            original_req=recv_req,
+            source_dp_rank=self.dp_rank,
+            tried_dp_ranks=tried_dp_ranks,
+        )
+        self.send_to_dp_controller.send_pyobj(redirect_req)
+
+        logger.debug(
+            f"Scheduler DP{self.dp_rank}: Redirecting request {recv_req.rid} "
+            f"(current_reqs={current_reqs}, max={self.max_reqs_per_dp_worker}, "
+            f"tried={tried_dp_ranks})"
+        )
+        return True
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
@@ -1595,6 +1656,10 @@ class Scheduler(
         self,
         recv_req: TokenizedEmbeddingReqInput,
     ):
+        # Check if we should redirect to another DP worker (when max_reqs_per_dp_worker is set)
+        if self._should_redirect_request(recv_req):
+            return
+
         req = Req(
             recv_req.rid,
             recv_req.input_text,

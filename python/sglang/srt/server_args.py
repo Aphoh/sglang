@@ -364,6 +364,7 @@ class ServerArgs:
     dp_size: int = 1
     load_balance_method: str = "round_robin"
     load_watch_interval: float = 0.1
+    max_reqs_per_dp_worker: Optional[int] = None
     # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
     prefill_round_robin_balance: bool = False
 
@@ -2835,6 +2836,14 @@ class ServerArgs:
             help="The interval of load watching in seconds.",
         )
         parser.add_argument(
+            "--max-reqs-per-dp-worker",
+            type=int,
+            default=ServerArgs.max_reqs_per_dp_worker,
+            help="Maximum number of requests per DP worker. When a worker reaches this limit, "
+            "incoming requests are redirected to other workers. If all workers are full, "
+            "requests are queued at the DP controller.",
+        )
+        parser.add_argument(
             "--prefill-round-robin-balance",
             default=ServerArgs.prefill_round_robin_balance,
             action="store_true",
@@ -4520,6 +4529,9 @@ class PortArgs:
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 
+    # The ipc filename for schedulers to send redirects back to DP controller
+    dp_controller_feedback_ipc_name: Optional[str] = None
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,
@@ -4547,6 +4559,12 @@ class PortArgs:
 
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
+            # Only create feedback channel if max_reqs_per_dp_worker is set and dp_size > 1
+            dp_controller_feedback_ipc_name = None
+            if server_args.max_reqs_per_dp_worker is not None and server_args.dp_size > 1:
+                dp_controller_feedback_ipc_name = (
+                    f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+                )
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -4555,6 +4573,7 @@ class PortArgs:
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                dp_controller_feedback_ipc_name=dp_controller_feedback_ipc_name,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -4576,6 +4595,7 @@ class PortArgs:
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_ipc_name = port_base + 3
+            dp_feedback_port = port_base + 5
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -4591,6 +4611,8 @@ class PortArgs:
                     wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_ipc_name, "metrics_ipc_name")
+                    if server_args.max_reqs_per_dp_worker is not None:
+                        wait_port_available(dp_feedback_port, "dp_feedback_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
@@ -4601,6 +4623,13 @@ class PortArgs:
                 )
                 raise
 
+            # Only create feedback channel if max_reqs_per_dp_worker is set
+            dp_controller_feedback_ipc_name = None
+            if server_args.max_reqs_per_dp_worker is not None and server_args.dp_size > 1:
+                dp_controller_feedback_ipc_name = (
+                    f"tcp://{dist_init_host}:{dp_feedback_port}"
+                )
+
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
@@ -4609,6 +4638,7 @@ class PortArgs:
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                dp_controller_feedback_ipc_name=dp_controller_feedback_ipc_name,
             )
 
 

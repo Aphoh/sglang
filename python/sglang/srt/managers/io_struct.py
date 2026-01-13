@@ -707,6 +707,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    # Tracks which DP workers have been tried (for redirect/bounce-back)
+    tried_dp_ranks: Optional[List[int]] = None
+
     # Priority for the request
     priority: Optional[int] = None
 
@@ -881,6 +884,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     sampling_params: SamplingParams
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    # Tracks which DP workers have been tried (for redirect/bounce-back)
+    tried_dp_ranks: Optional[List[int]] = None
     # Priority for the request
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
@@ -1657,6 +1662,22 @@ class GetLoadReqOutput(BaseReq):
 @dataclass
 class WatchLoadUpdateReq(BaseReq):
     loads: List[GetLoadReqOutput]
+
+
+@dataclass
+class RedirectReq(BaseReq):
+    """Request redirected from a full DP worker back to the DP controller.
+
+    When a scheduler receives a request but is at max capacity, it sends this
+    message back to the DP controller, which will try dispatching to another worker.
+    """
+
+    # The original request that needs to be redirected
+    original_req: Union["TokenizedGenerateReqInput", "TokenizedEmbeddingReqInput"]
+    # The DP rank that rejected this request
+    source_dp_rank: int
+    # Set of DP ranks that have already been tried (to avoid retrying the same workers)
+    tried_dp_ranks: List[int] = field(default_factory=list)
 
 
 @dataclass
