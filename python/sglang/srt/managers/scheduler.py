@@ -1573,6 +1573,25 @@ class Scheduler(
             return False
         return True
 
+    def _get_total_queued_requests(self) -> int:
+        """Count total requests across running batch and all queues.
+
+        This is used for redirect decisions with max_reqs_per_dp_worker.
+        Counts the appropriate queues based on the disaggregation mode.
+        """
+        total = len(self.running_batch.reqs)
+
+        if self.disaggregation_mode == DisaggregationMode.NULL:
+            total += len(self.waiting_queue)
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            total += len(self.disagg_prefill_bootstrap_queue.queue)
+            total += len(self.disagg_prefill_inflight_queue)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            total += len(self.disagg_decode_prealloc_queue.queue)
+            total += len(self.disagg_decode_transfer_queue.queue)
+
+        return total
+
     def _should_redirect_request(
         self, recv_req: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
     ) -> bool:
@@ -1584,8 +1603,8 @@ class Scheduler(
         if self.send_to_dp_controller is None or self.max_reqs_per_dp_worker is None:
             return False
 
-        # Count current requests (running + waiting)
-        current_reqs = len(self.running_batch.reqs) + len(self.waiting_queue)
+        # Count current requests (running + all queued requests)
+        current_reqs = self._get_total_queued_requests()
 
         # Check if we're at capacity
         if current_reqs < self.max_reqs_per_dp_worker:
