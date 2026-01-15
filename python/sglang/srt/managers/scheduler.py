@@ -1579,30 +1579,16 @@ class Scheduler(
         This is used for redirect decisions with max_reqs_per_dp_worker.
         Counts the appropriate queues based on the disaggregation mode.
         """
-        total = sum(1 for req in self.running_batch.reqs if not req.finished())
+        total = len(self.running_batch.reqs)
 
         if self.disaggregation_mode == DisaggregationMode.NULL:
-            total += sum(1 for req in self.waiting_queue if not req.finished())
+            total += len(self.waiting_queue)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            total += sum(
-                1
-                for req in self.disagg_prefill_bootstrap_queue.queue
-                if not req.finished()
-            )
-            total += sum(
-                1 for req in self.disagg_prefill_inflight_queue if not req.finished()
-            )
+            total += len(self.disagg_prefill_bootstrap_queue.queue)
+            total += len(self.disagg_prefill_inflight_queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            total += sum(
-                1
-                for decode_req in self.disagg_decode_prealloc_queue.queue
-                if not decode_req.req.finished()
-            )
-            total += sum(
-                1
-                for decode_req in self.disagg_decode_transfer_queue.queue
-                if not decode_req.req.finished()
-            )
+            total += len(self.disagg_decode_prealloc_queue.queue)
+            total += len(self.disagg_decode_transfer_queue.queue)
 
         return total
 
