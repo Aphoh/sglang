@@ -51,6 +51,7 @@ from sglang.srt.tracing.trace import (
     trace_slice_start,
 )
 from sglang.srt.utils import numa_utils
+from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.common import (
     bind_port,
     configure_ipv6,
@@ -165,6 +166,17 @@ class DataParallelController:
         # Pending queue for requests when all workers are at capacity
         self.pending_queue: deque = deque()
 
+        # Load update watchdog (warn if updates are too infrequent)
+        self._load_update_warn_sec = get_int_env_var(
+            "SGLANG_DP_LOAD_UPDATE_WARN_SEC", 0
+        )
+        self._load_update_warn_interval_sec = get_int_env_var(
+            "SGLANG_DP_LOAD_UPDATE_WARN_INTERVAL_SEC",
+            max(self._load_update_warn_sec, 1),
+        )
+        self._last_load_update_time = time.monotonic()
+        self._last_load_update_warn_time = 0.0
+
         # Dispatch method
         self.round_robin_counter = 0
         dispatch_lookup = {
@@ -203,9 +215,32 @@ class DataParallelController:
             worker.send_pyobj(obj)
 
     def handle_load_update_req(self, obj):
+        self._last_load_update_time = time.monotonic()
         self.dp_budget.update_budget(obj)
         # Try to dispatch pending requests after load update (workers may have capacity now)
         self._process_pending_queue()
+
+    def _check_load_update_watchdog(self):
+        if self._load_update_warn_sec <= 0:
+            return
+
+        now = time.monotonic()
+        since_last_update = now - self._last_load_update_time
+        if since_last_update < self._load_update_warn_sec:
+            return
+        if (
+            self._last_load_update_warn_time
+            and now - self._last_load_update_warn_time
+            < self._load_update_warn_interval_sec
+        ):
+            return
+
+        self._last_load_update_warn_time = now
+        logger.warning(
+            "DP Controller: load updates delayed (%.2fs since last update, warn threshold=%.2fs).",
+            since_last_update,
+            self._load_update_warn_sec,
+        )
 
     def dispatching_with_trace(self, req: Req):
         if self.server_args.enable_trace:
@@ -601,6 +636,8 @@ class DataParallelController:
                     except zmq.ZMQError:
                         break
                     self._handle_redirect(redirect_req)
+
+            self._check_load_update_watchdog()
 
 
 def run_data_parallel_controller_process(
