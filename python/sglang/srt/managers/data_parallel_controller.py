@@ -167,12 +167,13 @@ class DataParallelController:
         self.pending_queue: deque = deque()
 
         # Load update watchdog (warn if updates are too infrequent)
+        default_warn_sec = self.server_args.load_watch_interval * 2
         self._load_update_warn_sec = get_int_env_var(
-            "SGLANG_DP_LOAD_UPDATE_WARN_SEC", 0
+            "SGLANG_DP_LOAD_UPDATE_WARN_SEC", default_warn_sec
         )
+        default_warn_interval = max(self._load_update_warn_sec, 1)
         self._load_update_warn_interval_sec = get_int_env_var(
-            "SGLANG_DP_LOAD_UPDATE_WARN_INTERVAL_SEC",
-            max(self._load_update_warn_sec, 1),
+            "SGLANG_DP_LOAD_UPDATE_WARN_INTERVAL_SEC", default_warn_interval
         )
         self._last_load_update_time = time.monotonic()
         self._last_load_update_warn_time = 0.0
