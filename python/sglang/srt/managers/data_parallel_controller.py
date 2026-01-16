@@ -51,7 +51,6 @@ from sglang.srt.tracing.trace import (
     trace_slice_start,
 )
 from sglang.srt.utils import numa_utils
-from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.common import (
     bind_port,
     configure_ipv6,
@@ -166,18 +165,6 @@ class DataParallelController:
         # Pending queue for requests when all workers are at capacity
         self.pending_queue: deque = deque()
 
-        # Load update watchdog (warn if updates are too infrequent)
-        default_warn_sec = self.server_args.load_watch_interval * 2
-        self._load_update_warn_sec = get_int_env_var(
-            "SGLANG_DP_LOAD_UPDATE_WARN_SEC", default_warn_sec
-        )
-        default_warn_interval = max(self._load_update_warn_sec, 1)
-        self._load_update_warn_interval_sec = get_int_env_var(
-            "SGLANG_DP_LOAD_UPDATE_WARN_INTERVAL_SEC", default_warn_interval
-        )
-        self._last_load_update_time = time.monotonic()
-        self._last_load_update_warn_time = 0.0
-
         # Dispatch method
         self.round_robin_counter = 0
         dispatch_lookup = {
@@ -216,32 +203,9 @@ class DataParallelController:
             worker.send_pyobj(obj)
 
     def handle_load_update_req(self, obj):
-        self._last_load_update_time = time.monotonic()
         self.dp_budget.update_budget(obj)
         # Try to dispatch pending requests after load update (workers may have capacity now)
         self._process_pending_queue()
-
-    def _check_load_update_watchdog(self):
-        if self._load_update_warn_sec <= 0:
-            return
-
-        now = time.monotonic()
-        since_last_update = now - self._last_load_update_time
-        if since_last_update < self._load_update_warn_sec:
-            return
-        if (
-            self._last_load_update_warn_time
-            and now - self._last_load_update_warn_time
-            < self._load_update_warn_interval_sec
-        ):
-            return
-
-        self._last_load_update_warn_time = now
-        logger.warning(
-            "DP Controller: load updates delayed (%.2fs since last update, warn threshold=%.2fs).",
-            since_last_update,
-            self._load_update_warn_sec,
-        )
 
     def dispatching_with_trace(self, req: Req):
         if self.server_args.enable_trace:
@@ -559,8 +523,15 @@ class DataParallelController:
             return
         target_worker = self.dp_budget.dispatch()
         if target_worker is None:
+            target_worker = self.round_robin_counter
+            logger.info(
+                f"DP Controller: Dispatching request {req.rid} to DP{target_worker} (round-robin fallback)"
+            )
             self.round_robin_scheduler(req)
         else:
+            logger.info(
+                f"DP Controller: Dispatching request {req.rid} to DP{target_worker} (shortest_queue)"
+            )
             self.workers[target_worker].send_pyobj(req)
 
     def minimum_tokens_scheduler(self, req):
@@ -583,6 +554,11 @@ class DataParallelController:
         tried_dp_ranks = set(redirect_req.tried_dp_ranks)
         tried_dp_ranks.add(redirect_req.source_dp_rank)
 
+        logger.info(
+            f"DP Controller: Received redirect for request {original_req.rid} "
+            f"from DP{redirect_req.source_dp_rank} (tried: {tried_dp_ranks})"
+        )
+
         # Find an untried worker
         for dp_rank in range(self.server_args.dp_size):
             if dp_rank not in tried_dp_ranks:
@@ -591,8 +567,8 @@ class DataParallelController:
                 # if it also needs to redirect
                 original_req.tried_dp_ranks = list(tried_dp_ranks)
                 self.workers[dp_rank].send_pyobj(original_req)
-                logger.debug(
-                    f"Redirected request {original_req.rid} to DP worker {dp_rank} "
+                logger.info(
+                    f"DP Controller: Re-dispatching request {original_req.rid} to DP{dp_rank} "
                     f"(tried: {tried_dp_ranks})"
                 )
                 return
@@ -609,24 +585,45 @@ class DataParallelController:
         """Try to dispatch requests from the pending queue to workers."""
         # This is called after receiving new requests or redirects
         # Try to dispatch pending requests using round-robin
+        if self.pending_queue:
+            logger.info(
+                f"DP Controller: Processing pending queue ({len(self.pending_queue)} requests)"
+            )
+        dispatched = 0
         while self.pending_queue:
             req = self.pending_queue[0]
             # Reset tried_dp_ranks for a fresh dispatch attempt
             if hasattr(req, "tried_dp_ranks"):
                 req.tried_dp_ranks = []
             # Use round-robin for pending requests
-            self.workers[self.round_robin_counter].send_pyobj(req)
+            target_worker = self.round_robin_counter
+            logger.info(
+                f"DP Controller: Dispatching pending request {req.rid} to DP{target_worker}"
+            )
+            self.workers[target_worker].send_pyobj(req)
             self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
             self.pending_queue.popleft()
+            dispatched += 1
+        if dispatched:
+            logger.info(f"DP Controller: Dispatched {dispatched} requests from pending queue")
 
     def event_loop(self):
+        loop_iterations = 0
+        requests_dispatched = 0
+        redirects_handled = 0
+        last_stats_time = time.monotonic()
+        stats_interval = 10.0  # Log stats every 10 seconds
+
         while True:
+            loop_iterations += 1
+
             # Process incoming requests from tokenizer
             while True:
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
+                requests_dispatched += 1
                 self._request_dispatcher(recv_req)
 
             # Process redirect messages from workers (if enabled)
@@ -636,9 +633,22 @@ class DataParallelController:
                         redirect_req = self.recv_from_workers.recv_pyobj(zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
+                    redirects_handled += 1
                     self._handle_redirect(redirect_req)
 
-            self._check_load_update_watchdog()
+            # Periodic stats logging
+            now = time.monotonic()
+            if now - last_stats_time >= stats_interval:
+                elapsed = now - last_stats_time
+                logger.info(
+                    f"DP Controller stats: {loop_iterations/elapsed:.0f} loops/sec, "
+                    f"{requests_dispatched} requests dispatched, {redirects_handled} redirects handled, "
+                    f"pending_queue={len(self.pending_queue)}"
+                )
+                loop_iterations = 0
+                requests_dispatched = 0
+                redirects_handled = 0
+                last_stats_time = now
 
 
 def run_data_parallel_controller_process(

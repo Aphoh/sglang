@@ -38,20 +38,17 @@ fi
 
 # Python setup (combined with apt update to reduce layers)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt update && apt install -y --no-install-recommends wget software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt install -y --no-install-recommends python3.12-full python3.12-dev python3.10-venv \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+    apt update && apt install -y --no-install-recommends \
+    wget \
+    python3.12-full \
+    python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && wget -q https://bootstrap.pypa.io/get-pip.py \
     && python3 get-pip.py --break-system-packages \
     && rm get-pip.py \
     # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
-    && python3 -m pip config set global.break-system-packages true \
-    # Fix for apt-add-repository
-    && cd /usr/lib/python3/dist-packages/ \
-    && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
+    && python3 -m pip config set global.break-system-packages true
 
 # Install system dependencies (organized by category for better caching)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
@@ -628,11 +625,8 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm
 
 # Install runtime dependencies (devel base provides gcc/g++/build tools)
 RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
-    apt-get update && apt-get install -y --no-install-recommends \
+    apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
     # Python runtime
-    software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
     python3.12-full \
     python3.12-dev \
     wget \

@@ -1119,6 +1119,12 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
+                    # Log generate/embedding requests received from ZMQ
+                    if hasattr(recv_req, 'rid'):
+                        logger.info(
+                            f"Scheduler DP{self.dp_rank}: Received {type(recv_req).__name__} "
+                            f"{recv_req.rid} from ZMQ"
+                        )
 
                 while True:
                     try:
@@ -1317,6 +1323,9 @@ class Scheduler(
         # Check if we should redirect to another DP worker (when max_reqs_per_dp_worker is set)
         if self._should_redirect_request(recv_req):
             return
+
+        # Log request arrival on this DP worker
+        logger.info(f"Scheduler DP{self.dp_rank}: Request {recv_req.rid} arrived")
 
         # Create a new request
         if (
@@ -1623,7 +1632,7 @@ class Scheduler(
         )
         self.send_to_dp_controller.send_pyobj(redirect_req)
 
-        logger.debug(
+        logger.info(
             f"Scheduler DP{self.dp_rank}: Redirecting request {recv_req.rid} "
             f"(current_reqs={current_reqs}, max={self.max_reqs_per_dp_worker}, "
             f"tried={tried_dp_ranks})"
