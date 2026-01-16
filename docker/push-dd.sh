@@ -15,11 +15,14 @@ set -euo pipefail
 #
 # Flags:
 # - --local: Build locally without buildx/push, tag as sgl-dd-local
+# - --no-cache-export: Skip --cache-to (faster export, no intermediate layer caching)
 
 LOCAL_BUILD=0
+NO_CACHE_EXPORT=0
 for arg in "$@"; do
   case "$arg" in
     --local) LOCAL_BUILD=1 ;;
+    --no-cache-export) NO_CACHE_EXPORT=1 ;;
   esac
 done
 
@@ -63,7 +66,13 @@ else
     --build-arg "CUDA_VERSION=${CUDA_VERSION}"
     --build-arg "BRANCH_TYPE=local"
     --cache-from "type=registry,ref=${CACHE_REF}"
-    --cache-to "type=registry,ref=${CACHE_REF},mode=max"
+  )
+  # Only add --cache-to if not disabled (significantly speeds up export)
+  # Using mode=min (default) instead of mode=max to only cache final image layers
+  if [[ "$NO_CACHE_EXPORT" == "0" ]]; then
+    CMD+=(--cache-to "type=registry,ref=${CACHE_REF}")
+  fi
+  CMD+=(
     -t "${IMAGE_TAG}"
     --push
     -f docker/Dockerfile
@@ -73,6 +82,9 @@ else
   echo "  platform: ${PLATFORM}"
   echo "  cache:    ${CACHE_REF}"
   echo "  cuda:     ${CUDA_VERSION}"
+  if [[ "$NO_CACHE_EXPORT" == "1" ]]; then
+    echo "  cache-export: disabled (--no-cache-export)"
+  fi
 fi
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then

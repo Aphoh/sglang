@@ -162,8 +162,6 @@ COPY . /src
 #
 #   base
 #     |
-#     +-- rust_builder -----> gateway_builder (needs Rust + source)
-#     |
 #     +-- torch_deps ------> deepep_builder (needs torch)
 #     |                  \-> flashinfer_cache (needs flashinfer)
 #     |
@@ -174,20 +172,7 @@ COPY . /src
 #
 
 ########################################################
-# PARALLEL STAGE 1: Rust Builder (starts from base)
-########################################################
-FROM base AS rust_builder
-
-# Install Rust toolchain
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-# Install maturin for Python wheel building
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install maturin
-
-########################################################
-# PARALLEL STAGE 2: Torch/Deps Builder (starts from base)
+# PARALLEL STAGE 1: Torch/Deps Builder (starts from base)
 ########################################################
 FROM base AS torch_deps
 
@@ -248,7 +233,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
 
 ########################################################
-# PARALLEL STAGE 3: DeepEP Builder (needs torch_deps)
+# PARALLEL STAGE 2: DeepEP Builder (needs torch_deps)
 ########################################################
 FROM torch_deps AS deepep_builder
 
@@ -299,7 +284,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 setup.py bdist_wheel -d /wheels
 
 ########################################################
-# PARALLEL STAGE 4: FlashInfer Cache (needs torch_deps)
+# PARALLEL STAGE 3: FlashInfer Cache (needs torch_deps)
 ########################################################
 FROM torch_deps AS flashinfer_cache
 
@@ -323,32 +308,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
 ########################################################
-# PARALLEL STAGE 5: Gateway Builder (needs rust_builder)
-########################################################
-FROM rust_builder AS gateway_builder
-
-ARG BRANCH_TYPE
-ARG SGL_VERSION
-ARG USE_LATEST_SGLANG
-
-WORKDIR /build
-
-# Copy only sgl-model-gateway source (not all of sglang)
-COPY --from=local_src /src/sgl-model-gateway /build/sgl-model-gateway
-
-# Build sgl-model-gateway wheel
-RUN --mount=type=cache,target=/root/.cache/pip \
-    cd /build/sgl-model-gateway/bindings/python \
-    && ulimit -n 65536 \
-    && maturin build --release --features vendored-openssl --out /wheels
-
-# Build sgl-model-gateway binary
-RUN cd /build/sgl-model-gateway \
-    && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
-    && cp target/release/sgl-model-gateway /usr/local/bin/sglang-router
-
-########################################################
-# PARALLEL STAGE 6: Dev Tools Builder (starts from base)
+# PARALLEL STAGE 4: Dev Tools Builder (starts from base)
 ########################################################
 FROM base AS devtools_builder
 
@@ -458,12 +418,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Copy flashinfer cache
 COPY --from=flashinfer_cache /root/.cache/flashinfer /root/.cache/flashinfer
-
-# Copy gateway wheel and binary, install
-COPY --from=gateway_builder /wheels /tmp/wheels/gateway
-COPY --from=gateway_builder /usr/local/bin/sglang-router /usr/local/bin/sglang-router
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install /tmp/wheels/gateway/*.whl && rm -rf /tmp/wheels/gateway
 
 # Copy dev tools
 COPY --from=devtools_builder /tools/diff-so-fancy /usr/local/bin/
@@ -584,9 +538,13 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     && rm -rf /tmp/local_src
 
 # Editable install (fast - dependencies already installed)
+# Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/sglang \
-    && python3 -m pip install --no-deps -e "python"
+    && python3 -m pip install --no-deps -e "python" \
+    && find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true \
+    && find /usr/local/lib/python3.12/dist-packages -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true \
+    && find /usr/local/lib/python3.12/dist-packages -name "*.pyc" -delete 2>/dev/null || true
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
@@ -686,7 +644,8 @@ ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
     LC_ALL=en_US.UTF-8
 
-# Copy Python site-packages from framework (contains all built packages)
+# Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
+# No --link in final stage to allow RUN commands to modify the filesystem
 COPY --from=framework /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
 
 # Copy SGLang workspace
