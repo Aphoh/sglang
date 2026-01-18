@@ -686,6 +686,7 @@ class Req:
         self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
         self.has_log_time_stats: bool = False
         self.last_tic = time.monotonic()
+        self.kv_transfer_bytes: float = 0.0
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host

@@ -29,6 +29,9 @@ from sglang.srt.utils import get_int_env_var
 logger = logging.getLogger(__name__)
 
 GUARD = "NixlMsgGuard".encode("ascii")
+NIXL_WAIT_LOG_INTERVAL_S = float(
+    os.getenv("SGLANG_NIXL_WAIT_LOG_INTERVAL_S", "5")
+)
 
 
 @dataclasses.dataclass
@@ -766,6 +769,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.bootstrap_room
             )
         self.init_time = None
+        self.last_wait_log_time = 0.0
 
     def init(
         self,
@@ -837,6 +841,26 @@ class NixlKVReceiver(CommonKVReceiver):
             return KVPoll.Failed
 
         self.kv_mgr.update_transfer_status()
+        if (
+            NIXL_WAIT_LOG_INTERVAL_S > 0
+            and elapsed >= NIXL_WAIT_LOG_INTERVAL_S
+            and (now - self.last_wait_log_time) >= NIXL_WAIT_LOG_INTERVAL_S
+        ):
+            status = self.kv_mgr.transfer_statuses.get(self.bootstrap_room)
+            received_kvs = len(status.received_kvs) if status else 0
+            expected_kvs = status.num_kvs_expected if status else None
+            received_aux = status.received_aux if status else False
+            logger.info(
+                "[DEBUG NIXL wait] room=%s elapsed=%.1fs received_kvs=%s/%s "
+                "received_aux=%s addr=%s",
+                self.bootstrap_room,
+                elapsed,
+                received_kvs,
+                expected_kvs,
+                received_aux,
+                self.bootstrap_addr,
+            )
+            self.last_wait_log_time = now
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room

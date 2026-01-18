@@ -24,6 +24,38 @@ from sglang.srt.utils import get_bool_env_var
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
+KV_TRANSFER_TIME_MS_BUCKETS = [
+    0.1,
+    0.2,
+    0.5,
+    1,
+    2,
+    5,
+    10,
+    20,
+    50,
+    100,
+    200,
+    500,
+    1000,
+    2000,
+    5000,
+]
+KV_TRANSFER_SPEED_GB_S_BUCKETS = [
+    0.1,
+    0.2,
+    0.5,
+    1,
+    2,
+    5,
+    10,
+    20,
+    50,
+    100,
+    200,
+    500,
+]
+
 
 def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
     """
@@ -364,29 +396,29 @@ class SchedulerMetricsCollector:
             documentation="The number of transfer failed requests.",
             labelnames=labels.keys(),
         )
-        self.kv_transfer_speed_gb_s = Gauge(
+        self.kv_transfer_speed_gb_s = Histogram(
             name="sglang:kv_transfer_speed_gb_s",
-            documentation="The transfer speed of the KV cache in GB/s.",
+            documentation="Histogram of KV cache transfer speed in GB/s.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=KV_TRANSFER_SPEED_GB_S_BUCKETS,
         )
-        self.kv_transfer_latency_ms = Gauge(
+        self.kv_transfer_latency_ms = Histogram(
             name="sglang:kv_transfer_latency_ms",
-            documentation="The transfer latency of the KV cache in ms.",
+            documentation="Histogram of KV cache transfer latency in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=KV_TRANSFER_TIME_MS_BUCKETS,
         )
-        self.kv_transfer_bootstrap_ms = Gauge(
+        self.kv_transfer_bootstrap_ms = Histogram(
             name="sglang:kv_transfer_bootstrap_ms",
-            documentation="The bootstrap time of the KV transfer in ms.",
+            documentation="Histogram of KV transfer bootstrap time in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=KV_TRANSFER_TIME_MS_BUCKETS,
         )
-        self.kv_transfer_alloc_ms = Gauge(
+        self.kv_transfer_alloc_ms = Histogram(
             name="sglang:kv_transfer_alloc_ms",
-            documentation="The allocation waiting time of the KV transfer in ms.",
+            documentation="Histogram of KV transfer allocation wait time in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=KV_TRANSFER_TIME_MS_BUCKETS,
         )
 
         # Utilization
@@ -619,6 +651,20 @@ class SchedulerMetricsCollector:
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
 
+    def observe_kv_transfer_metrics(
+        self,
+        latency_ms: float,
+        speed_gb_s: float,
+        bootstrap_ms: Optional[float] = None,
+        alloc_ms: Optional[float] = None,
+    ) -> None:
+        self._log_histogram(self.kv_transfer_latency_ms, latency_ms)
+        self._log_histogram(self.kv_transfer_speed_gb_s, speed_gb_s)
+        if bootstrap_ms is not None:
+            self._log_histogram(self.kv_transfer_bootstrap_ms, bootstrap_ms)
+        if alloc_ms is not None:
+            self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
+
     def increment_bootstrap_failed_reqs(self) -> None:
         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)
 
@@ -668,11 +714,6 @@ class SchedulerMetricsCollector:
         self._log_gauge(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
-        self._log_gauge(self.kv_transfer_speed_gb_s, stats.kv_transfer_speed_gb_s)
-        self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
-        self._log_gauge(self.kv_transfer_bootstrap_ms, stats.kv_transfer_bootstrap_ms)
-        self._log_gauge(self.kv_transfer_alloc_ms, stats.kv_transfer_alloc_ms)
-
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
         self._log_gauge(self.num_paused_reqs, stats.num_paused_reqs)

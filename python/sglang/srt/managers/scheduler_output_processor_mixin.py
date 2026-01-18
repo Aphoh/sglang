@@ -22,6 +22,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
+from sglang.srt.utils import get_float_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
+DISAGG_LONG_WAIT_LOG_S = get_float_env_var("SGLANG_DISAGG_LONG_WAIT_LOG_S", 5.0)
 
 
 class SchedulerOutputProcessorMixin:
@@ -360,6 +362,11 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             new_accepted_len = 1
+            is_first_token = len(req.output_ids) == 0
+            first_decode_token = False
+            if not getattr(req, "_disagg_decode_first_token_seen", False):
+                setattr(req, "_disagg_decode_first_token_seen", True)
+                first_decode_token = True
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif batch.is_v2_eagle:
@@ -368,6 +375,33 @@ class SchedulerOutputProcessorMixin:
                 new_accepted_len = len(next_token_id)
 
             req.check_finished(new_accepted_len)
+
+            if first_decode_token:
+                now = time.perf_counter()
+                forward_entry = req.time_stats.forward_entry_time
+                wait_entry = req.time_stats.wait_queue_entry_time
+                wait_to_forward = (
+                    forward_entry - wait_entry
+                    if wait_entry and wait_entry > 0 and forward_entry and forward_entry > 0
+                    else None
+                )
+                forward_to_first = (
+                    now - forward_entry if forward_entry and forward_entry > 0 else None
+                )
+                if isinstance(next_token_id, int):
+                    token_info = str(next_token_id)
+                else:
+                    token_info = f"list(len={len(next_token_id)})"
+                logger.info(
+                    "[TRACE disagg] rid=%s first_token_generated "
+                    "stage=process_batch_result_decode token=%s "
+                    "wait_to_forward=%s forward_to_first=%s batch_size=%d",
+                    req.rid,
+                    token_info,
+                    f"{wait_to_forward:.3f}s" if wait_to_forward is not None else "n/a",
+                    f"{forward_to_first:.3f}s" if forward_to_first is not None else "n/a",
+                    batch.batch_size(),
+                )
 
             if req.finished():
                 # Skip KV release for migrating requests - migration owns the cleanup
@@ -380,6 +414,46 @@ class SchedulerOutputProcessorMixin:
                         release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.completion_time = time.perf_counter()
+
+            if is_first_token and DISAGG_LONG_WAIT_LOG_S > 0:
+                now = time.perf_counter()
+                prealloc_entry = req.time_stats.decode_prealloc_queue_entry_time
+                transfer_entry = req.time_stats.decode_transfer_queue_entry_time
+                wait_entry = req.time_stats.wait_queue_entry_time
+                forward_entry = req.time_stats.forward_entry_time
+                total_wait = (
+                    now - prealloc_entry if prealloc_entry and prealloc_entry > 0 else 0.0
+                )
+                if total_wait >= DISAGG_LONG_WAIT_LOG_S:
+                    prealloc_to_transfer = (
+                        transfer_entry - prealloc_entry
+                        if prealloc_entry > 0 and transfer_entry > 0
+                        else None
+                    )
+                    transfer_to_wait = (
+                        wait_entry - transfer_entry
+                        if transfer_entry > 0 and wait_entry > 0
+                        else None
+                    )
+                    wait_to_forward = (
+                        forward_entry - wait_entry
+                        if wait_entry > 0 and forward_entry > 0
+                        else None
+                    )
+                    forward_to_first = (
+                        now - forward_entry if forward_entry and forward_entry > 0 else None
+                    )
+                    logger.info(
+                        "[DEBUG disagg] rid=%s first_token_wait=%.1fs "
+                        "prealloc_to_transfer=%s transfer_to_wait=%s "
+                        "wait_to_forward=%s forward_to_first=%s",
+                        req.rid,
+                        total_wait,
+                        f"{prealloc_to_transfer:.3f}s" if prealloc_to_transfer is not None else "n/a",
+                        f"{transfer_to_wait:.3f}s" if transfer_to_wait is not None else "n/a",
+                        f"{wait_to_forward:.3f}s" if wait_to_forward is not None else "n/a",
+                        f"{forward_to_first:.3f}s" if forward_to_first is not None else "n/a",
+                    )
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
@@ -838,6 +912,26 @@ class SchedulerOutputProcessorMixin:
                     )
 
             if should_output:
+                if (
+                    self.disaggregation_mode == DisaggregationMode.DECODE
+                    and not getattr(req, "_disagg_first_output_streamed", False)
+                ):
+                    forward_entry = req.time_stats.forward_entry_time
+                    forward_to_stream = (
+                        time.perf_counter() - forward_entry
+                        if forward_entry and forward_entry > 0
+                        else None
+                    )
+                    logger.info(
+                        "[TRACE disagg] rid=%s first_output_stream "
+                        "stage=stream_output_generation output_len=%d "
+                        "send_token_offset=%d forward_to_stream=%s",
+                        req.rid,
+                        len(req.output_ids),
+                        req.send_token_offset,
+                        f"{forward_to_stream:.3f}s" if forward_to_stream is not None else "n/a",
+                    )
+                    setattr(req, "_disagg_first_output_streamed", True)
                 send_token_offset = req.send_token_offset
                 send_output_token_logprobs_offset = (
                     req.send_output_token_logprobs_offset
@@ -968,6 +1062,18 @@ class SchedulerOutputProcessorMixin:
         if rids:
             if self.model_config.is_multimodal_gen:
                 return
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                rid_prefixes = [
+                    rid[:6] if isinstance(rid, str) else "n/a"
+                    for rid in rids[:6]
+                ]
+                token_counts = [len(tokens) for tokens in output_ids[:6]]
+                logger.info(
+                    "[TRACE disagg] output_send stage=send_to_detokenizer "
+                    "batch_rids=%s token_counts=%s",
+                    ",".join(rid_prefixes),
+                    ",".join(str(x) for x in token_counts),
+                )
 
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(

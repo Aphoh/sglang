@@ -36,6 +36,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+import psutil
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -118,6 +119,13 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = logging.getLogger(__name__)
+
+TOKENIZER_LOG_INTERVAL_S = float(os.getenv("SGLANG_TOKENIZER_LOG_INTERVAL_S", "0"))
+TOKENIZER_SLOW_LOOP_MS = float(os.getenv("SGLANG_TOKENIZER_SLOW_LOOP_MS", "50"))
+TOKENIZER_TRACE_RECV = int(os.getenv("SGLANG_TOKENIZER_TRACE_RECV", "0"))
+TOKENIZER_TRACE_RECV_EVERY = max(
+    int(os.getenv("SGLANG_TOKENIZER_TRACE_RECV_EVERY", "1")), 1
+)
 
 
 @dataclasses.dataclass
@@ -1632,9 +1640,77 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
+            loop_start = time.perf_counter()
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            after_recv = time.perf_counter()
+            if TOKENIZER_TRACE_RECV > 0:
+                counter = getattr(self, "_trace_recv_counter", 0) + 1
+                self._trace_recv_counter = counter
+                if counter % TOKENIZER_TRACE_RECV_EVERY == 0:
+                    rid_count = None
+                    if hasattr(recv_obj, "rids"):
+                        try:
+                            rid_count = len(recv_obj.rids)
+                        except Exception:
+                            rid_count = None
+                    has_more = None
+                    try:
+                        has_more = bool(
+                            self.recv_from_detokenizer.getsockopt(zmq.EVENTS)
+                            & zmq.POLLIN
+                        )
+                    except Exception:
+                        has_more = None
+                    logger.info(
+                        "[TOK recv] type=%s rids=%s states=%d recv_wait_ms=%.1f more=%s",
+                        type(recv_obj).__name__,
+                        rid_count if rid_count is not None else "n/a",
+                        len(self.rid_to_state),
+                        (after_recv - loop_start) * 1000,
+                        has_more if has_more is not None else "n/a",
+                    )
             self._result_dispatcher(recv_obj)
+            after_dispatch = time.perf_counter()
             self.last_receive_tstamp = time.time()
+
+            total_ms = (after_dispatch - loop_start) * 1000
+            if TOKENIZER_SLOW_LOOP_MS > 0 and total_ms >= TOKENIZER_SLOW_LOOP_MS:
+                rid_count = None
+                if hasattr(recv_obj, "rids"):
+                    try:
+                        rid_count = len(recv_obj.rids)
+                    except Exception:
+                        rid_count = None
+                logger.info(
+                    "[TOK loop] type=%s rids=%s recv_ms=%.1f dispatch_ms=%.1f total_ms=%.1f",
+                    type(recv_obj).__name__,
+                    rid_count if rid_count is not None else "n/a",
+                    (after_recv - loop_start) * 1000,
+                    (after_dispatch - after_recv) * 1000,
+                    total_ms,
+                )
+
+            if (
+                TOKENIZER_LOG_INTERVAL_S > 0
+                and not hasattr(self, "_last_log_time")
+            ):
+                self._last_log_time = time.monotonic()
+                self._proc = psutil.Process(os.getpid())
+                self._proc.cpu_percent(None)
+                psutil.cpu_percent(None)
+
+            if (
+                TOKENIZER_LOG_INTERVAL_S > 0
+                and hasattr(self, "_last_log_time")
+                and (time.monotonic() - self._last_log_time) >= TOKENIZER_LOG_INTERVAL_S
+            ):
+                self._last_log_time = time.monotonic()
+                logger.info(
+                    "[TOK cpu] proc=%.1f sys=%.1f states=%d",
+                    self._proc.cpu_percent(None),
+                    psutil.cpu_percent(None),
+                    len(self.rid_to_state),
+                )
 
     def _add_metric_if_present(
         self,
@@ -1732,6 +1808,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "meta_info": meta_info,
                 }
             elif isinstance(recv_obj, BatchTokenIDOutput):
+                prev_len = len(state.output_ids)
                 if self.server_args.stream_output and state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
@@ -1739,6 +1816,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 else:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids.copy()
+
+                if (
+                    self.disaggregation_mode == DisaggregationMode.DECODE
+                    and prev_len == 0
+                    and len(state.output_ids) > 0
+                ):
+                    logger.info(
+                        "[TRACE output] rid=%s tokenizer_first_token "
+                        "output_len=%d pending=%d",
+                        rid,
+                        len(output_token_ids),
+                        len(self.rid_to_state),
+                    )
 
                 out_dict = {
                     "output_ids": output_token_ids,
@@ -1773,6 +1863,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
             state.out_list.append(out_dict)
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and not getattr(state, "_first_event_set", False)
+            ):
+                logger.info(
+                    "[TRACE output] rid=%s tokenizer_event_set "
+                    "output_len=%d pending=%d",
+                    rid,
+                    len(output_token_ids) if isinstance(recv_obj, BatchTokenIDOutput) else 0,
+                    len(self.rid_to_state),
+                )
+                setattr(state, "_first_event_set", True)
             state.event.set()
 
             # Log metrics and dump

@@ -205,6 +205,8 @@ TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
+TRACE_BATCH_RIDS = get_int_env_var("SGLANG_TRACE_BATCH_RIDS", 0)
+TRACE_BATCH_RIDS_EVERY = max(get_int_env_var("SGLANG_TRACE_BATCH_RIDS_EVERY", 1), 1)
 
 
 @dataclass
@@ -299,6 +301,9 @@ class Scheduler(
 
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
+        self._trace_batch_rids = TRACE_BATCH_RIDS
+        self._trace_batch_rids_every = TRACE_BATCH_RIDS_EVERY
+        self._trace_batch_counter = 0
 
         # Init pdmux context
         if self.enable_pdmux:
@@ -602,9 +607,12 @@ class Scheduler(
         context = zmq.Context(2)
         self.idle_sleeper = None
 
+        output_send_log_ms = get_int_env_var("SGLANG_OUTPUT_SEND_LOG_MS", 50)
+
         class SenderWrapper:
-            def __init__(self, socket: zmq.Socket):
+            def __init__(self, socket: zmq.Socket, name: str):
                 self.socket = socket
+                self.name = name
 
             def send_output(
                 self,
@@ -622,7 +630,27 @@ class Scheduler(
                     # handle communicator reqs for multi-http worker case
                     output.http_worker_ipc = recv_obj.http_worker_ipc
 
+                start = time.perf_counter()
                 self.socket.send_pyobj(output)
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                if output_send_log_ms > 0 and elapsed_ms >= output_send_log_ms:
+                    rid_count = None
+                    if hasattr(output, "rids"):
+                        try:
+                            rid_count = len(output.rids)
+                        except Exception:
+                            rid_count = None
+                    proc = psutil.Process(os.getpid())
+                    logger.info(
+                        "[SCHED send] target=%s type=%s rids=%s send_ms=%.1f "
+                        "cpu_proc=%.1f cpu_sys=%.1f",
+                        self.name,
+                        type(output).__name__,
+                        rid_count if rid_count is not None else "n/a",
+                        elapsed_ms,
+                        proc.cpu_percent(None),
+                        psutil.cpu_percent(None),
+                    )
 
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
@@ -646,8 +674,8 @@ class Scheduler(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
 
-            self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
-            self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
+            self.send_to_tokenizer = SenderWrapper(send_to_tokenizer, "tokenizer")
+            self.send_to_detokenizer = SenderWrapper(send_to_detokenizer, "detokenizer")
 
             # Socket for sending redirects back to DP controller (when max_reqs_per_dp_worker is set)
             self.send_to_dp_controller = None
@@ -677,8 +705,8 @@ class Scheduler(
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
-            self.send_to_tokenizer = SenderWrapper(None)
-            self.send_to_detokenizer = SenderWrapper(None)
+            self.send_to_tokenizer = SenderWrapper(None, "tokenizer")
+            self.send_to_detokenizer = SenderWrapper(None, "detokenizer")
             self.send_to_dp_controller = None
             self.max_reqs_per_dp_worker = None
 
@@ -1099,6 +1127,9 @@ class Scheduler(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+        self._last_zmq_pending_tokenizer = None
+        self._last_zmq_pending_rpc = None
+        self._last_zmq_limit_hit = False
 
         if self.recv_skipper is not None:
             last_forward_mode = (
@@ -1134,6 +1165,24 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+                try:
+                    pending_tokenizer = bool(
+                        self.recv_from_tokenizer.getsockopt(zmq.EVENTS) & zmq.POLLIN
+                    )
+                except Exception:
+                    pending_tokenizer = None
+                if self.recv_from_rpc is not None:
+                    try:
+                        pending_rpc = bool(
+                            self.recv_from_rpc.getsockopt(zmq.EVENTS) & zmq.POLLIN
+                        )
+                    except Exception:
+                        pending_rpc = None
+                else:
+                    pending_rpc = None
+                self._last_zmq_pending_tokenizer = pending_tokenizer
+                self._last_zmq_pending_rpc = pending_rpc
+                self._last_zmq_limit_hit = self.recv_limit_reached(len(recv_reqs))
             else:
                 recv_reqs = None
         else:
@@ -2019,7 +2068,24 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
+        pre_filter_rids = None
+        if self._trace_batch_rids > 0:
+            pre_filter_rids = [req.rid for req in batch.reqs]
+
         batch.filter_batch()
+        if self._trace_batch_rids > 0 and pre_filter_rids is not None:
+            post_filter_rids = {req.rid for req in batch.reqs}
+            removed = [rid for rid in pre_filter_rids if rid not in post_filter_rids]
+            if removed:
+                prefixes = [rid[:6] for rid in removed[: self._trace_batch_rids]]
+                remaining = len(removed) - len(prefixes)
+                if remaining > 0:
+                    prefixes.append(f"+{remaining}")
+                logger.info(
+                    "[TRACE batch] removed=%d rids=%s",
+                    len(removed),
+                    ",".join(prefixes),
+                )
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
@@ -2045,6 +2111,12 @@ class Scheduler(
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
             )
+            if self._trace_batch_rids > 0 and retracted_reqs:
+                logger.info(
+                    "[TRACE batch] retracted=%d rids=%s",
+                    len(retracted_reqs),
+                    self._format_rid_prefixes(retracted_reqs, self._trace_batch_rids),
+                )
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
@@ -2067,11 +2139,31 @@ class Scheduler(
     ):
         pass
 
+    @staticmethod
+    def _format_rid_prefixes(reqs: List[BaseReq], max_count: int) -> str:
+        prefixes: List[str] = []
+        for req in reqs[:max_count]:
+            rid = getattr(req, "rid", None)
+            prefixes.append(rid[:6] if isinstance(rid, str) else "n/a")
+        remaining = len(reqs) - max_count
+        if remaining > 0:
+            prefixes.append(f"+{remaining}")
+        return ",".join(prefixes)
+
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+        if self._trace_batch_rids > 0:
+            self._trace_batch_counter += 1
+            if self._trace_batch_counter % self._trace_batch_rids_every == 0:
+                logger.info(
+                    "[TRACE batch] mode=%s batch_size=%d rids=%s",
+                    batch.forward_mode,
+                    len(batch.reqs),
+                    self._format_rid_prefixes(batch.reqs, self._trace_batch_rids),
+                )
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)

@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import os
 import signal
+import time
 from collections import OrderedDict
 from typing import Dict, List, Union
 
@@ -53,6 +54,12 @@ logger = logging.getLogger(__name__)
 # For more details, see: https://github.com/sgl-project/sglang/issues/2812
 # Use power of 2 values for better memory allocation.
 DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 << 16))
+DETOKENIZER_LOG_INTERVAL_S = float(
+    os.environ.get("SGLANG_DETOKENIZER_LOG_INTERVAL_S", "0")
+)
+DETOKENIZER_SLOW_LOOP_MS = float(
+    os.environ.get("SGLANG_DETOKENIZER_SLOW_LOOP_MS", "50")
+)
 
 
 @dataclasses.dataclass
@@ -99,6 +106,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.is_dummy = False
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
+        self._last_log_time = time.monotonic()
+        self._proc = psutil.Process(os.getpid())
+        # Prime CPU percent stats
+        self._proc.cpu_percent(None)
+        psutil.cpu_percent(None)
 
         # Init dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -113,10 +125,45 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
+            loop_start = time.perf_counter()
             recv_obj = self.recv_from_scheduler.recv_pyobj()
+            after_recv = time.perf_counter()
             output = self._request_dispatcher(recv_obj)
+            after_dispatch = time.perf_counter()
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
+            after_send = time.perf_counter()
+
+            total_ms = (after_send - loop_start) * 1000
+            if DETOKENIZER_SLOW_LOOP_MS > 0 and total_ms >= DETOKENIZER_SLOW_LOOP_MS:
+                rid_count = None
+                if hasattr(output, "rids"):
+                    try:
+                        rid_count = len(output.rids)
+                    except Exception:
+                        rid_count = None
+                logger.info(
+                    "[DETOK loop] type=%s rids=%s recv_ms=%.1f dispatch_ms=%.1f "
+                    "send_ms=%.1f total_ms=%.1f",
+                    type(output).__name__ if output is not None else "None",
+                    rid_count if rid_count is not None else "n/a",
+                    (after_recv - loop_start) * 1000,
+                    (after_dispatch - after_recv) * 1000,
+                    (after_send - after_dispatch) * 1000,
+                    total_ms,
+                )
+
+            if (
+                DETOKENIZER_LOG_INTERVAL_S > 0
+                and (time.monotonic() - self._last_log_time) >= DETOKENIZER_LOG_INTERVAL_S
+            ):
+                self._last_log_time = time.monotonic()
+                logger.info(
+                    "[DETOK cpu] proc=%.1f sys=%.1f states=%d",
+                    self._proc.cpu_percent(None),
+                    psutil.cpu_percent(None),
+                    len(self.decode_status),
+                )
 
     def trim_matched_stop(
         self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
