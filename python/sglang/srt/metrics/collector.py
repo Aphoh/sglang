@@ -644,12 +644,53 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        self.histogram_forward_pass_latency = Histogram(
+            name="sglang:forward_pass_latency_seconds",
+            documentation="Histogram of forward pass latency in seconds.",
+            labelnames=labels.keys(),
+            buckets=[
+                0.005,
+                0.01,
+                0.015,
+                0.02,
+                0.025,
+                0.03,
+                0.04,
+                0.05,
+                0.06,
+                0.08,
+                0.1,
+                0.15,
+                0.2,
+                0.3,
+                0.5,
+                1.0,
+                2.0,
+            ],
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
 
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
+
+    def observe_forward_pass_latency(self, latency: float, batch_size: int) -> None:
+        """
+        Record forward pass latency for batch_size requests.
+
+        Each request in the batch experienced this forward pass latency.
+        O(1) update instead of O(batch_size).
+        """
+        if batch_size <= 0:
+            return
+        his = self.histogram_forward_pass_latency.labels(**self.labels)
+        his._sum.inc(latency * batch_size)
+        for i, bound in enumerate(his._upper_bounds):
+            if latency <= bound:
+                his._buckets[i].inc(batch_size)
+                break
 
     def observe_kv_transfer_metrics(
         self,

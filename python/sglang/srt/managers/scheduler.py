@@ -2240,6 +2240,16 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_end_time_host = current_time
 
+        # Record forward pass latency for metrics
+        if self.enable_metrics:
+            now = time.perf_counter()
+            forward_latency = now - self.last_forward_time
+            self.last_forward_time = now
+            batch_size = len(batch.reqs)
+            self.metrics_collector.observe_forward_pass_latency(
+                forward_latency, batch_size
+            )
+
         return ret
 
     def launch_batch_sample_if_needed(

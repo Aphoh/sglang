@@ -2138,18 +2138,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self.metrics_collector.observe_time_to_first_token(
                 labels, state.first_token_time - state.created_time
             )
-        else:
-            num_new_tokens = completion_tokens - state.last_completion_tokens
-            if num_new_tokens:
-                new_time = time.time()
-                interval = new_time - state.last_time
-                self.metrics_collector.observe_inter_token_latency(
-                    labels,
-                    interval,
-                    num_new_tokens,
-                )
-                state.last_time = new_time
-                state.last_completion_tokens = completion_tokens
+        # ITL observation removed - now tracked as forward_pass_latency in scheduler
 
         if state.finished:
             has_grammar = (
