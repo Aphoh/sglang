@@ -648,6 +648,9 @@ ENV LANG=en_US.UTF-8 \
 # No --link in final stage to allow RUN commands to modify the filesystem
 COPY --from=framework /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
 
+# Copy py-spy binary (installed to /usr/local/bin by pip, not in dist-packages)
+COPY --from=framework /usr/local/bin/py-spy /usr/local/bin/py-spy
+
 # Copy SGLang workspace
 COPY --from=framework /sgl-workspace /sgl-workspace
 
