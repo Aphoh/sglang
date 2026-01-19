@@ -38,6 +38,8 @@ class Sampler(nn.Module):
         super().__init__()
         self.use_nan_detection = get_global_server_args().enable_nan_detection
         self.tp_sync_group = get_tp_group().device_group
+        self._bad_value_warn_count = 0
+        self._bad_value_warn_limit = 5
 
         if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
@@ -50,14 +52,30 @@ class Sampler(nn.Module):
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
 
-        # Detect and handle NaN values in logits
-        if self.use_nan_detection and torch.any(torch.isnan(logits)):
-            logger.warning("Detected errors during sampling! NaN in the logits.")
-            logits = torch.where(
-                torch.isnan(logits), torch.full_like(logits, -1e5), logits
-            )
-            if crash_on_warnings():
-                raise ValueError("Detected errors during sampling! NaN in the logits.")
+        # Detect and handle NaN and inf values in logits
+        if self.use_nan_detection:
+            has_nan = torch.any(torch.isnan(logits))
+            has_inf = torch.any(torch.isinf(logits))
+            if has_nan or has_inf:
+                if self._bad_value_warn_count < self._bad_value_warn_limit:
+                    if has_nan:
+                        logger.warning("Detected errors during sampling! NaN in the logits.")
+                    if has_inf:
+                        logger.warning("Detected errors during sampling! inf in the logits.")
+                    self._bad_value_warn_count += 1
+                    if self._bad_value_warn_count == self._bad_value_warn_limit:
+                        logger.warning(
+                            "Suppressing further NaN/inf warnings (limit reached)."
+                        )
+                logits = torch.where(
+                    torch.isnan(logits) | torch.isinf(logits),
+                    torch.full_like(logits, -1e5),
+                    logits,
+                )
+                if crash_on_warnings():
+                    raise ValueError(
+                        "Detected errors during sampling! NaN or inf in the logits."
+                    )
 
         return logits
 
@@ -122,6 +140,23 @@ class Sampler(nn.Module):
                 logits[:] = torch.softmax(logits, dim=-1)
             probs = logits
             del logits
+
+            # Detect and handle NaN/inf/negative in probs after softmax
+            if self.use_nan_detection:
+                bad_values = torch.isnan(probs) | torch.isinf(probs) | (probs < 0)
+                if torch.any(bad_values):
+                    if self._bad_value_warn_count < self._bad_value_warn_limit:
+                        logger.warning(
+                            "Detected errors during sampling! NaN, inf, or negative values in probs after softmax."
+                        )
+                        self._bad_value_warn_count += 1
+                        if self._bad_value_warn_count == self._bad_value_warn_limit:
+                            logger.warning(
+                                "Suppressing further NaN/inf warnings (limit reached)."
+                            )
+                    # Replace bad values with 0, then renormalize
+                    probs = torch.where(bad_values, torch.zeros_like(probs), probs)
+                    probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-10)
 
             if can_sample_directly_from_probs:
                 # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
