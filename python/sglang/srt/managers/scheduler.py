@@ -690,10 +690,6 @@ class Scheduler(
                     port_args.dp_controller_feedback_ipc_name,
                     False,  # bind=False since scheduler is the client
                 )
-                logger.info(
-                    f"Scheduler DP{self.dp_rank}: Enabled redirect with "
-                    f"max_reqs_per_dp_worker={self.max_reqs_per_dp_worker}"
-                )
 
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
@@ -1150,12 +1146,6 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
-                    # Log generate/embedding requests received from ZMQ
-                    if hasattr(recv_req, 'rid'):
-                        logger.info(
-                            f"Scheduler DP{self.dp_rank}: Received {type(recv_req).__name__} "
-                            f"{recv_req.rid} from ZMQ"
-                        )
 
                 while True:
                     try:
@@ -1374,7 +1364,6 @@ class Scheduler(
             return
 
         # Log request arrival on this DP worker
-        logger.info(f"Scheduler DP{self.dp_rank}: Request {recv_req.rid} arrived")
 
         # Create a new request
         if (
@@ -1681,11 +1670,6 @@ class Scheduler(
         )
         self.send_to_dp_controller.send_pyobj(redirect_req)
 
-        logger.info(
-            f"Scheduler DP{self.dp_rank}: Redirecting request {recv_req.rid} "
-            f"(current_reqs={current_reqs}, max={self.max_reqs_per_dp_worker}, "
-            f"tried={tried_dp_ranks})"
-        )
         return True
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
@@ -2073,19 +2057,6 @@ class Scheduler(
             pre_filter_rids = [req.rid for req in batch.reqs]
 
         batch.filter_batch()
-        if self._trace_batch_rids > 0 and pre_filter_rids is not None:
-            post_filter_rids = {req.rid for req in batch.reqs}
-            removed = [rid for rid in pre_filter_rids if rid not in post_filter_rids]
-            if removed:
-                prefixes = [rid[:6] for rid in removed[: self._trace_batch_rids]]
-                remaining = len(removed) - len(prefixes)
-                if remaining > 0:
-                    prefixes.append(f"+{remaining}")
-                logger.info(
-                    "[TRACE batch] removed=%d rids=%s",
-                    len(removed),
-                    ",".join(prefixes),
-                )
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
@@ -2111,12 +2082,6 @@ class Scheduler(
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
             )
-            if self._trace_batch_rids > 0 and retracted_reqs:
-                logger.info(
-                    "[TRACE batch] retracted=%d rids=%s",
-                    len(retracted_reqs),
-                    self._format_rid_prefixes(retracted_reqs, self._trace_batch_rids),
-                )
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
@@ -2155,15 +2120,6 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
-        if self._trace_batch_rids > 0:
-            self._trace_batch_counter += 1
-            if self._trace_batch_counter % self._trace_batch_rids_every == 0:
-                logger.info(
-                    "[TRACE batch] mode=%s batch_size=%d rids=%s",
-                    batch.forward_mode,
-                    len(batch.reqs),
-                    self._format_rid_prefixes(batch.reqs, self._trace_batch_rids),
-                )
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)

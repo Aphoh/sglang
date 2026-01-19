@@ -640,11 +640,6 @@ class DataParallelController:
             now = time.monotonic()
             if now - last_stats_time >= stats_interval:
                 elapsed = now - last_stats_time
-                logger.info(
-                    f"DP Controller stats: {loop_iterations/elapsed:.0f} loops/sec, "
-                    f"{requests_dispatched} requests dispatched, {redirects_handled} redirects handled, "
-                    f"pending_queue={len(self.pending_queue)}"
-                )
                 loop_iterations = 0
                 requests_dispatched = 0
                 redirects_handled = 0

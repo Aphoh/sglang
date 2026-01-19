@@ -126,6 +126,8 @@ TOKENIZER_TRACE_RECV = int(os.getenv("SGLANG_TOKENIZER_TRACE_RECV", "0"))
 TOKENIZER_TRACE_RECV_EVERY = max(
     int(os.getenv("SGLANG_TOKENIZER_TRACE_RECV_EVERY", "1")), 1
 )
+TOKENIZER_DISABLE_METRICS = int(os.getenv("SGLANG_TOKENIZER_DISABLE_METRICS", "0"))
+TOKENIZER_HIGH_CPU_PCT = float(os.getenv("SGLANG_TOKENIZER_HIGH_CPU_PCT", "0"))
 
 
 @dataclasses.dataclass
@@ -190,7 +192,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         # Parse args
         self.server_args = server_args
-        self.enable_metrics = server_args.enable_metrics
+        self.enable_metrics = server_args.enable_metrics and not TOKENIZER_DISABLE_METRICS
         self.log_requests = server_args.log_requests
         self.log_requests_level = server_args.log_requests_level
         self.preferred_sampling_params = (
@@ -1705,12 +1707,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 and (time.monotonic() - self._last_log_time) >= TOKENIZER_LOG_INTERVAL_S
             ):
                 self._last_log_time = time.monotonic()
+                proc_cpu = self._proc.cpu_percent(None)
+                sys_cpu = psutil.cpu_percent(None)
                 logger.info(
                     "[TOK cpu] proc=%.1f sys=%.1f states=%d",
-                    self._proc.cpu_percent(None),
-                    psutil.cpu_percent(None),
+                    proc_cpu,
+                    sys_cpu,
                     len(self.rid_to_state),
                 )
+                if TOKENIZER_HIGH_CPU_PCT > 0 and proc_cpu >= TOKENIZER_HIGH_CPU_PCT:
+                    logger.warning(
+                        "[TOK cpu_high] proc=%.1f sys=%.1f states=%d",
+                        proc_cpu,
+                        sys_cpu,
+                        len(self.rid_to_state),
+                    )
 
     def _add_metric_if_present(
         self,
@@ -1817,19 +1828,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids.copy()
 
-                if (
-                    self.disaggregation_mode == DisaggregationMode.DECODE
-                    and prev_len == 0
-                    and len(state.output_ids) > 0
-                ):
-                    logger.info(
-                        "[TRACE output] rid=%s tokenizer_first_token "
-                        "output_len=%d pending=%d",
-                        rid,
-                        len(output_token_ids),
-                        len(self.rid_to_state),
-                    )
-
                 out_dict = {
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
@@ -1867,13 +1865,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self.disaggregation_mode == DisaggregationMode.DECODE
                 and not getattr(state, "_first_event_set", False)
             ):
-                logger.info(
-                    "[TRACE output] rid=%s tokenizer_event_set "
-                    "output_len=%d pending=%d",
-                    rid,
-                    len(output_token_ids) if isinstance(recv_obj, BatchTokenIDOutput) else 0,
-                    len(self.rid_to_state),
-                )
                 setattr(state, "_first_event_set", True)
             state.event.set()
 

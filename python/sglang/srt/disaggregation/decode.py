@@ -318,13 +318,6 @@ class DecodePreallocQueue:
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
-        logger.info(
-            f"[TRACE disagg] rid={req.rid} prealloc_add "
-            f"is_retracted={is_retracted} queue_size={len(self.queue)} "
-            f"bootstrap_host={req.bootstrap_host} bootstrap_port={req.bootstrap_port} "
-            f"bootstrap_room={req.bootstrap_room}"
-        )
-
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -430,17 +423,6 @@ class DecodePreallocQueue:
                         elapsed >= long_wait_s
                         and (now - decode_req.last_bootstrap_log_time) >= long_wait_s
                     ):
-                        logger.info(
-                            "[DEBUG disagg] rid=%s prealloc_wait=%.1fs poll=%s "
-                            "waiting_for_input=%s queue_size=%d req_pool_avail=%d metadata_avail=%d",
-                            decode_req.req.rid,
-                            elapsed,
-                            KV_POLL_NAME.get(poll, poll),
-                            decode_req.waiting_for_input,
-                            len(self.queue),
-                            self.req_to_token_pool.available_size(),
-                            self.req_to_metadata_buffer_idx_allocator.available_size(),
-                        )
                         decode_req.last_bootstrap_log_time = now
             elif poll == KVPoll.WaitingForInput:
                 if not decode_req.waiting_for_input:
@@ -450,13 +432,6 @@ class DecodePreallocQueue:
                         elapsed = (
                             decode_req.bootstrap_ready_time
                             - decode_req.req.time_stats.decode_prealloc_queue_entry_time
-                        )
-                        logger.info(
-                            "[TRACE disagg] rid=%s bootstrap_ready "
-                            "elapsed=%.3fs queue_size=%d",
-                            decode_req.req.rid,
-                            elapsed,
-                            len(self.queue),
                         )
                     if decode_req.req.time_stats.decode_prealloc_queue_entry_time > 0:
                         decode_req.req.time_stats.bootstrap_duration = (
@@ -474,17 +449,6 @@ class DecodePreallocQueue:
                         elapsed >= long_wait_s
                         and (now - decode_req.last_bootstrap_log_time) >= long_wait_s
                     ):
-                        logger.info(
-                            "[DEBUG disagg] rid=%s prealloc_wait=%.1fs poll=%s "
-                            "waiting_for_input=%s queue_size=%d req_pool_avail=%d metadata_avail=%d",
-                            decode_req.req.rid,
-                            elapsed,
-                            KV_POLL_NAME.get(poll, poll),
-                            decode_req.waiting_for_input,
-                            len(self.queue),
-                            self.req_to_token_pool.available_size(),
-                            self.req_to_metadata_buffer_idx_allocator.available_size(),
-                        )
                         decode_req.last_bootstrap_log_time = now
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
@@ -506,15 +470,6 @@ class DecodePreallocQueue:
     def pop_preallocated(self) -> List[DecodeRequest]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
         self._update_handshake_waiters()
-
-        # DEBUG: Log queue state at start of pop
-        waiting_for_input_count = sum(1 for d in self.queue if d.waiting_for_input)
-        logger.info(
-            f"[DEBUG pop_preallocated] queue_size={len(self.queue)}, "
-            f"waiting_for_input={waiting_for_input_count}, "
-            f"req_pool_avail={self.req_to_token_pool.available_size()}, "
-            f"metadata_buf_avail={self.req_to_metadata_buffer_idx_allocator.available_size()}"
-        )
 
         preallocated_reqs = []
         indices_to_remove = set()
@@ -635,15 +590,6 @@ class DecodePreallocQueue:
             decode_req.kv_receiver.init(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
-            logger.info(
-                "[TRACE disagg] rid=%s prealloc_done req_pool_idx=%s "
-                "metadata_idx=%s kv_pages=%d transfer_queue_size=%d",
-                decode_req.req.rid,
-                decode_req.req.req_pool_idx,
-                decode_req.metadata_buffer_index,
-                len(page_indices),
-                len(self.transfer_queue.queue) + 1,
-            )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             if decode_req.bootstrap_ready_time is not None:
@@ -661,12 +607,6 @@ class DecodePreallocQueue:
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
-
-        if preallocated_reqs:
-            logger.info(
-                f"[DEBUG pop_preallocated] preallocated {len(preallocated_reqs)} requests, "
-                f"remaining_queue={len(self.queue)}"
-            )
 
         return preallocated_reqs
 
@@ -802,12 +742,6 @@ class DecodeTransferQueue:
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
-        logger.info(
-            "[TRACE disagg] rid=%s transfer_add room=%s queue_size=%d",
-            decode_req.req.rid,
-            decode_req.req.bootstrap_room,
-            len(self.queue),
-        )
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         for decode_req in decode_reqs:
@@ -861,9 +795,6 @@ class DecodeTransferQueue:
         if not self.queue:
             return []
 
-        # DEBUG: Log transfer queue state
-        logger.info(f"[DEBUG pop_transferred] transfer_queue_size={len(self.queue)}")
-
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
@@ -899,14 +830,6 @@ class DecodeTransferQueue:
                 transfer_start = decode_req.req.time_stats.decode_transfer_queue_entry_time
                 transfer_end = decode_req.req.time_stats.wait_queue_entry_time
                 if transfer_start > 0 and transfer_end >= transfer_start:
-                    logger.info(
-                        "[TRACE disagg] rid=%s transfer_done "
-                        "latency=%.3fs queue_size=%d",
-                        decode_req.req.rid,
-                        transfer_end - transfer_start,
-                        len(self.queue),
-                    )
-                if transfer_start > 0 and transfer_end >= transfer_start:
                     self.scheduler.record_kv_transfer_metrics(
                         bytes_transferred=decode_req.req.kv_transfer_bytes,
                         latency_seconds=transfer_end - transfer_start,
@@ -931,16 +854,6 @@ class DecodeTransferQueue:
                         elapsed >= long_wait_s
                         and (now - decode_req.last_transfer_log_time) >= long_wait_s
                     ):
-                        logger.info(
-                            "[DEBUG disagg] rid=%s transfer_wait=%.1fs poll=%s "
-                            "room=%s addr=%s queue_size=%d",
-                            decode_req.req.rid,
-                            elapsed,
-                            KV_POLL_NAME.get(poll, poll),
-                            decode_req.req.bootstrap_room,
-                            f"{decode_req.req.bootstrap_host}:{decode_req.req.bootstrap_port}",
-                            len(self.queue),
-                        )
                         decode_req.last_transfer_log_time = now
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
@@ -954,12 +867,6 @@ class DecodeTransferQueue:
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
-
-        if transferred_reqs:
-            logger.info(
-                f"[DEBUG pop_transferred] transferred {len(transferred_reqs)} requests, "
-                f"remaining_transfer_queue={len(self.queue)}"
-            )
 
         return transferred_reqs
 
@@ -1003,39 +910,6 @@ class SchedulerDisaggregationDecodeMixin:
             _after_run_batch = _time.perf_counter()
             self.last_batch = batch
 
-            # DEBUG: Log every iteration with timing breakdown
-            _recv_ms = (_after_recv - _loop_start) * 1000
-            _process_ms = (_after_process_input - _after_recv) * 1000
-            _decode_queue_ms = (_after_decode_queue - _after_process_input) * 1000
-            _get_batch_ms = (_after_get_batch - _after_decode_queue) * 1000
-            _run_batch_ms = (_after_run_batch - _after_get_batch) * 1000
-            _total_ms = (_after_run_batch - _loop_start) * 1000
-
-            # Log every iteration when there's activity, slow loop, or every 100 iters
-            pending_tokenizer = getattr(self, "_last_zmq_pending_tokenizer", None)
-            pending_rpc = getattr(self, "_last_zmq_pending_rpc", None)
-            limit_hit = getattr(self, "_last_zmq_limit_hit", False)
-            pending_tokenizer_str = (
-                "?" if pending_tokenizer is None else str(int(bool(pending_tokenizer)))
-            )
-            pending_rpc_str = (
-                "?" if pending_rpc is None else str(int(bool(pending_rpc)))
-            )
-            if recv_reqs or batch or _loop_count % 100 == 0 or _total_ms >= SCHED_LOG_SLOW_MS:
-                logger.info(
-                    f"[SCHED iter={_loop_count}] "
-                    f"zmq_recv={len(recv_reqs)} "
-                    f"zmq_pending={pending_tokenizer_str}/{pending_rpc_str} "
-                    f"zmq_limit={int(bool(limit_hit))} "
-                    f"running={len(self.running_batch.reqs)} "
-                    f"waiting={len(self.waiting_queue)} "
-                    f"prealloc={len(self.disagg_decode_prealloc_queue.queue)} "
-                    f"transfer={len(self.disagg_decode_transfer_queue.queue)} "
-                    f"batch={'Y' if batch else 'N'}({batch.batch_size() if batch else 0}) | "
-                    f"recv={_recv_ms:.1f}ms proc={_process_ms:.1f}ms "
-                    f"decQ={_decode_queue_ms:.1f}ms getBatch={_get_batch_ms:.1f}ms "
-                    f"runBatch={_run_batch_ms:.1f}ms total={_total_ms:.1f}ms"
-                )
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
@@ -1077,39 +951,6 @@ class SchedulerDisaggregationDecodeMixin:
 
             _after_run_batch = _time.perf_counter()
 
-            # DEBUG: Log every iteration with timing breakdown
-            _recv_ms = (_after_recv - _loop_start) * 1000
-            _process_ms = (_after_process_input - _after_recv) * 1000
-            _decode_queue_ms = (_after_decode_queue - _after_process_input) * 1000
-            _get_batch_ms = (_after_get_batch - _after_decode_queue) * 1000
-            _run_batch_ms = (_after_run_batch - _after_get_batch) * 1000
-            _total_ms = (_after_run_batch - _loop_start) * 1000
-
-            # Log every iteration when there's activity, slow loop, or every 100 iters
-            pending_tokenizer = getattr(self, "_last_zmq_pending_tokenizer", None)
-            pending_rpc = getattr(self, "_last_zmq_pending_rpc", None)
-            limit_hit = getattr(self, "_last_zmq_limit_hit", False)
-            pending_tokenizer_str = (
-                "?" if pending_tokenizer is None else str(int(bool(pending_tokenizer)))
-            )
-            pending_rpc_str = (
-                "?" if pending_rpc is None else str(int(bool(pending_rpc)))
-            )
-            if recv_reqs or batch or _loop_count % 100 == 0 or _total_ms >= SCHED_LOG_SLOW_MS:
-                logger.info(
-                    f"[SCHED iter={_loop_count}] "
-                    f"zmq_recv={len(recv_reqs)} "
-                    f"zmq_pending={pending_tokenizer_str}/{pending_rpc_str} "
-                    f"zmq_limit={int(bool(limit_hit))} "
-                    f"running={len(self.running_batch.reqs)} "
-                    f"waiting={len(self.waiting_queue)} "
-                    f"prealloc={len(self.disagg_decode_prealloc_queue.queue)} "
-                    f"transfer={len(self.disagg_decode_transfer_queue.queue)} "
-                    f"batch={'Y' if batch else 'N'}({batch.batch_size() if batch else 0}) | "
-                    f"recv={_recv_ms:.1f}ms proc={_process_ms:.1f}ms "
-                    f"decQ={_decode_queue_ms:.1f}ms getBatch={_get_batch_ms:.1f}ms "
-                    f"runBatch={_run_batch_ms:.1f}ms total={_total_ms:.1f}ms"
-                )
 
             self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
@@ -1189,14 +1030,6 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                logger.info(
-                    "[TRACE disagg] rid=%s waiting_to_running "
-                    "curr_batch=%d num_not_used_batch=%d waiting_queue_size=%d",
-                    req.rid,
-                    curr_batch_size,
-                    num_not_used_batch,
-                    len(self.waiting_queue),
-                )
                 req.add_latency(RequestStage.DECODE_WAITING)
                 req.init_next_round_input(self.tree_cache)
             else:
@@ -1207,16 +1040,6 @@ class SchedulerDisaggregationDecodeMixin:
                         wait_entry = req.time_stats.wait_queue_entry_time
                         wait_s = (
                             now - wait_entry if wait_entry and wait_entry > 0 else 0.0
-                        )
-                        logger.info(
-                            "[TRACE disagg] rid=%s waiting_stuck "
-                            "wait_s=%.3f curr_batch=%d "
-                            "num_not_used_batch=%d waiting_queue_size=%d",
-                            req.rid,
-                            wait_s,
-                            curr_batch_size,
-                            num_not_used_batch,
-                            len(self.waiting_queue),
                         )
                         setattr(req, "_disagg_waiting_log_time", now)
                 waiting_queue.append(req)
@@ -1252,15 +1075,7 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         if resumed_reqs:
-            base_size = len(self.waiting_queue)
             self.waiting_queue.extend(resumed_reqs)
-            for i, req in enumerate(resumed_reqs, start=1):
-                logger.info(
-                    "[TRACE disagg] rid=%s waiting_queue_add reason=retract_resume "
-                    "queue_size=%d",
-                    req.rid,
-                    base_size + i,
-                )
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return
@@ -1280,12 +1095,4 @@ class SchedulerDisaggregationDecodeMixin:
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
             if alloc_reqs:
-                base_size = len(self.waiting_queue)
                 self.waiting_queue.extend(alloc_reqs)
-                for i, req in enumerate(alloc_reqs, start=1):
-                    logger.info(
-                        "[TRACE disagg] rid=%s waiting_queue_add reason=transfer_done "
-                        "queue_size=%d",
-                        req.rid,
-                        base_size + i,
-                    )
