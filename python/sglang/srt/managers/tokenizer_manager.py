@@ -31,6 +31,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import nvtx
 import orjson
 import uvloop
 import zmq
@@ -423,6 +424,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self._migrate_debug: Dict[str, Dict[str, Any]] = {}
         self.init_communicators(server_args)
 
+    @nvtx.annotate(domain="py", category="TokenizerManager")
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -928,6 +930,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
         )
 
+    @nvtx.annotate(domain="py", category="TokenizerManager")
     def _send_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -936,10 +939,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
-        state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
-        state.request_sent_to_scheduler_ts = time.time()
-        self.rid_to_state[obj.rid] = state
+        with nvtx.annotate("send_pyobj", domain="py", category="TokenizerManager", color="blue"):
+            self.send_to_scheduler.send_pyobj(tokenized_obj)
+        with nvtx.annotate("create_ReqState", domain="py", category="TokenizerManager", color="green"):
+            state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
+            state.request_sent_to_scheduler_ts = time.time()
+        with nvtx.annotate("rid_to_state_insert", domain="py", category="TokenizerManager", color="yellow"):
+            self.rid_to_state[obj.rid] = state
         trace_slice_end(
             RequestStage.TOKENIZER_DISPATCH, obj.rid, thread_finish_flag=True
         )
@@ -968,6 +974,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
             self.rid_to_state[tmp_obj.rid] = state
 
+    @nvtx.annotate(domain="py", category="TokenizerManager")
     async def _wait_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -977,7 +984,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         """Wait for the response of one request."""
         while True:
             try:
-                await asyncio.wait_for(state.event.wait(), timeout=4)
+                with nvtx.annotate("event_wait", domain="py", category="TokenizerManager", color="orange"):
+                    await asyncio.wait_for(state.event.wait(), timeout=4)
             except asyncio.TimeoutError:
                 if (
                     request is not None
@@ -992,9 +1000,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     )
                 continue
 
-            out = state.out_list[-1]
-
-            state.out_list = []
+            with nvtx.annotate("out_list_access", domain="py", category="TokenizerManager", color="cyan"):
+                out = state.out_list[-1]
+                state.out_list = []
             if state.finished:
                 # For non-streaming cases, response has not been sent yet (`response_sent_to_client_ts` has not been set yet).
                 # Record response sent time right before we log finished results and metrics.
@@ -1053,10 +1061,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         else:
                             yield out
                             break
-                yield out
+                with nvtx.annotate("yield_final_response", domain="py", category="TokenizerManager", color="green"):
+                    yield out
                 break
 
-            state.event.clear()
+            with nvtx.annotate("event_clear", domain="py", category="TokenizerManager", color="purple"):
+                state.event.clear()
 
             if obj.stream:
                 # Record response sent time right before we send response.
@@ -1065,7 +1075,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     out["meta_info"][
                         "response_sent_to_client_ts"
                     ] = state.response_sent_to_client_ts
-                yield out
+                with nvtx.annotate("yield_stream_response", domain="py", category="TokenizerManager", color="green"):
+                    yield out
             else:
                 if (
                     request is not None
@@ -1639,11 +1650,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
+    @nvtx.annotate(domain="py", category="TokenizerManager")
     async def handle_loop(self):
         """The event loop that handles requests"""
         while True:
             loop_start = time.perf_counter()
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            with nvtx.annotate("zmq_recv_pyobj", domain="py", category="TokenizerManager", color="red"):
+                recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             after_recv = time.perf_counter()
             if TOKENIZER_TRACE_RECV > 0:
                 counter = getattr(self, "_trace_recv_counter", 0) + 1
@@ -1671,7 +1684,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         (after_recv - loop_start) * 1000,
                         has_more if has_more is not None else "n/a",
                     )
-            self._result_dispatcher(recv_obj)
+            with nvtx.annotate("result_dispatcher", domain="py", category="TokenizerManager", color="blue"):
+                self._result_dispatcher(recv_obj)
             after_dispatch = time.perf_counter()
             self.last_receive_tstamp = time.time()
 
@@ -1745,6 +1759,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         ):
             meta_info[attr_name] = getattr(recv_obj, attr_name)[index]
 
+    @nvtx.annotate(domain="py", category="TokenizerManager")
     def _handle_batch_output(
         self,
         recv_obj: Union[
@@ -1754,127 +1769,153 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             BatchTokenIDOutput,
         ],
     ):
-        for i, rid in enumerate(recv_obj.rids):
-            state = self.rid_to_state.get(rid, None)
-            if state is None:
-                logger.error(
-                    f"Received output for {rid=} but the state was deleted in TokenizerManager."
-                )
-                continue
+        with nvtx.annotate("batch_output_loop", domain="py", category="TokenizerManager", color="orange"):
+            for i, rid in enumerate(recv_obj.rids):
+                with nvtx.annotate("rid_to_state_get", domain="py", category="TokenizerManager", color="yellow"):
+                    state = self.rid_to_state.get(rid, None)
+                if state is None:
+                    logger.error(
+                        f"Received output for {rid=} but the state was deleted in TokenizerManager."
+                    )
+                    continue
 
-            # Build meta_info and return value
-            meta_info = {
-                "id": rid,
-                "finish_reason": recv_obj.finished_reasons[i],
-                "prompt_tokens": recv_obj.prompt_tokens[i],
-                "weight_version": self.server_args.weight_version,
-                "total_retractions": recv_obj.retraction_counts[i],
-            }
-
-            if self.enable_metrics:
-                self._add_metric_if_present(recv_obj, "queue_time", meta_info, i)
-                self._add_metric_if_present(
-                    recv_obj, "prefill_launch_delay", meta_info, i
-                )
-                self._add_metric_if_present(
-                    recv_obj, "prefill_launch_latency", meta_info, i
-                )
-
-            if getattr(state.obj, "return_logprob", False):
-                self.convert_logprob_style(
-                    meta_info,
-                    state,
-                    state.obj.top_logprobs_num,
-                    state.obj.token_ids_logprob,
-                    state.obj.return_text_in_logprobs
-                    and not self.server_args.skip_tokenizer_init,
-                    recv_obj,
-                    i,
-                )
-
-            if not isinstance(recv_obj, BatchEmbeddingOutput):
-                meta_info.update(
-                    {
-                        "completion_tokens": recv_obj.completion_tokens[i],
-                        "cached_tokens": recv_obj.cached_tokens[i],
+                # Build meta_info and return value
+                with nvtx.annotate("build_meta_info", domain="py", category="TokenizerManager", color="cyan"):
+                    meta_info = {
+                        "id": rid,
+                        "finish_reason": recv_obj.finished_reasons[i],
+                        "prompt_tokens": recv_obj.prompt_tokens[i],
+                        "weight_version": self.server_args.weight_version,
+                        "total_retractions": recv_obj.retraction_counts[i],
                     }
-                )
-
-            if getattr(recv_obj, "output_hidden_states", None):
-                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
-
-            if isinstance(recv_obj, BatchStrOutput):
-                state.text += recv_obj.output_strs[i]
-                if self.server_args.stream_output and state.obj.stream:
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[state.last_output_offset :]
-                    state.last_output_offset = len(state.output_ids)
-                else:
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids.copy()
-
-                out_dict = {
-                    "text": state.text,
-                    "output_ids": output_token_ids,
-                    "meta_info": meta_info,
-                }
-            elif isinstance(recv_obj, BatchTokenIDOutput):
-                prev_len = len(state.output_ids)
-                if self.server_args.stream_output and state.obj.stream:
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[state.last_output_offset :]
-                    state.last_output_offset = len(state.output_ids)
-                else:
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids.copy()
-
-                out_dict = {
-                    "output_ids": output_token_ids,
-                    "meta_info": meta_info,
-                }
-            elif isinstance(recv_obj, BatchMultimodalOutput):
-                raise NotImplementedError("BatchMultimodalOut not implemented")
-            else:
-                assert isinstance(recv_obj, BatchEmbeddingOutput)
-                out_dict = {
-                    "embedding": recv_obj.embeddings[i],
-                    "meta_info": meta_info,
-                }
-
-            state.finished = recv_obj.finished_reasons[i] is not None
-            if state.finished:
-                if self.server_args.speculative_algorithm:
-                    self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
-                state.finished_time = time.time()
-                state.finished_time_perf = time.perf_counter()
-                meta_info["e2e_latency"] = state.finished_time - state.created_time
 
                 if self.enable_metrics:
-                    self._calculate_timing_metrics(meta_info, state, recv_obj, i)
+                    self._add_metric_if_present(recv_obj, "queue_time", meta_info, i)
+                    self._add_metric_if_present(
+                        recv_obj, "prefill_launch_delay", meta_info, i
+                    )
+                    self._add_metric_if_present(
+                        recv_obj, "prefill_launch_latency", meta_info, i
+                    )
 
-                trace_req_finish(rid, ts=int(state.finished_time * 1e9))
+                if getattr(state.obj, "return_logprob", False):
+                    with nvtx.annotate("convert_logprob_style", domain="py", category="TokenizerManager", color="magenta"):
+                        self.convert_logprob_style(
+                            meta_info,
+                            state,
+                            state.obj.top_logprobs_num,
+                            state.obj.token_ids_logprob,
+                            state.obj.return_text_in_logprobs
+                            and not self.server_args.skip_tokenizer_init,
+                            recv_obj,
+                            i,
+                        )
 
-                del self.rid_to_state[rid]
+                with nvtx.annotate("isinstance_checks", domain="py", category="TokenizerManager", color="red"):
+                    is_batch_embedding = isinstance(recv_obj, BatchEmbeddingOutput)
+                    is_batch_str = isinstance(recv_obj, BatchStrOutput)
+                    is_batch_token_id = isinstance(recv_obj, BatchTokenIDOutput)
+                    is_batch_multimodal = isinstance(recv_obj, BatchMultimodalOutput)
 
-                # Mark ongoing LoRA request as finished.
-                if self.server_args.enable_lora and state.obj.lora_path:
-                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+                if not is_batch_embedding:
+                    with nvtx.annotate("meta_info_update", domain="py", category="TokenizerManager", color="cyan"):
+                        meta_info.update(
+                            {
+                                "completion_tokens": recv_obj.completion_tokens[i],
+                                "cached_tokens": recv_obj.cached_tokens[i],
+                            }
+                        )
 
-            state.out_list.append(out_dict)
-            if (
-                self.disaggregation_mode == DisaggregationMode.DECODE
-                and not getattr(state, "_first_event_set", False)
-            ):
-                setattr(state, "_first_event_set", True)
-            state.event.set()
+                if getattr(recv_obj, "output_hidden_states", None):
+                    meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
-            # Log metrics and dump
-            if self.enable_metrics and state.obj.log_metrics:
-                self.collect_metrics(state, recv_obj, i)
-            if self.dump_requests_folder and state.finished and state.obj.log_metrics:
-                self.dump_requests(state, out_dict)
-            if self.crash_dump_folder and state.finished and state.obj.log_metrics:
-                self.record_request_for_crash_dump(state, out_dict)
+                if is_batch_str:
+                    with nvtx.annotate("process_BatchStrOutput", domain="py", category="TokenizerManager", color="green"):
+                        state.text += recv_obj.output_strs[i]
+                        if self.server_args.stream_output and state.obj.stream:
+                            with nvtx.annotate("list_extend_stream", domain="py", category="TokenizerManager", color="blue"):
+                                state.output_ids.extend(recv_obj.output_ids[i])
+                            with nvtx.annotate("list_slice", domain="py", category="TokenizerManager", color="blue"):
+                                output_token_ids = state.output_ids[state.last_output_offset :]
+                            state.last_output_offset = len(state.output_ids)
+                        else:
+                            with nvtx.annotate("list_extend_non_stream", domain="py", category="TokenizerManager", color="blue"):
+                                state.output_ids.extend(recv_obj.output_ids[i])
+                            with nvtx.annotate("list_copy", domain="py", category="TokenizerManager", color="blue"):
+                                output_token_ids = state.output_ids.copy()
+
+                        out_dict = {
+                            "text": state.text,
+                            "output_ids": output_token_ids,
+                            "meta_info": meta_info,
+                        }
+                elif is_batch_token_id:
+                    with nvtx.annotate("process_BatchTokenIDOutput", domain="py", category="TokenizerManager", color="green"):
+                        prev_len = len(state.output_ids)
+                        if self.server_args.stream_output and state.obj.stream:
+                            with nvtx.annotate("list_extend_stream", domain="py", category="TokenizerManager", color="blue"):
+                                state.output_ids.extend(recv_obj.output_ids[i])
+                            with nvtx.annotate("list_slice", domain="py", category="TokenizerManager", color="blue"):
+                                output_token_ids = state.output_ids[state.last_output_offset :]
+                            state.last_output_offset = len(state.output_ids)
+                        else:
+                            with nvtx.annotate("list_extend_non_stream", domain="py", category="TokenizerManager", color="blue"):
+                                state.output_ids.extend(recv_obj.output_ids[i])
+                            with nvtx.annotate("list_copy", domain="py", category="TokenizerManager", color="blue"):
+                                output_token_ids = state.output_ids.copy()
+
+                        out_dict = {
+                            "output_ids": output_token_ids,
+                            "meta_info": meta_info,
+                        }
+                elif is_batch_multimodal:
+                    raise NotImplementedError("BatchMultimodalOut not implemented")
+                else:
+                    assert is_batch_embedding
+                    out_dict = {
+                        "embedding": recv_obj.embeddings[i],
+                        "meta_info": meta_info,
+                    }
+
+                state.finished = recv_obj.finished_reasons[i] is not None
+                if state.finished:
+                    with nvtx.annotate("handle_finished_request", domain="py", category="TokenizerManager", color="purple"):
+                        if self.server_args.speculative_algorithm:
+                            self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
+                        state.finished_time = time.time()
+                        state.finished_time_perf = time.perf_counter()
+                        meta_info["e2e_latency"] = state.finished_time - state.created_time
+
+                        if self.enable_metrics:
+                            self._calculate_timing_metrics(meta_info, state, recv_obj, i)
+
+                        trace_req_finish(rid, ts=int(state.finished_time * 1e9))
+
+                        with nvtx.annotate("rid_to_state_del", domain="py", category="TokenizerManager", color="yellow"):
+                            del self.rid_to_state[rid]
+
+                        # Mark ongoing LoRA request as finished.
+                        if self.server_args.enable_lora and state.obj.lora_path:
+                            asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+
+                with nvtx.annotate("out_list_append", domain="py", category="TokenizerManager", color="blue"):
+                    state.out_list.append(out_dict)
+                if (
+                    self.disaggregation_mode == DisaggregationMode.DECODE
+                    and not getattr(state, "_first_event_set", False)
+                ):
+                    setattr(state, "_first_event_set", True)
+                with nvtx.annotate("event_set", domain="py", category="TokenizerManager", color="green"):
+                    state.event.set()
+
+                # Log metrics and dump
+                if self.enable_metrics and state.obj.log_metrics:
+                    with nvtx.annotate("collect_metrics", domain="py", category="TokenizerManager", color="gray"):
+                        self.collect_metrics(state, recv_obj, i)
+                if self.dump_requests_folder and state.finished and state.obj.log_metrics:
+                    self.dump_requests(state, out_dict)
+                if self.crash_dump_folder and state.finished and state.obj.log_metrics:
+                    self.record_request_for_crash_dump(state, out_dict)
 
     def add_logprob_to_meta_info(
         self,

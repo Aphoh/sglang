@@ -347,9 +347,10 @@ RUN --mount=type=cache,target=/var/cache/apt,id=devtools-apt \
     && apt-get clean
 
 # Install NVIDIA development tools
+# Note: devtools repo is still signed with old key (7fa2af80) even on ubuntu2404
 RUN --mount=type=cache,target=/var/cache/apt,id=devtools-apt \
-    echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
+    echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2404/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/7fa2af80.pub \
     && apt update -y \
     && apt install -y --no-install-recommends nsight-systems-cli \
     && rm -rf /var/lib/apt/lists/*
@@ -461,11 +462,12 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     && apt-get clean
 
 # Install NVIDIA development tools
+# Note: devtools repo is still signed with old key (7fa2af80) even on ubuntu2404
 RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     apt update -y \
     && apt install -y --no-install-recommends gnupg \
-    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
+    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2404/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/7fa2af80.pub \
     && apt update -y \
     && apt install -y --no-install-recommends nsight-systems-cli \
     && rm -rf /var/lib/apt/lists/*
@@ -643,6 +645,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends locales \
 ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
     LC_ALL=en_US.UTF-8
+
+# Copy NVIDIA profiling tools from devtools_builder (nsight-systems-cli)
+COPY --from=devtools_builder /opt/nvidia/nsight-systems-cli /opt/nvidia/nsight-systems-cli
+# Create symlink to bin directory (version number changes with apt package updates)
+RUN NSYS_BIN_DIR=$(ls -d /opt/nvidia/nsight-systems-cli/*/bin 2>/dev/null | head -1) && \
+    if [ -n "$NSYS_BIN_DIR" ]; then \
+        ln -sf "$NSYS_BIN_DIR" /opt/nvidia/nsight-systems-cli/bin; \
+    fi
+ENV PATH="${PATH}:/opt/nvidia/nsight-systems-cli/bin"
 
 # Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
 # No --link in final stage to allow RUN commands to modify the filesystem

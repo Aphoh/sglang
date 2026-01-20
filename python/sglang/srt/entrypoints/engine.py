@@ -34,6 +34,7 @@ import zmq
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
+import nvtx
 import torch
 import uvloop
 
@@ -160,6 +161,7 @@ class Engine(EngineBase):
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
 
+    @nvtx.annotate(domain="py", category="Engine")
     def generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
@@ -204,44 +206,49 @@ class Engine(EngineBase):
                     f"data_parallel_rank must be less than dp_size: {self.server_args.dp_size}"
                 )
 
-        obj = GenerateReqInput(
-            text=prompt,
-            input_ids=input_ids,
-            sampling_params=sampling_params,
-            image_data=image_data,
-            audio_data=audio_data,
-            video_data=video_data,
-            return_logprob=return_logprob,
-            logprob_start_len=logprob_start_len,
-            top_logprobs_num=top_logprobs_num,
-            token_ids_logprob=token_ids_logprob,
-            lora_path=lora_path,
-            custom_logit_processor=custom_logit_processor,
-            return_hidden_states=return_hidden_states,
-            stream=stream,
-            bootstrap_host=bootstrap_host,
-            bootstrap_port=bootstrap_port,
-            bootstrap_room=bootstrap_room,
-            data_parallel_rank=data_parallel_rank,
-            rid=rid,
-        )
-        generator = self.tokenizer_manager.generate_request(obj, None)
+        with nvtx.annotate("create_GenerateReqInput", domain="py", category="Engine", color="blue"):
+            obj = GenerateReqInput(
+                text=prompt,
+                input_ids=input_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                audio_data=audio_data,
+                video_data=video_data,
+                return_logprob=return_logprob,
+                logprob_start_len=logprob_start_len,
+                top_logprobs_num=top_logprobs_num,
+                token_ids_logprob=token_ids_logprob,
+                lora_path=lora_path,
+                custom_logit_processor=custom_logit_processor,
+                return_hidden_states=return_hidden_states,
+                stream=stream,
+                bootstrap_host=bootstrap_host,
+                bootstrap_port=bootstrap_port,
+                bootstrap_room=bootstrap_room,
+                data_parallel_rank=data_parallel_rank,
+                rid=rid,
+            )
+        with nvtx.annotate("call_generate_request", domain="py", category="Engine", color="green"):
+            generator = self.tokenizer_manager.generate_request(obj, None)
 
         if stream:
 
             def generator_wrapper():
                 while True:
                     try:
-                        chunk = self.loop.run_until_complete(generator.__anext__())
+                        with nvtx.annotate("run_until_complete_stream", domain="py", category="Engine", color="orange"):
+                            chunk = self.loop.run_until_complete(generator.__anext__())
                         yield chunk
                     except StopAsyncIteration:
                         break
 
             return generator_wrapper()
         else:
-            ret = self.loop.run_until_complete(generator.__anext__())
+            with nvtx.annotate("run_until_complete_non_stream", domain="py", category="Engine", color="orange"):
+                ret = self.loop.run_until_complete(generator.__anext__())
             return ret
 
+    @nvtx.annotate(domain="py", category="Engine")
     async def async_generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
@@ -288,33 +295,36 @@ class Engine(EngineBase):
                 )
 
         logger.debug(f"data_parallel_rank: {data_parallel_rank}")
-        obj = GenerateReqInput(
-            text=prompt,
-            input_ids=input_ids,
-            sampling_params=sampling_params,
-            image_data=image_data,
-            audio_data=audio_data,
-            video_data=video_data,
-            return_logprob=return_logprob,
-            logprob_start_len=logprob_start_len,
-            top_logprobs_num=top_logprobs_num,
-            token_ids_logprob=token_ids_logprob,
-            lora_path=lora_path,
-            return_hidden_states=return_hidden_states,
-            stream=stream,
-            custom_logit_processor=custom_logit_processor,
-            bootstrap_host=bootstrap_host,
-            bootstrap_port=bootstrap_port,
-            bootstrap_room=bootstrap_room,
-            data_parallel_rank=data_parallel_rank,
-            rid=rid,
-        )
-        generator = self.tokenizer_manager.generate_request(obj, None)
+        with nvtx.annotate("create_GenerateReqInput", domain="py", category="Engine", color="blue"):
+            obj = GenerateReqInput(
+                text=prompt,
+                input_ids=input_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                audio_data=audio_data,
+                video_data=video_data,
+                return_logprob=return_logprob,
+                logprob_start_len=logprob_start_len,
+                top_logprobs_num=top_logprobs_num,
+                token_ids_logprob=token_ids_logprob,
+                lora_path=lora_path,
+                return_hidden_states=return_hidden_states,
+                stream=stream,
+                custom_logit_processor=custom_logit_processor,
+                bootstrap_host=bootstrap_host,
+                bootstrap_port=bootstrap_port,
+                bootstrap_room=bootstrap_room,
+                data_parallel_rank=data_parallel_rank,
+                rid=rid,
+            )
+        with nvtx.annotate("call_generate_request", domain="py", category="Engine", color="green"):
+            generator = self.tokenizer_manager.generate_request(obj, None)
 
         if stream is True:
             return generator
         else:
-            return await generator.__anext__()
+            with nvtx.annotate("await_generator_anext", domain="py", category="Engine", color="orange"):
+                return await generator.__anext__()
 
     def encode(
         self,
