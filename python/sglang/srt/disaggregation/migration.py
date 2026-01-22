@@ -16,6 +16,7 @@ Life cycle of a migration request:
 from __future__ import annotations
 
 import logging
+import os
 import random
 import time
 from http import HTTPStatus
@@ -42,6 +43,7 @@ from sglang.srt.managers.schedule_batch import (
     RequestStage,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.utils import get_int_env_var
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     NSATokenToKVPool,
@@ -52,6 +54,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
+MIGRATION_WAIT_TIMEOUT_S = get_int_env_var(
+    "SGLANG_DISAGGREGATION_WAITING_TIMEOUT", 300
+)
 
 
 class SchedulerMigrationMixin:
@@ -66,6 +71,30 @@ class SchedulerMigrationMixin:
         """Initialize migration-related data structures."""
         self.disagg_migration_inflight_queue: List[Req] = []
         self._migration_kv_manager: Optional[BaseKVManager] = None
+
+    def _handle_migration_failure(
+        self: "Scheduler", req: Req, error_message: str
+    ) -> None:
+        logger.error(error_message)
+        if getattr(req, "disagg_kv_sender", None) is not None:
+            try:
+                req.disagg_kv_sender.failure_exception()
+            except Exception as e:
+                error_message = f"{error_message} with exception {e}"
+                logger.error(error_message)
+            if hasattr(req.disagg_kv_sender, "clear"):
+                req.disagg_kv_sender.clear()
+        release_kv_cache(req, self.tree_cache)
+        if (
+            hasattr(req, "metadata_buffer_index")
+            and req.metadata_buffer_index is not None
+            and req.metadata_buffer_index >= 0
+        ):
+            self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
+            req.metadata_buffer_index = -1
+        prepare_abort(
+            req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
 
     def _get_migration_kv_manager(self: "Scheduler") -> BaseKVManager:
         """Get or create the KV manager for migration transfers.
@@ -210,18 +239,97 @@ class SchedulerMigrationMixin:
         # tokens_seen is total tokens frontend has seen (origin_input_ids + output tokens yielded)
         # We need to send output_ids that the frontend hasn't seen yet
         origin_input_len = len(req.origin_input_ids)
-        total_tokens = origin_input_len + len(req.output_ids)
+        logical_tokens = origin_input_len + len(req.output_ids)
+        committed_len = getattr(req, "kv_committed_len", None)
+        allocated_len = getattr(req, "kv_allocated_len", None)
+        committed_source = "kv_committed_len"
+        if committed_len is None or committed_len <= 0:
+            committed_len = allocated_len
+            committed_source = "kv_allocated_len"
+        if committed_len is None:
+            committed_len = logical_tokens
+            committed_source = "logical_tokens"
+
+        if logical_tokens not in (committed_len, committed_len + 1):
+            error_message = (
+                f"Migration KV length mismatch for request {rid}: "
+                f"logical_tokens={logical_tokens}, kv_committed_len={getattr(req, 'kv_committed_len', None)}, "
+                f"kv_allocated_len={allocated_len} (source={committed_source})"
+            )
+            self._handle_migration_failure(req, error_message)
+            output = MigrateReqOutput(
+                rid=rid,
+                src_dp_rank=getattr(self, "dp_rank", None),
+                src_tp_rank=getattr(self, "tp_rank", None),
+                bootstrap_room=bootstrap_room,
+                pending_output_ids=[],
+                total_tokens=logical_tokens,
+                success=False,
+                error=error_message,
+            )
+            self.send_to_tokenizer.send_output(output, recv_req)
+            self.stream_output([req], req.return_logprob)
+            return
+
+        effective_tokens = min(logical_tokens, committed_len)
+        token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = token_to_kv_pool.page_size
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :effective_tokens
+        ]
+        page_indices = kv_to_page_indices(kv_indices.cpu().numpy(), page_size)
+        expected_pages = kv_to_page_num(effective_tokens, page_size)
+        if len(page_indices) != expected_pages:
+            error_message = (
+                f"Migration page_indices mismatch for request {rid}: "
+                f"effective_tokens={effective_tokens}, page_size={page_size}, "
+                f"page_indices_len={len(page_indices)}, expected_pages={expected_pages}"
+            )
+            self._handle_migration_failure(req, error_message)
+            output = MigrateReqOutput(
+                rid=rid,
+                src_dp_rank=getattr(self, "dp_rank", None),
+                src_tp_rank=getattr(self, "tp_rank", None),
+                bootstrap_room=bootstrap_room,
+                pending_output_ids=[],
+                total_tokens=logical_tokens,
+                success=False,
+                error=error_message,
+            )
+            self.send_to_tokenizer.send_output(output, recv_req)
+            self.stream_output([req], req.return_logprob)
+            return
+
+        req.migration_logical_tokens = logical_tokens
+        req.migration_committed_len = committed_len
+        req.migration_effective_tokens = effective_tokens
+        req.migration_page_indices = page_indices
         
         # How many output tokens has frontend seen?
         output_tokens_seen = max(0, tokens_seen - origin_input_len)
         # Pending output tokens are everything after that
         pending_output_ids = list(req.output_ids[output_tokens_seen:])
+        if logical_tokens == committed_len + 1 and pending_output_ids:
+            if pending_output_ids[-1] == req.output_ids[-1]:
+                pending_output_ids.pop()
+            else:
+                logger.warning(
+                    "Migration pending_output_ids did not include expected aux token "
+                    "rid=%s output_tokens_seen=%s pending_output_ids_len=%s",
+                    req.rid,
+                    output_tokens_seen,
+                    len(pending_output_ids),
+                )
 
         logger.debug(
             f"Migration request found: rid={rid}, "
             f"origin_input_ids_len={origin_input_len}, "
             f"output_ids_len={len(req.output_ids)}, "
-            f"total_tokens={total_tokens}, "
+            f"total_tokens={logical_tokens}, "
+            f"kv_committed_len={getattr(req, 'kv_committed_len', None)}, "
+            f"kv_allocated_len={allocated_len}, "
+            f"effective_tokens={effective_tokens}, "
+            f"page_indices_len={len(page_indices)}, "
             f"tokens_seen_by_frontend={tokens_seen}, "
             f"output_tokens_seen={output_tokens_seen}, "
             f"pending_output_ids_len={len(pending_output_ids)}"
@@ -234,7 +342,7 @@ class SchedulerMigrationMixin:
             src_tp_rank=getattr(self, "tp_rank", None),
             bootstrap_room=bootstrap_room,
             pending_output_ids=pending_output_ids,
-            total_tokens=total_tokens,
+            total_tokens=logical_tokens,
             success=True,
         )
         self.send_to_tokenizer.send_output(output, recv_req)
@@ -343,12 +451,6 @@ class SchedulerMigrationMixin:
             pp_rank=0,  # Migration is within a single PP stage
         )
 
-        # Store num_tokens for later when we call init() and send()
-        # We need to wait for the receiver to connect first (status = WaitingForInput)
-        # IMPORTANT: fill_ids is stale from initial prefill transfer, so we must compute
-        # the actual token count from origin_input_ids + output_ids
-        actual_computed_tokens = len(req.origin_input_ids) + len(req.output_ids)
-        req.migration_num_tokens = actual_computed_tokens
         req.migration_kv_sent = False
 
     def _send_migration_kv(self: "Scheduler", req: Req) -> None:
@@ -357,53 +459,24 @@ class SchedulerMigrationMixin:
         Args:
             req: The request whose KV cache to send.
         """
-        # Use migration_num_tokens which was computed from origin_input_ids + output_ids
-        # fill_ids is stale from initial prefill transfer and doesn't reflect generated tokens
-        num_tokens_to_send = req.migration_num_tokens
-        
-        # Verify we're not trying to send more than what's allocated
-        # The last generated token doesn't have KV yet, so we may need to adjust
-        if hasattr(req, 'kv_allocated_len') and num_tokens_to_send > req.kv_allocated_len:
-            # Clamp to what's actually allocated
-            logger.debug(
-                f"_send_migration_kv: clamping num_tokens_to_send from {num_tokens_to_send} to {req.kv_allocated_len}"
-            )
-            num_tokens_to_send = req.kv_allocated_len
-        
         # Update fill_ids to reflect actual computed tokens before sending
         # This ensures the request metadata is consistent for the receiver
         req.fill_ids = list(req.origin_input_ids) + list(req.output_ids)
-        
-        # Get the KV indices for this request
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :num_tokens_to_send
-        ]
-        
-        # Convert to page indices (same as prefill does)
+
+        # Send the precomputed page indices for this migration.
         token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = token_to_kv_pool.page_size
-        page_indices = kv_to_page_indices(kv_indices.cpu().numpy(), page_size)
-        
+        page_indices = req.migration_page_indices
+
         logger.debug(
             f"_send_migration_kv: rid={req.rid}, "
-            f"num_tokens_to_send={num_tokens_to_send}, "
+            f"effective_tokens={getattr(req, 'migration_effective_tokens', None)}, "
             f"origin_input_ids_len={len(req.origin_input_ids)}, "
             f"output_ids_len={len(req.output_ids)}, "
-            f"kv_indices_len={len(kv_indices)}, "
             f"page_size={page_size}, "
             f"page_indices_len={len(page_indices)}, "
             f"sender_num_kv_indices={req.disagg_kv_sender.num_kv_indices}"
         )
-        
-        # Sample first few KV values for verification
-        kv_sample = None
-        try:
-            # Get first layer's K cache, first few indices
-            k_cache = token_to_kv_pool.k_buffer[0]  # First layer
-            sample_indices = kv_indices[:min(4, len(kv_indices))].tolist()
-            kv_sample = k_cache[sample_indices[0], :4].tolist() if sample_indices else None
-        except Exception as e:
-            kv_sample = f"error: {e}"
 
         # Send the KV cache using page indices
         req.disagg_kv_sender.send(
@@ -414,7 +487,8 @@ class SchedulerMigrationMixin:
             f"_send_migration_kv: send called: rid={req.rid}, "
             f"room={getattr(req, 'migration_bootstrap_room', None)}, "
             f"src_dp_rank={getattr(self, 'dp_rank', None)}, src_tp_rank={getattr(self, 'tp_rank', None)}, "
-            f"num_tokens_to_send={num_tokens_to_send}, page_indices_len={len(page_indices)}"
+            f"effective_tokens={getattr(req, 'migration_effective_tokens', None)}, "
+            f"page_indices_len={len(page_indices)}"
         )
 
     @torch.no_grad()
@@ -438,6 +512,17 @@ class SchedulerMigrationMixin:
         )
 
         for req, poll in zip(self.disagg_migration_inflight_queue, polls):
+            enq_ts = getattr(req, "migration_ts_enqueued", None)
+            if enq_ts and (time.time() - enq_ts) > MIGRATION_WAIT_TIMEOUT_S:
+                error_message = (
+                    f"Migration timed out for request {req.rid} "
+                    f"after {MIGRATION_WAIT_TIMEOUT_S}s "
+                    f"room={getattr(req, 'migration_bootstrap_room', None)}"
+                )
+                self._handle_migration_failure(req, error_message)
+                done_reqs.append(req)
+                continue
+
             # Still waiting for receiver to connect
             if poll == KVPoll.Bootstrapping:
                 undone_reqs.append(req)
@@ -445,17 +530,42 @@ class SchedulerMigrationMixin:
             
             # Receiver connected - initialize and send if not already done
             if poll == KVPoll.WaitingForInput and not getattr(req, 'migration_kv_sent', False):
-                # Compute num_pages from num_tokens (same as prefill does)
+                page_indices = getattr(req, "migration_page_indices", None)
+                if page_indices is None:
+                    error_message = (
+                        f"Migration missing page_indices for request {req.rid} "
+                        f"room={getattr(req, 'migration_bootstrap_room', None)}"
+                    )
+                    self._handle_migration_failure(req, error_message)
+                    done_reqs.append(req)
+                    continue
+
+                # Compute num_pages from page indices (same as prefill does)
                 page_size = self.token_to_kv_pool_allocator.get_kvcache().page_size
-                num_pages = kv_to_page_num(req.migration_num_tokens, page_size)
-                enq_ts = getattr(req, "migration_ts_enqueued", None)
+                num_pages = len(page_indices)
+                effective_tokens = getattr(req, "migration_effective_tokens", None)
+                expected_pages = (
+                    kv_to_page_num(effective_tokens, page_size)
+                    if effective_tokens is not None
+                    else None
+                )
+                if expected_pages is not None and num_pages != expected_pages:
+                    error_message = (
+                        f"Migration page_indices mismatch for request {req.rid}: "
+                        f"page_indices_len={num_pages}, expected_pages={expected_pages}, "
+                        f"page_size={page_size}"
+                    )
+                    self._handle_migration_failure(req, error_message)
+                    done_reqs.append(req)
+                    continue
+
                 t_enqueued_s = (time.time() - enq_ts) if enq_ts else None
                 logger.debug(
                     f"process_migration_inflight_queue: rid={req.rid}, "
                     f"room={getattr(req, 'migration_bootstrap_room', None)}, "
                     f"src_dp_rank={getattr(self, 'dp_rank', None)}, src_tp_rank={getattr(self, 'tp_rank', None)}, "
                     f"t_enqueued_s={t_enqueued_s}, "
-                    f"migration_num_tokens={req.migration_num_tokens}, "
+                    f"effective_tokens={effective_tokens}, "
                     f"page_size={page_size}, "
                     f"num_pages={num_pages}, "
                     f"origin_input_ids_len={len(req.origin_input_ids)}, "
@@ -538,23 +648,7 @@ class SchedulerMigrationMixin:
                     f"room={getattr(req, 'migration_bootstrap_room', None)}, "
                     f"src_dp_rank={getattr(self, 'dp_rank', None)}, src_tp_rank={getattr(self, 'tp_rank', None)}"
                 )
-                try:
-                    req.disagg_kv_sender.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
-                logger.error(error_message)
-                release_kv_cache(req, self.tree_cache)
-                # Free the metadata buffer index if allocated
-                if (
-                    hasattr(req, "metadata_buffer_index")
-                    and req.metadata_buffer_index is not None
-                    and req.metadata_buffer_index >= 0
-                ):
-                    self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
-                    req.metadata_buffer_index = -1
-                prepare_abort(
-                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-                )
+                self._handle_migration_failure(req, error_message)
                 done_reqs.append(req)
             else:
                 raise ValueError(f"Unexpected polling state {poll=}")

@@ -860,6 +860,17 @@ class NixlKVReceiver(CommonKVReceiver):
                 received_aux,
                 self.bootstrap_addr,
             )
+            if expected_kvs is None and received_kvs > 0 and not received_aux:
+                logger.error(
+                    "[NIXL STUCK] room=%s elapsed=%.1fs received_kvs=%s/%s "
+                    "received_aux=%s addr=%s (expected_kvs missing; possible init/send mismatch)",
+                    self.bootstrap_room,
+                    elapsed,
+                    received_kvs,
+                    expected_kvs,
+                    received_aux,
+                    self.bootstrap_addr,
+                )
             self.last_wait_log_time = now
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
