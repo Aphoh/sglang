@@ -74,6 +74,9 @@ CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 40
 SCHED_LOG_SLOW_MS = get_int_env_var("SGLANG_SCHED_LOG_SLOW_MS", 200)
 DISAGG_LONG_WAIT_LOG_S = get_float_env_var("SGLANG_DISAGG_LONG_WAIT_LOG_S", 5.0)
 DISAGG_WAITING_LOG_S = get_float_env_var("SGLANG_DISAGG_WAITING_LOG_S", 1.0)
+DISAGG_DECODE_START_DELAY_S = get_float_env_var(
+    "SGLANG_DISAGG_DECODE_START_DELAY_S", 0.0
+)
 
 KV_POLL_NAME = {
     KVPoll.Failed: "Failed",
@@ -873,6 +876,36 @@ class DecodeTransferQueue:
 
 class SchedulerDisaggregationDecodeMixin:
 
+    def _maybe_start_decode_start_delay(self: Scheduler, recv_reqs: List) -> None:
+        if DISAGG_DECODE_START_DELAY_S <= 0 or not recv_reqs:
+            return
+        if getattr(self, "_disagg_decode_delay_until", None) is not None:
+            return
+        now = time.perf_counter()
+        self._disagg_decode_delay_until = now + DISAGG_DECODE_START_DELAY_S
+        self._disagg_decode_delay_start = now
+        logger.info(
+            "Delaying disagg decode start for %.3fs after first request",
+            DISAGG_DECODE_START_DELAY_S,
+        )
+
+    def _decode_start_delay_active(self: Scheduler) -> bool:
+        delay_until = getattr(self, "_disagg_decode_delay_until", None)
+        if delay_until is None:
+            return False
+        now = time.perf_counter()
+        if now >= delay_until:
+            delay_start = getattr(self, "_disagg_decode_delay_start", None)
+            self._disagg_decode_delay_until = None
+            self._disagg_decode_delay_start = None
+            if delay_start is not None:
+                logger.info(
+                    "Disagg decode start delay complete after %.3fs",
+                    now - delay_start,
+                )
+            return False
+        return True
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -887,6 +920,7 @@ class SchedulerDisaggregationDecodeMixin:
             # DEBUG: Log received requests count periodically
             _loop_count += 1
 
+            self._maybe_start_decode_start_delay(recv_reqs)
             self.process_input_requests(recv_reqs)
             _after_process_input = _time.perf_counter()
 
@@ -896,7 +930,10 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process any in-flight migration transfers (decode->decode)
             self.process_migration_inflight_queue()
-            batch = self.get_next_disagg_decode_batch_to_run()
+            if self._decode_start_delay_active():
+                batch = None
+            else:
+                batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
             _after_get_batch = _time.perf_counter()
 
@@ -925,6 +962,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             _loop_count += 1
 
+            self._maybe_start_decode_start_delay(recv_reqs)
             self.process_input_requests(recv_reqs)
             _after_process_input = _time.perf_counter()
 
@@ -934,7 +972,10 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process any in-flight migration transfers (decode->decode)
             self.process_migration_inflight_queue()
-            batch = self.get_next_disagg_decode_batch_to_run()
+            if self._decode_start_delay_active():
+                batch = None
+            else:
+                batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
             _after_get_batch = _time.perf_counter()
 
