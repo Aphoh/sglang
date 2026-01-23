@@ -877,34 +877,29 @@ class DecodeTransferQueue:
 class SchedulerDisaggregationDecodeMixin:
 
     def _maybe_start_decode_start_delay(self: Scheduler, recv_reqs: List) -> None:
-        if DISAGG_DECODE_START_DELAY_S <= 0 or not recv_reqs:
-            return
-        if getattr(self, "_disagg_decode_delay_until", None) is not None:
-            return
-        now = time.perf_counter()
-        self._disagg_decode_delay_until = now + DISAGG_DECODE_START_DELAY_S
-        self._disagg_decode_delay_start = now
-        logger.info(
-            "Delaying disagg decode start for %.3fs after first request",
-            DISAGG_DECODE_START_DELAY_S,
-        )
+        if DISAGG_DECODE_START_DELAY_S > 0 and getattr(self, "_disagg_decode_delay_until", None) is None and len(recv_reqs) > 0:
+            now = time.perf_counter()
+            self._disagg_decode_delay_until = now + DISAGG_DECODE_START_DELAY_S
+            self._disagg_decode_did_delay = False
+            logger.info(
+                "Delaying disagg decode start for %.3fs after first request",
+                DISAGG_DECODE_START_DELAY_S,
+            )
 
     def _decode_start_delay_active(self: Scheduler) -> bool:
-        delay_until = getattr(self, "_disagg_decode_delay_until", None)
-        if delay_until is None:
-            return False
-        now = time.perf_counter()
-        if now >= delay_until:
-            delay_start = getattr(self, "_disagg_decode_delay_start", None)
-            self._disagg_decode_delay_until = None
-            self._disagg_decode_delay_start = None
-            if delay_start is not None:
+        if (dd_time := getattr(self, "_disagg_decode_delay_until", None)) is not None:
+            if self._disagg_decode_did_delay:
+                return False
+            now = time.perf_counter()
+            if now >= dd_time:
+                self._disagg_decode_did_delay = True
                 logger.info(
-                    "Disagg decode start delay complete after %.3fs",
-                    now - delay_start,
+                    "Disagg decode delay complete after %.3fs",
+                    DISAGG_DECODE_START_DELAY_S,
                 )
-            return False
-        return True
+                return False
+            return True
+        return False
 
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
