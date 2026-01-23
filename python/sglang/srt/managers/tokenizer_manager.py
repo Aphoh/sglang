@@ -1209,7 +1209,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         bootstrap_port: int,
         bootstrap_room: int,
         tokens_seen: int = 0,
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """Initiate migration of an in-flight request's KV cache to another worker.
 
         This sends a MigrateReq to the scheduler which will:
@@ -1226,12 +1226,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             tokens_seen: Number of tokens the frontend has already seen/yielded.
 
         Returns:
-            List of pending outputs (token chunks the frontend hasn't seen yet).
+            Dict with:
+                - "result": "migrate" | "not_found" | "error" 
+                - "pending_outputs": List of pending outputs (token chunks the frontend hasn't seen yet).
+                - "src_dp_rank": Source DP rank.
+                - "bootstrap_room": Unique room ID for this migration transfer.
             Each output is a dict with 'token_ids', 'text', etc.
         """
         if rid not in self.rid_to_state:
             logger.warning(f"migrate_request: rid={rid} not found in rid_to_state")
-            return []
+            return {
+                "result": "not_found",
+            }
 
         logger.info(
             f"migrate_request: start rid={rid}, tokens_seen={tokens_seen}, "
@@ -1272,7 +1278,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
             self._migrate_futures.pop(rid, None)
             self._migrate_debug.pop(rid, None)
-            return []
+            return {
+                "result": "error",
+                "error": "timeout waiting for response",
+            }
         finally:
             self._migrate_futures.pop(rid, None)
             self._migrate_debug.pop(rid, None)
@@ -1284,10 +1293,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 f"src_tp_rank={getattr(migrate_output, 'src_tp_rank', None)}, "
                 f"error={migrate_output.error}"
             )
-            return []
+            return {
+                "result": "error",
+                "error": migrate_output.error,
+            }
 
-        ts0 = time.time()
-        # `ts_start` was popped in finally; so use current time and log what we know.
         logger.info(
             f"migrate_request: success rid={rid}, "
             f"src_dp_rank={getattr(migrate_output, 'src_dp_rank', None)}, "
@@ -1306,6 +1316,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             })
 
         return {
+            "result": "migrate",
             "pending_outputs": pending_outputs,
             "src_dp_rank": migrate_output.src_dp_rank,
             "bootstrap_room": migrate_output.bootstrap_room,

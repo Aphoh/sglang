@@ -435,10 +435,12 @@ class SchedulerMigrationMixin:
         transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
-        # Use the existing decode prealloc queue's kv_manager instead of creating a new one
-        # This ensures the sender uses the same manager that's already registered with the
-        # bootstrap server and whose bootstrap thread will receive the receiver's connection
-        kv_manager = self.disagg_decode_prealloc_queue.kv_manager
+        # Use the migration kv_manager which is in PREFILL mode (sender mode).
+        # The decode prealloc queue's kv_manager is in DECODE mode (receiver mode) which
+        # doesn't have the sender's parallel info registered with its bootstrap server.
+        # The migration kv_manager sets up a proper sender bootstrap server that decode_long's
+        # receiver can query via /route to get the connection info.
+        kv_manager = self._get_migration_kv_manager()
 
         kv_sender_class = get_kv_class(transfer_backend, KVClassType.SENDER)
         dest_tp_ranks = [self.tp_rank]

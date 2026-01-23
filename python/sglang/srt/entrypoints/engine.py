@@ -17,6 +17,7 @@ The entry point of inference server. (SRT = SGLang Runtime)
 This file implements python APIs for the inference engine.
 """
 
+from typing import Any
 import asyncio
 import atexit
 import dataclasses
@@ -613,7 +614,7 @@ class Engine(EngineBase):
         bootstrap_port: int,
         bootstrap_room: int,
         tokens_seen: int = 0,
-    ) -> list:
+    ) -> Dict[str, Any]:
         """Initiate migration of an in-flight request's KV cache to another worker.
 
         This sends a MigrateReq to the scheduler which will:
