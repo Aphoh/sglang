@@ -1414,6 +1414,8 @@ class MigrateReqOutput(BaseReq):
     total_tokens: int = 0
     # Success flag
     success: bool = True
+    # not found flag
+    not_found: bool = False
     # Error message if failed
     error: Optional[str] = None
 

@@ -1286,6 +1286,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self._migrate_futures.pop(rid, None)
             self._migrate_debug.pop(rid, None)
 
+        if migrate_output.not_found:
+            logger.warning(f"migrate_request: not found rid={rid}, error={migrate_output.error}")
+            return {
+                "result": "not_found",
+            }
         if not migrate_output.success:
             logger.error(
                 f"migrate_request: failed rid={rid}, "

@@ -94,4 +94,4 @@ target/
 Thumbs.db
 *.bak
 *.tmp
-
+*.log

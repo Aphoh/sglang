@@ -230,6 +230,27 @@ class SchedulerMigrationMixin:
                 pending_output_ids=[],
                 total_tokens=0,
                 success=False,
+                not_found=True,
+                error=f"Request {rid} not found in running_batch",
+            )
+            self.send_to_tokenizer.send_output(output, recv_req)
+            return
+
+        if getattr(req, "kv_committed_freed", False):
+            logger.warning(
+                f"Migration: request {rid} already freed (likely finished). "
+                f"src_dp_rank={getattr(self, 'dp_rank', None)}, src_tp_rank={getattr(self, 'tp_rank', None)}, "
+                f"room={bootstrap_room}"
+            )
+            output = MigrateReqOutput(
+                rid=rid,
+                src_dp_rank=getattr(self, "dp_rank", None),
+                src_tp_rank=getattr(self, "tp_rank", None),
+                bootstrap_room=bootstrap_room,
+                pending_output_ids=[],
+                total_tokens=0,
+                success=False,
+                not_found=True,
                 error=f"Request {rid} not found in running_batch",
             )
             self.send_to_tokenizer.send_output(output, recv_req)
@@ -626,7 +647,10 @@ class SchedulerMigrationMixin:
                     f"output_ids_len={len(req.output_ids)}, "
                     f"req_pool_idx={req.req_pool_idx}"
                 )
-                release_kv_cache(req, self.tree_cache)
+                try:
+                    release_kv_cache(req, self.tree_cache)
+                except Exception as e:
+                    logger.info(f"rid={req.rid} error releasing KV cache: {e}")
                 req.finished_reason = FINISH_LENGTH(length=0)
                 if hasattr(req.disagg_kv_sender, "clear"):
                     req.disagg_kv_sender.clear()
