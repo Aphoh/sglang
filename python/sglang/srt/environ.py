@@ -452,6 +452,9 @@ class Envs:
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # fmt: on
 
+    # Nixl
+    SGLANG_NIXL_WAIT_LOG_INTERVAL_S = EnvFloat(5.0)
+
 
 envs = Envs()
 EnvField._allow_set_name = False

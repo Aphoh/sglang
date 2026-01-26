@@ -36,6 +36,16 @@ logger = logging.getLogger(__name__)
 opentelemetry_imported = False
 tracing_enabled = False
 _trace_context_propagator = None
+_trace_debug_log = get_int_env_var("SGLANG_TRACE_DEBUG_LOG", 0)
+_trace_debug_rid = os.environ.get("SGLANG_TRACE_DEBUG_RID")
+
+
+def _trace_debug_enabled(rid: str) -> bool:
+    if not _trace_debug_log:
+        return False
+    if _trace_debug_rid and str(rid) != _trace_debug_rid:
+        return False
+    return True
 
 TRACE_HEADERS = ["traceparent", "tracestate"]
 
@@ -592,6 +602,18 @@ def trace_slice_start(
 
     thread_context.cur_slice_stack.append(slice_info)
 
+    if _trace_debug_enabled(rid):
+        thread_info = thread_context.thread_info
+        logger.info(
+            "trace_start rid=%s name=%s thread=%s tp=%s dp=%s pid=%s",
+            rid,
+            name,
+            thread_info.thread_label,
+            thread_info.tp_rank,
+            thread_info.dp_rank,
+            thread_info.pid,
+        )
+
 
 def trace_slice_end(
     name: str,
@@ -650,6 +672,18 @@ def trace_slice_end(
 
     if auto_next_anon:
         trace_slice_start("", rid, ts, True)
+
+    if _trace_debug_enabled(rid):
+        thread_info = thread_context.thread_info
+        logger.info(
+            "trace_end rid=%s name=%s thread=%s tp=%s dp=%s pid=%s",
+            rid,
+            name,
+            thread_info.thread_label,
+            thread_info.tp_rank,
+            thread_info.dp_rank,
+            thread_info.pid,
+        )
 
 
 # alias

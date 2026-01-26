@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.encode_receiver import MMReceiver
+from sglang.srt.disaggregation.migration import SchedulerMigrationMixin
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -100,6 +101,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    MigrateReq,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
@@ -112,6 +114,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    RedirectReq,
     SlowDownReqInput,
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
@@ -214,7 +217,6 @@ TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
-
 @dataclass
 class EmbeddingBatchResult:
     embeddings: torch.Tensor
@@ -246,6 +248,7 @@ class Scheduler(
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
+    SchedulerMigrationMixin,
     SchedulerMultiplexMixin,
     SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
@@ -426,8 +429,8 @@ class Scheduler(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
 
-            self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
-            self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
+            self.send_to_tokenizer = SenderWrapper(send_to_tokenizer, "tokenizer")
+            self.send_to_detokenizer = SenderWrapper(send_to_detokenizer, "detokenizer")
 
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
@@ -439,8 +442,8 @@ class Scheduler(
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
-            self.send_to_tokenizer = SenderWrapper(None)
-            self.send_to_detokenizer = SenderWrapper(None)
+            self.send_to_tokenizer = SenderWrapper(None, "tokenizer")
+            self.send_to_detokenizer = SenderWrapper(None, "detokenizer")
 
         if self.current_scheduler_metrics_enabled:
             self.send_metrics_from_scheduler = get_zmq_socket(
@@ -907,6 +910,9 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
+            # Initialize migration support for decode workers
+            self.init_migration()
+
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
@@ -1061,6 +1067,7 @@ class Scheduler(
                 (GetLoadsReqInput, self.get_loads),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (MigrateReq, self.process_migrate_request)
             ]
         )
 
@@ -1178,6 +1185,9 @@ class Scheduler(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+        self._last_zmq_pending_tokenizer = None
+        self._last_zmq_pending_rpc = None
+        self._last_zmq_limit_hit = False
 
         if self.recv_skipper is not None:
             last_forward_mode = (
@@ -1207,6 +1217,24 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+                try:
+                    pending_tokenizer = bool(
+                        self.recv_from_tokenizer.getsockopt(zmq.EVENTS) & zmq.POLLIN
+                    )
+                except Exception:
+                    pending_tokenizer = None
+                if self.recv_from_rpc is not None:
+                    try:
+                        pending_rpc = bool(
+                            self.recv_from_rpc.getsockopt(zmq.EVENTS) & zmq.POLLIN
+                        )
+                    except Exception:
+                        pending_rpc = None
+                else:
+                    pending_rpc = None
+                self._last_zmq_pending_tokenizer = pending_tokenizer
+                self._last_zmq_pending_rpc = pending_rpc
+                self._last_zmq_limit_hit = self.recv_limit_reached(len(recv_reqs))
             else:
                 recv_reqs = None
         else:
@@ -1655,6 +1683,7 @@ class Scheduler(
             return False
         return True
 
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
@@ -1731,6 +1760,7 @@ class Scheduler(
         self,
         recv_req: TokenizedEmbeddingReqInput,
     ):
+
         req = Req(
             recv_req.rid,
             recv_req.input_text,
@@ -2241,6 +2271,17 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
+    @staticmethod
+    def _format_rid_prefixes(reqs: List[BaseReq], max_count: int) -> str:
+        prefixes: List[str] = []
+        for req in reqs[:max_count]:
+            rid = getattr(req, "rid", None)
+            prefixes.append(rid[:6] if isinstance(rid, str) else "n/a")
+        remaining = len(reqs) - max_count
+        if remaining > 0:
+            prefixes.append(f"+{remaining}")
+        return ",".join(prefixes)
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -2391,6 +2432,15 @@ class Scheduler(
             dp_active_ranks = tp_active_ranks.reshape(self.dp_size, -1).prod(axis=1)
             self.send_to_tokenizer.send_output(
                 ActiveRanksOutput(status=dp_active_ranks.tolist())
+            )
+        # Record forward pass latency for metrics (only on rank 0 to avoid duplicates)
+        if self.enable_metrics and self.tp_rank == 0:
+            now = time.perf_counter()
+            forward_latency = now - self.last_forward_time
+            self.last_forward_time = now
+            batch_size = len(batch.reqs)
+            self.metrics_collector.observe_forward_pass_latency(
+                forward_latency, batch_size
             )
 
         return ret
@@ -2590,6 +2640,24 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        # Skip aborting requests that are in the migration inflight queue.
+        # These requests are being migrated to another tier and should not be aborted.
+        # The migration flow will handle cleanup when the transfer completes.
+        if (
+            hasattr(self, 'disagg_migration_inflight_queue')
+            and not recv_req.abort_all
+        ):
+            for req in self.disagg_migration_inflight_queue:
+                if req.rid.startswith(recv_req.rid):
+                    logger.warning(
+                        f"Skipping abort for request {recv_req.rid} - "
+                        f"request is in migration inflight queue "
+                        f"(dp_rank={getattr(self, 'dp_rank', None)}, tp_rank={getattr(self, 'tp_rank', None)}, "
+                        f"queue_size={len(self.disagg_migration_inflight_queue)}, "
+                        f"room={getattr(req, 'migration_bootstrap_room', None)})"
+                    )
+                    return
+
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -2652,6 +2720,7 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:

@@ -64,6 +64,8 @@ class SchedulerMetricsMixin:
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_prefill_tokens = 0
+        self.last_forward_time = time.perf_counter()
+
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -84,6 +86,12 @@ class SchedulerMetricsMixin:
 
         # Only for `log_prefill_stats` to pass information to `log_prefill_stats_late`
         self.temp_prefill_info: Optional[Dict] = None
+        self.kv_transfer_bytes_since_last: float = 0.0
+        self.kv_transfer_latency_ms_sum: float = 0.0
+        self.kv_transfer_bootstrap_ms_sum: float = 0.0
+        self.kv_transfer_alloc_ms_sum: float = 0.0
+        self.kv_transfer_count: int = 0
+        self._kv_bytes_per_token: Optional[float] = None
 
         self.stats = SchedulerStats()
 
@@ -130,6 +138,90 @@ class SchedulerMetricsMixin:
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config, self.attn_dp_rank
             )
+
+    def get_kv_bytes_per_token(self: Scheduler) -> float:
+        if self._kv_bytes_per_token is not None:
+            return self._kv_bytes_per_token
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        kv_size_bytes = kv_cache.get_kv_size_bytes()
+        if isinstance(kv_size_bytes, tuple):
+            kv_size_bytes = sum(kv_size_bytes)
+        if kv_cache.size <= 0:
+            self._kv_bytes_per_token = 0.0
+        else:
+            self._kv_bytes_per_token = kv_size_bytes / kv_cache.size
+        return self._kv_bytes_per_token
+
+    def estimate_kv_transfer_bytes(
+        self: Scheduler,
+        token_count: Optional[int] = None,
+        page_count: Optional[int] = None,
+    ) -> float:
+        if page_count is not None:
+            token_count = page_count * self.token_to_kv_pool_allocator.page_size
+        if token_count is None or token_count <= 0:
+            return 0.0
+        return token_count * self.get_kv_bytes_per_token()
+
+    def record_kv_transfer_metrics(
+        self: Scheduler,
+        bytes_transferred: float,
+        latency_seconds: Optional[float],
+        bootstrap_seconds: Optional[float] = None,
+        alloc_seconds: Optional[float] = None,
+    ) -> None:
+        if bytes_transferred <= 0 or latency_seconds is None or latency_seconds < 0:
+            return
+        if latency_seconds == 0:
+            return
+        self.kv_transfer_bytes_since_last += bytes_transferred
+        self.kv_transfer_latency_ms_sum += latency_seconds * 1e3
+        if bootstrap_seconds is not None and bootstrap_seconds >= 0:
+            self.kv_transfer_bootstrap_ms_sum += bootstrap_seconds * 1e3
+        if alloc_seconds is not None and alloc_seconds >= 0:
+            self.kv_transfer_alloc_ms_sum += alloc_seconds * 1e3
+        self.kv_transfer_count += 1
+        if self.enable_metrics:
+            speed_gb_s = bytes_transferred / latency_seconds / 1e9
+            self.metrics_collector.observe_kv_transfer_metrics(
+                latency_ms=latency_seconds * 1e3,
+                speed_gb_s=speed_gb_s,
+                bootstrap_ms=(
+                    bootstrap_seconds * 1e3
+                    if bootstrap_seconds is not None and bootstrap_seconds >= 0
+                    else None
+                ),
+                alloc_ms=(
+                    alloc_seconds * 1e3
+                    if alloc_seconds is not None and alloc_seconds >= 0
+                    else None
+                ),
+            )
+
+    def _update_kv_transfer_stats(self: Scheduler, gap_latency: float) -> None:
+        if self.kv_transfer_count > 0 and gap_latency > 0:
+            self.kv_transfer_speed_gb_s = (
+                self.kv_transfer_bytes_since_last / gap_latency / 1e9
+            )
+            self.kv_transfer_latency_ms = (
+                self.kv_transfer_latency_ms_sum / self.kv_transfer_count
+            )
+            self.kv_transfer_bootstrap_ms = (
+                self.kv_transfer_bootstrap_ms_sum / self.kv_transfer_count
+            )
+            self.kv_transfer_alloc_ms = (
+                self.kv_transfer_alloc_ms_sum / self.kv_transfer_count
+            )
+        else:
+            self.kv_transfer_speed_gb_s = 0.0
+            self.kv_transfer_latency_ms = 0.0
+            self.kv_transfer_bootstrap_ms = 0.0
+            self.kv_transfer_alloc_ms = 0.0
+        self.kv_transfer_bytes_since_last = 0.0
+        self.kv_transfer_latency_ms_sum = 0.0
+        self.kv_transfer_bootstrap_ms_sum = 0.0
+        self.kv_transfer_alloc_ms_sum = 0.0
+        self.kv_transfer_count = 0
 
     def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
         self.spec_num_accepted_tokens += num_accepted_tokens + bs
@@ -249,6 +341,7 @@ class SchedulerMetricsMixin:
 
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self._update_kv_transfer_stats(gap_latency)
                 self.stats.num_prefill_prealloc_queue_reqs = len(
                     self.disagg_prefill_bootstrap_queue.queue
                 )
@@ -426,12 +519,17 @@ class SchedulerMetricsMixin:
                     self.disagg_prefill_inflight_queue
                 )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
+                self._update_kv_transfer_stats(gap_latency)
                 self.stats.num_decode_prealloc_queue_reqs = len(
                     self.disagg_decode_prealloc_queue.queue
                 )
                 self.stats.num_decode_transfer_queue_reqs = len(
                     self.disagg_decode_transfer_queue.queue
                 )
+                self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
+                self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
+                self.stats.kv_transfer_bootstrap_ms = self.kv_transfer_bootstrap_ms
+                self.stats.kv_transfer_alloc_ms = self.kv_transfer_alloc_ms
 
             running_routing_keys = [r.routing_key for r in batch.reqs]
             waiting_routing_keys = [r.routing_key for r in self.waiting_queue]

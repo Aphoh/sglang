@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
-from collections import deque
+import time
+from collections import Counter, deque
 from contextlib import nullcontext
 from enum import Enum
 from typing import TYPE_CHECKING, Optional, Type
@@ -12,6 +14,14 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.utils import is_npu
+
+logger = logging.getLogger(__name__)
+
+POLL_LOG_THRESHOLD_MS = float(
+    os.getenv("SGLANG_DISAGG_POLL_LOG_THRESHOLD_MS", "50")
+)
+POLL_LOG_MAX = int(os.getenv("SGLANG_DISAGG_POLL_LOG_MAX", "50"))
+_poll_log_count = 0
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -37,6 +47,10 @@ FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 
 
 def poll_and_all_reduce(pollers, gloo_group):
+    if not pollers:
+        return []
+    global _poll_log_count
+    start_time = time.perf_counter()
     # at a certain prob, the poll is failed to simulate failure
     if FAILURE_PROB > 0:
         from sglang.srt.disaggregation.base import KVPoll
@@ -47,8 +61,30 @@ def poll_and_all_reduce(pollers, gloo_group):
         ]
     else:
         polls = [int(poller.poll()) for poller in pollers]
+    after_poll = time.perf_counter()
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
+    after_reduce = time.perf_counter()
+
+    total_ms = (after_reduce - start_time) * 1000
+    if (
+        POLL_LOG_THRESHOLD_MS > 0
+        and total_ms >= POLL_LOG_THRESHOLD_MS
+        and (POLL_LOG_MAX < 0 or _poll_log_count < POLL_LOG_MAX)
+    ):
+        _poll_log_count += 1
+        local_counts = dict(Counter(polls))
+        reduced_counts = dict(Counter(tensor_to_reduce.tolist()))
+        logger.info(
+            "[DISAGG poll] size=%d poll=%.1fms reduce=%.1fms total=%.1fms local=%s reduced=%s",
+            len(pollers),
+            (after_poll - start_time) * 1000,
+            (after_reduce - after_poll) * 1000,
+            total_ms,
+            local_counts,
+            reduced_counts,
+        )
+
     return tensor_to_reduce.tolist()
 
 

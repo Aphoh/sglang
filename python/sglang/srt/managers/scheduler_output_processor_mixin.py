@@ -24,6 +24,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
+from sglang.srt.utils import get_float_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
+DISAGG_LONG_WAIT_LOG_S = get_float_env_var("SGLANG_DISAGG_LONG_WAIT_LOG_S", 5.0)
 
 
 class SchedulerOutputProcessorMixin:
@@ -57,7 +59,9 @@ class SchedulerOutputProcessorMixin:
                     req.rid,
                     thread_finish_flag=True,
                 )
-                release_kv_cache(req, self.tree_cache)
+                # Skip KV release for migrating requests - migration owns the cleanup
+                if not req.is_migrating:
+                    release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
@@ -138,6 +142,9 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
+                        # Skip KV release for migrating requests - migration owns the cleanup
+                        if not req.is_migrating:
+                            release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
@@ -271,7 +278,9 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
+                        # Skip KV release for migrating requests - migration owns the cleanup
+                        if not req.is_migrating:
+                            release_kv_cache(req, self.tree_cache)
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
@@ -334,8 +343,19 @@ class SchedulerOutputProcessorMixin:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        for idx in range(batch.batch_size()):
-            # If no new tokens generated, meaning the prefilling stage
+        assert len(batch.reqs) == 1, "batch size is currently expected to be 1"
+        req = batch.reqs[0]
+
+        for next_token_id in next_token_ids:
+            req.output_ids.append(next_token_id)
+            req.check_finished()
+
+            if req.finished():
+                # Skip KV release for migrating requests - migration owns the cleanup
+                if not req.is_migrating:
+                    release_kv_cache(req, self.tree_cache)
+                req.time_stats.completion_time = time.perf_counter()
+                break
             if not result.next_token_ids:
                 break
 
@@ -399,6 +419,11 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             new_accepted_len = 1
+            is_first_token = len(req.output_ids) == 0
+            first_decode_token = False
+            if not getattr(req, "_disagg_decode_first_token_seen", False):
+                setattr(req, "_disagg_decode_first_token_seen", True)
+                first_decode_token = True
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif batch.is_spec_v2:
@@ -414,12 +439,14 @@ class SchedulerOutputProcessorMixin:
             if req.finished():
                 self.maybe_collect_routed_experts(req)
 
-                if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                    # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
-                    if not self.decode_offload_manager.offload_kv_cache(req):
+                # Skip KV release for migrating requests - migration owns the cleanup
+                if not req.is_migrating:
+                    if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                        # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
+                        if not self.decode_offload_manager.offload_kv_cache(req):
+                            release_kv_cache(req, self.tree_cache)
+                    else:
                         release_kv_cache(req, self.tree_cache)
-                else:
-                    release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.completion_time = time.perf_counter()
 
@@ -929,6 +956,11 @@ class SchedulerOutputProcessorMixin:
                     )
 
             if should_output:
+                if (
+                    self.disaggregation_mode == DisaggregationMode.DECODE
+                    and not getattr(req, "_disagg_first_output_streamed", False)
+                ):
+                    setattr(req, "_disagg_first_output_streamed", True)
                 send_token_offset = req.send_token_offset
                 send_output_token_logprobs_offset = (
                     req.send_output_token_logprobs_offset

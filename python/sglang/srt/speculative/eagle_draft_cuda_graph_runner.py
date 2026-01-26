@@ -323,6 +323,14 @@ class EAGLEDraftCudaGraphRunner:
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
+        # DEBUG: Log batch size information for DP debugging
+        import os
+        if os.environ.get("EAGLE_DEBUG", "0") == "1":
+            print(f"[EAGLE DEBUG] replay: raw_bs={raw_bs}, "
+                  f"raw_num_token={raw_num_token}, "
+                  f"global_num_tokens_cpu={forward_batch.global_num_tokens_cpu}, "
+                  f"require_mlp_tp_gather={self.require_mlp_tp_gather}")
+
         # Pad
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
@@ -336,7 +344,37 @@ class EAGLEDraftCudaGraphRunner:
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
 
+        # Bounds check: if index exceeds capture_bs, clamp to max
+        if index >= len(self.capture_bs):
+            if os.environ.get("EAGLE_DEBUG", "0") == "1":
+                print(f"[EAGLE DEBUG] ERROR: index={index} >= len(capture_bs)={len(self.capture_bs)}!")
+                if self.require_mlp_tp_gather:
+                    print(f"[EAGLE DEBUG]   max_batch_size={max_batch_size}, max_capture_bs={max(self.capture_bs)}")
+                else:
+                    print(f"[EAGLE DEBUG]   raw_bs={raw_bs}, max_capture_bs={max(self.capture_bs)}")
+            index = len(self.capture_bs) - 1
+
         bs = self.capture_bs[index]
+
+        # DEBUG: Log batch size mismatch warning for DP debugging
+        if os.environ.get("EAGLE_DEBUG", "0") == "1":
+            max_capture_bs = max(self.capture_bs) if self.capture_bs else 0
+            if self.require_mlp_tp_gather:
+                if max_batch_size > max_capture_bs:
+                    print(f"[EAGLE DEBUG] ERROR: max_batch_size={max_batch_size} > max_capture_bs={max_capture_bs}!")
+                if raw_bs > bs:
+                    print(f"[EAGLE DEBUG] ERROR: raw_bs={raw_bs} > bs={bs}!")
+            else:
+                if raw_bs > max_capture_bs:
+                    print(f"[EAGLE DEBUG] ERROR: raw_bs={raw_bs} > max_capture_bs={max_capture_bs}!")
+            print(f"[EAGLE DEBUG] Selected bs={bs} (from capture_bs index={index}, max_capture={max_capture_bs})")
+            if self.require_mlp_tp_gather and raw_bs != bs:
+                print(f"[EAGLE DEBUG] WARNING: Batch size mismatch! raw_bs={raw_bs} != bs={bs}")
+                print(f"[EAGLE DEBUG]   topk_p shape: {forward_batch.spec_info.topk_p.shape}")
+                print(f"[EAGLE DEBUG]   topk_index shape: {forward_batch.spec_info.topk_index.shape}")
+                print(f"[EAGLE DEBUG]   hidden_states shape: {forward_batch.spec_info.hidden_states.shape}")
+                print(f"[EAGLE DEBUG]   Data will be copied for raw_bs={raw_bs}, but graph captured for bs={bs}")
+
         if bs != raw_bs:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
@@ -379,6 +417,13 @@ class EAGLEDraftCudaGraphRunner:
         self.raw_bs = raw_bs
         self.bs = bs
         # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
+
+        # DEBUG: Log state right before replay
+        if os.environ.get("EAGLE_DEBUG", "0") == "1":
+            print(f"[EAGLE DEBUG] About to replay graph[{bs}]")
+            print(f"[EAGLE DEBUG]   Buffer topk_p[:bs] shape: {self.topk_p[:bs].shape}")
+            print(f"[EAGLE DEBUG]   Buffer hidden_states[:bs] shape: {self.hidden_states[:bs].shape}")
+            print(f"[EAGLE DEBUG]   Copied data for raw_bs={raw_bs}, graph expects bs={bs}")
 
         # Replay
         self._replay(forward_batch)

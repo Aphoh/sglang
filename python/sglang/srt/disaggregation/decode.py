@@ -61,7 +61,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice_end
-from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils import get_float_env_var, get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,17 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
+SCHED_LOG_SLOW_MS = get_int_env_var("SGLANG_SCHED_LOG_SLOW_MS", 200)
+DISAGG_LONG_WAIT_LOG_S = get_float_env_var("SGLANG_DISAGG_LONG_WAIT_LOG_S", 5.0)
+DISAGG_WAITING_LOG_S = get_float_env_var("SGLANG_DISAGG_WAITING_LOG_S", 1.0)
+
+KV_POLL_NAME = {
+    KVPoll.Failed: "Failed",
+    KVPoll.Bootstrapping: "Bootstrapping",
+    KVPoll.WaitingForInput: "WaitingForInput",
+    KVPoll.Transferring: "Transferring",
+    KVPoll.Success: "Success",
+}
 
 
 class DecodeReqToTokenPool:
@@ -180,6 +191,9 @@ class DecodeRequest:
     kv_receiver: BaseKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    bootstrap_ready_time: Optional[float] = None
+    last_bootstrap_log_time: float = 0.0
+    last_transfer_log_time: float = 0.0
 
     @property
     def seqlen(self) -> int:
@@ -302,6 +316,12 @@ class DecodePreallocQueue:
             kv_args.state_item_lens = []
             kv_args.state_type = "none"
 
+        # Add sender-specific fields needed for decode->decode migration
+        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        if not self.is_mla_backend:
+            kv_args.kv_head_num = self.token_to_kv_pool.head_num
+        kv_args.page_size = self.token_to_kv_pool.page_size
+
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class: Type[BaseKVManager] = get_kv_class(
@@ -418,15 +438,52 @@ class DecodePreallocQueue:
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
+        now = time.perf_counter()
+        long_wait_s = DISAGG_LONG_WAIT_LOG_S
 
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
             if poll == KVPoll.Bootstrapping:
-                pass
+                if (
+                    long_wait_s > 0
+                    and decode_req.req.time_stats.decode_prealloc_queue_entry_time > 0
+                ):
+                    elapsed = (
+                        now - decode_req.req.time_stats.decode_prealloc_queue_entry_time
+                    )
+                    if (
+                        elapsed >= long_wait_s
+                        and (now - decode_req.last_bootstrap_log_time) >= long_wait_s
+                    ):
+                        decode_req.last_bootstrap_log_time = now
             elif poll == KVPoll.WaitingForInput:
-                decode_req.waiting_for_input = True
+                if not decode_req.waiting_for_input:
+                    decode_req.waiting_for_input = True
+                    decode_req.bootstrap_ready_time = time.perf_counter()
+                    if decode_req.req.time_stats.decode_prealloc_queue_entry_time > 0:
+                        elapsed = (
+                            decode_req.bootstrap_ready_time
+                            - decode_req.req.time_stats.decode_prealloc_queue_entry_time
+                        )
+                    if decode_req.req.time_stats.decode_prealloc_queue_entry_time > 0:
+                        decode_req.req.time_stats.bootstrap_duration = (
+                            decode_req.bootstrap_ready_time
+                            - decode_req.req.time_stats.decode_prealloc_queue_entry_time
+                        )
+                elif (
+                    long_wait_s > 0
+                    and decode_req.req.time_stats.decode_prealloc_queue_entry_time > 0
+                ):
+                    elapsed = (
+                        now - decode_req.req.time_stats.decode_prealloc_queue_entry_time
+                    )
+                    if (
+                        elapsed >= long_wait_s
+                        and (now - decode_req.last_bootstrap_log_time) >= long_wait_s
+                    ):
+                        decode_req.last_bootstrap_log_time = now
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -570,11 +627,18 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
+            decode_req.req.kv_transfer_bytes = self.scheduler.estimate_kv_transfer_bytes(
+                page_count=len(page_indices)
+            )
             decode_req.kv_receiver.init(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
+            if decode_req.bootstrap_ready_time is not None:
+                decode_req.req.time_stats.alloc_waiting_duration = (
+                    time.perf_counter() - decode_req.bootstrap_ready_time
+                )
             decode_req.req.time_stats.decode_transfer_queue_entry_time = (
                 time.perf_counter()
             )
@@ -723,7 +787,8 @@ class DecodeTransferQueue:
         self.queue.append(decode_req)
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
-        self.queue.extend(decode_reqs)
+        for decode_req in decode_reqs:
+            self.add(decode_req)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> None:
         idx = decode_req.metadata_buffer_index
@@ -772,9 +837,12 @@ class DecodeTransferQueue:
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
+
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
+        now = time.perf_counter()
+        long_wait_s = DISAGG_LONG_WAIT_LOG_S
 
         transferred_reqs = []
         indices_to_remove = set()
@@ -804,6 +872,15 @@ class DecodeTransferQueue:
                 continue
             elif poll == KVPoll.Success:
                 self._commit_transfer_to_req(decode_req)
+                transfer_start = decode_req.req.time_stats.decode_transfer_queue_entry_time
+                transfer_end = decode_req.req.time_stats.wait_queue_entry_time
+                if transfer_start > 0 and transfer_end >= transfer_start:
+                    self.scheduler.record_kv_transfer_metrics(
+                        bytes_transferred=decode_req.req.kv_transfer_bytes,
+                        latency_seconds=transfer_end - transfer_start,
+                        bootstrap_seconds=decode_req.req.time_stats.bootstrap_duration,
+                        alloc_seconds=decode_req.req.time_stats.alloc_waiting_duration,
+                    )
                 indices_to_remove.add(i)
                 transferred_reqs.append(decode_req.req)
             elif poll in [
@@ -811,7 +888,18 @@ class DecodeTransferQueue:
                 KVPoll.WaitingForInput,
                 KVPoll.Transferring,
             ]:
-                pass
+                if (
+                    long_wait_s > 0
+                    and decode_req.req.time_stats.decode_transfer_queue_entry_time > 0
+                ):
+                    elapsed = (
+                        now - decode_req.req.time_stats.decode_transfer_queue_entry_time
+                    )
+                    if (
+                        elapsed >= long_wait_s
+                        and (now - decode_req.last_transfer_log_time) >= long_wait_s
+                    ):
+                        decode_req.last_transfer_log_time = now
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
@@ -833,15 +921,15 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
-
         while True:
-            # Receive requests
             recv_reqs = self.recv_requests()
+
             self.process_input_requests(recv_reqs)
+
             # polling and allocating kv cache
             self.process_decode_queue()
-
-            # Get the next batch to run
+            # Process any in-flight migration transfers (decode->decode)
+            self.process_migration_inflight_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
@@ -853,8 +941,8 @@ class SchedulerDisaggregationDecodeMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
-            # Update last_batch
             self.last_batch = batch
+
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
@@ -862,13 +950,15 @@ class SchedulerDisaggregationDecodeMixin:
         self.last_batch: Optional[ScheduleBatch] = None
 
         while True:
-            # Receive requests
             recv_reqs = self.recv_requests()
+
             self.process_input_requests(recv_reqs)
+
             # polling and allocating kv cache
             self.process_decode_queue()
 
-            # Get the next batch to run
+            # Process any in-flight migration transfers (decode->decode)
+            self.process_migration_inflight_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
@@ -886,8 +976,6 @@ class SchedulerDisaggregationDecodeMixin:
             elif batch is None:
                 self.self_check_during_idle()
 
-            # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result)
 
             # Update last_batch
@@ -972,6 +1060,15 @@ class SchedulerDisaggregationDecodeMixin:
                 req.add_latency(RequestStage.DECODE_WAITING)
                 req.init_next_round_input(self.tree_cache)
             else:
+                if DISAGG_WAITING_LOG_S > 0:
+                    last_log_time = getattr(req, "_disagg_waiting_log_time", 0.0)
+                    now = time.perf_counter()
+                    if (now - last_log_time) >= DISAGG_WAITING_LOG_S:
+                        wait_entry = req.time_stats.wait_queue_entry_time
+                        wait_s = (
+                            now - wait_entry if wait_entry and wait_entry > 0 else 0.0
+                        )
+                        setattr(req, "_disagg_waiting_log_time", now)
                 waiting_queue.append(req)
 
         self.waiting_queue = waiting_queue
@@ -1004,7 +1101,8 @@ class SchedulerDisaggregationDecodeMixin:
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
-        self.waiting_queue.extend(resumed_reqs)
+        if resumed_reqs:
+            self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return
@@ -1023,4 +1121,5 @@ class SchedulerDisaggregationDecodeMixin:
             alloc_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
-            self.waiting_queue.extend(alloc_reqs)
+            if alloc_reqs:
+                self.waiting_queue.extend(alloc_reqs)

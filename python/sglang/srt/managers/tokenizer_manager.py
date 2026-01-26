@@ -36,6 +36,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+import psutil
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.encode_receiver import MMReceiver
@@ -61,6 +62,8 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
+    MigrateReq,
+    MigrateReqOutput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     SessionParams,
@@ -121,6 +124,15 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+TOKENIZER_LOG_INTERVAL_S = float(os.getenv("SGLANG_TOKENIZER_LOG_INTERVAL_S", "0"))
+TOKENIZER_SLOW_LOOP_MS = float(os.getenv("SGLANG_TOKENIZER_SLOW_LOOP_MS", "50"))
+TOKENIZER_TRACE_RECV = int(os.getenv("SGLANG_TOKENIZER_TRACE_RECV", "0"))
+TOKENIZER_TRACE_RECV_EVERY = max(
+    int(os.getenv("SGLANG_TOKENIZER_TRACE_RECV_EVERY", "1")), 1
+)
+TOKENIZER_DISABLE_METRICS = int(os.getenv("SGLANG_TOKENIZER_DISABLE_METRICS", "0"))
+TOKENIZER_HIGH_CPU_PCT = float(os.getenv("SGLANG_TOKENIZER_HIGH_CPU_PCT", "0"))
 
 
 @dataclasses.dataclass
@@ -193,7 +205,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         # Parse args
         self.server_args = server_args
-        self.enable_metrics = server_args.enable_metrics
+        self.enable_metrics = server_args.enable_metrics and not TOKENIZER_DISABLE_METRICS
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
         self.enable_trace = server_args.enable_trace
@@ -471,12 +483,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
                 ),
+                (MigrateReqOutput, self._handle_migrate_req_output),
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
             ]
         )
+        # Futures for migration responses (keyed by rid)
+        # Each entry is a tuple: (future, failure_count)
+        # We track failure counts to fail fast when all DP workers report failure
+        self._migrate_futures: Dict[str, Tuple[asyncio.Future, int]] = {}
+        # Extra per-rid metadata for migration debugging (do not affect logic)
+        self._migrate_debug: Dict[str, Dict[str, Any]] = {}
         self.init_communicators(self.server_args)
 
         self.sampling_params_class = SamplingParams
@@ -1121,7 +1140,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 continue
 
             out = state.out_list[-1]
-
             state.out_list = []
             if state.finished:
                 # For non-streaming cases, response has not been sent yet (`response_sent_to_client_ts` has not been set yet).
@@ -1318,6 +1336,198 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self.metrics_collector.labels
             )
 
+    async def migrate_request(
+        self,
+        rid: str,
+        bootstrap_host: str,
+        bootstrap_port: int,
+        bootstrap_room: int,
+        tokens_seen: int = 0,
+    ) -> Dict[str, Any]:
+        """Initiate migration of an in-flight request's KV cache to another worker.
+
+        This sends a MigrateReq to the scheduler which will:
+        1. Find and remove the request from active processing
+        2. Setup a KV sender with the provided bootstrap info
+        3. Transfer the KV cache to the destination worker
+        4. Return the pending outputs (tokens after tokens_seen)
+
+        Args:
+            rid: The request ID to migrate.
+            bootstrap_host: Destination worker's bootstrap host.
+            bootstrap_port: Destination worker's bootstrap port.
+            bootstrap_room: Unique room ID for this migration transfer.
+            tokens_seen: Number of tokens the frontend has already seen/yielded.
+
+        Returns:
+            Dict with:
+                - "result": "migrate" | "not_found" | "error" 
+                - "pending_outputs": List of pending outputs (token chunks the frontend hasn't seen yet).
+                - "src_dp_rank": Source DP rank.
+                - "bootstrap_room": Unique room ID for this migration transfer.
+            Each output is a dict with 'token_ids', 'text', etc.
+        """
+        if rid not in self.rid_to_state:
+            logger.warning(f"migrate_request: rid={rid} not found in rid_to_state")
+            return {
+                "result": "not_found",
+            }
+
+        logger.info(
+            f"migrate_request: start rid={rid}, tokens_seen={tokens_seen}, "
+            f"bootstrap={bootstrap_host}:{bootstrap_port}, room={bootstrap_room}"
+        )
+
+        # Create a future to receive the response from scheduler
+        # Store as tuple: (future, failure_count)
+        future = asyncio.get_event_loop().create_future()
+        self._migrate_futures[rid] = (future, 0)
+        self._migrate_debug[rid] = {
+            "bootstrap_host": bootstrap_host,
+            "bootstrap_port": bootstrap_port,
+            "bootstrap_room": bootstrap_room,
+            "tokens_seen": tokens_seen,
+            "ts_start": time.time(),
+        }
+
+        # Send migrate request to scheduler
+        req = MigrateReq(
+            rid=rid,
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
+            tokens_seen=tokens_seen,
+        )
+        self.send_to_scheduler.send_pyobj(req)
+
+        # Wait for response from scheduler (with timeout)
+        try:
+            migrate_output: MigrateReqOutput = await asyncio.wait_for(future, timeout=5.0)
+        except asyncio.TimeoutError:
+            ts0 = self._migrate_debug.get(rid, {}).get("ts_start", None)
+            waited_s = (time.time() - ts0) if ts0 else None
+            logger.error(
+                f"migrate_request: timeout waiting for response for rid={rid} "
+                f"waited_s={waited_s} room={bootstrap_room}"
+            )
+            self._migrate_futures.pop(rid, None)
+            self._migrate_debug.pop(rid, None)
+            return {
+                "result": "error",
+                "error": "timeout waiting for response",
+            }
+        finally:
+            self._migrate_futures.pop(rid, None)
+            self._migrate_debug.pop(rid, None)
+
+        if migrate_output.not_found:
+            logger.warning(f"migrate_request: not found rid={rid}, error={migrate_output.error}")
+            return {
+                "result": "not_found",
+            }
+        if not migrate_output.success:
+            logger.error(
+                f"migrate_request: failed rid={rid}, "
+                f"src_dp_rank={getattr(migrate_output, 'src_dp_rank', None)}, "
+                f"src_tp_rank={getattr(migrate_output, 'src_tp_rank', None)}, "
+                f"error={migrate_output.error}"
+            )
+            return {
+                "result": "error",
+                "error": migrate_output.error,
+            }
+
+        logger.info(
+            f"migrate_request: success rid={rid}, "
+            f"src_dp_rank={getattr(migrate_output, 'src_dp_rank', None)}, "
+            f"src_tp_rank={getattr(migrate_output, 'src_tp_rank', None)}, "
+            f"total_tokens={migrate_output.total_tokens}, "
+            f"pending_output_ids_len={len(migrate_output.pending_output_ids)}"
+        )
+
+        # Return pending outputs as list of dicts along with source dp_rank
+        # The src_dp_rank is needed so the destination worker's KV receiver
+        # can target the correct DP rank on the source worker to fetch the KV cache
+        pending_outputs = []
+        if migrate_output.pending_output_ids:
+            pending_outputs.append({
+                "token_ids": migrate_output.pending_output_ids,
+            })
+
+        return {
+            "result": "migrate",
+            "pending_outputs": pending_outputs,
+            "src_dp_rank": migrate_output.src_dp_rank,
+            "bootstrap_room": migrate_output.bootstrap_room,
+        }
+
+    def _handle_migrate_req_output(self, recv_obj: MigrateReqOutput) -> None:
+        """Handle MigrateReqOutput from scheduler.
+        
+        In DP attention setups, migration requests are broadcast to all DP workers,
+        but only one worker has the request. We track responses to:
+        1. Set the future immediately on success=True
+        2. Fail fast when ALL workers have responded with failure
+        """
+        rid = recv_obj.rid
+        state = self._migrate_futures.get(rid)
+        
+        if state is None:
+            # This can happen in DP broadcast setups: late failures arriving after the future
+            # has already been resolved/popped. It's only alarming if a SUCCESS gets dropped.
+            msg = (
+                f"_handle_migrate_req_output: dropped output (no pending state) rid={rid} "
+                f"success={recv_obj.success} "
+                f"src_dp_rank={getattr(recv_obj, 'src_dp_rank', None)} "
+                f"src_tp_rank={getattr(recv_obj, 'src_tp_rank', None)} "
+                f"error={getattr(recv_obj, 'error', None)}"
+            )
+            if recv_obj.success:
+                logger.warning(msg)
+            else:
+                logger.debug(msg)
+            return
+        
+        future, failure_count = state
+        
+        if future.done():
+            # Already resolved (success from another worker)
+            return
+        
+        if recv_obj.success:
+            # Success - set the future with the result
+            logger.info(
+                f"_handle_migrate_req_output: SUCCESS rid={rid} "
+                f"src_dp_rank={getattr(recv_obj, 'src_dp_rank', None)} "
+                f"src_tp_rank={getattr(recv_obj, 'src_tp_rank', None)} "
+                f"pending_output_ids_len={len(recv_obj.pending_output_ids)} total_tokens={recv_obj.total_tokens}"
+            )
+            future.set_result(recv_obj)
+        else:
+            # Failure (e.g., request not found on this DP worker)
+            # Track the failure and check if all workers have responded
+            failure_count += 1
+            self._migrate_futures[rid] = (future, failure_count)
+            
+            dp_size = self.server_args.dp_size
+            if failure_count >= dp_size:
+                # All DP workers have responded with failure - fail fast
+                logger.debug(
+                    f"_handle_migrate_req_output: all {dp_size} workers failed for rid={rid} "
+                    f"last_src_dp_rank={getattr(recv_obj, 'src_dp_rank', None)} "
+                    f"last_src_tp_rank={getattr(recv_obj, 'src_tp_rank', None)} "
+                    f"last_error={getattr(recv_obj, 'error', None)}"
+                )
+                future.set_result(recv_obj)
+            else:
+                logger.debug(
+                    f"_handle_migrate_req_output: failure {failure_count}/{dp_size} for rid={rid} "
+                    f"(waiting for other workers) "
+                    f"src_dp_rank={getattr(recv_obj, 'src_dp_rank', None)} "
+                    f"src_tp_rank={getattr(recv_obj, 'src_tp_rank', None)} "
+                    f"error={getattr(recv_obj, 'error', None)}"
+                )
+
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = True
@@ -1471,6 +1681,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             with self.soft_watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
+            after_dispatch = time.perf_counter()
             self.last_receive_tstamp = time.time()
             self.soft_watchdog.feed()
 
@@ -1500,6 +1711,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 "total_retractions": recv_obj.retraction_counts[i],
             }
 
+            if self.server_args.speculative_algorithm:
+                self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
             if self.enable_metrics:
                 self._add_metric_if_present(recv_obj, "queue_time", meta_info, i)
                 self._add_metric_if_present(
@@ -1524,7 +1737,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     i,
                 )
 
-            if not isinstance(recv_obj, BatchEmbeddingOutput):
+            is_batch_embedding = isinstance(recv_obj, BatchEmbeddingOutput)
+            is_batch_str = isinstance(recv_obj, BatchStrOutput)
+            is_batch_token_id = isinstance(recv_obj, BatchTokenIDOutput)
+            is_batch_multimodal = isinstance(recv_obj, BatchMultimodalOutput)
+
+            if not is_batch_embedding:
                 meta_info.update(
                     {
                         "completion_tokens": recv_obj.completion_tokens[i],
@@ -1540,10 +1758,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
 
-            if isinstance(recv_obj, BatchStrOutput):
+            # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
+            is_stream = getattr(state.obj, "stream", False)
+
+            if is_batch_str:
                 state.text += recv_obj.output_strs[i]
-                # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
-                is_stream = getattr(state.obj, "stream", False)
                 if self.server_args.stream_output and is_stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
@@ -1557,9 +1776,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
-
-            elif isinstance(recv_obj, BatchTokenIDOutput):
-                is_stream = getattr(state.obj, "stream", False)
+            elif is_batch_token_id:
                 if self.server_args.stream_output and is_stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
@@ -1572,10 +1789,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
-            elif isinstance(recv_obj, BatchMultimodalOutput):
+            elif is_batch_multimodal:
                 raise NotImplementedError("BatchMultimodalOut not implemented")
             else:
-                assert isinstance(recv_obj, BatchEmbeddingOutput)
+                assert is_batch_embedding
                 out_dict = {
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
@@ -1583,12 +1800,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
+                if self.server_args.speculative_algorithm:
+                    self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
                 state.finished_time = time.time()
                 state.finished_time_perf = time.perf_counter()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
-                if self.server_args.speculative_algorithm:
-                    self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
                 if self.enable_metrics:
                     self._calculate_timing_metrics(meta_info, state, recv_obj, i)
 
@@ -1601,6 +1818,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
             state.out_list.append(out_dict)
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and not getattr(state, "_first_event_set", False)
+            ):
+                setattr(state, "_first_event_set", True)
             state.event.set()
 
             # Log metrics and dump
@@ -1944,18 +2166,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self.metrics_collector.observe_time_to_first_token(
                 labels, state.first_token_time - state.created_time
             )
-        else:
-            num_new_tokens = completion_tokens - state.last_completion_tokens
-            if num_new_tokens:
-                new_time = time.time()
-                interval = new_time - state.last_time
-                self.metrics_collector.observe_inter_token_latency(
-                    labels,
-                    interval,
-                    num_new_tokens,
-                )
-                state.last_time = new_time
-                state.last_completion_tokens = completion_tokens
+        # ITL observation removed - now tracked as forward_pass_latency in scheduler
 
         if state.finished:
             retraction_count = (

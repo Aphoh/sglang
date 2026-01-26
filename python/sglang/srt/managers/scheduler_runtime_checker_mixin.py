@@ -240,7 +240,15 @@ class SchedulerRuntimeCheckerMixin:
             memory_leak, token_msg = self._check_radix_cache_memory()
 
         if memory_leak:
-            msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
+            # Add extra diagnostic info for migration queues
+            extra_info = ""
+            if hasattr(self, "disagg_migration_inflight_queue") and self.disagg_migration_inflight_queue:
+                migration_info = [
+                    f"rid={r.rid}, kv_alloc={r.kv_allocated_len}, kv_commit={r.kv_committed_len}"
+                    for r in self.disagg_migration_inflight_queue
+                ]
+                extra_info = f"migration_queue ({len(migration_info)} reqs): {migration_info}\n"
+            msg = f"token_to_kv_pool_allocator memory leak detected! {token_msg}{extra_info}"
             raise_error_or_warn(
                 self,
                 envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
@@ -326,6 +334,9 @@ class SchedulerRuntimeCheckerMixin:
             )
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
+            # Also skip if there are migration inflight requests
+            if hasattr(self, 'disagg_migration_inflight_queue'):
+                queue_size += len(self.disagg_migration_inflight_queue)
             if queue_size:
                 return
 

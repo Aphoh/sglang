@@ -294,6 +294,11 @@ class PrefillBootstrapQueue:
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
+            if req.time_stats.prefill_bootstrap_queue_entry_time > 0:
+                req.time_stats.bootstrap_duration = (
+                    req.time_stats.wait_queue_entry_time
+                    - req.time_stats.prefill_bootstrap_queue_entry_time
+                )
             req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
 
             trace_slice_end(
@@ -577,6 +582,18 @@ class SchedulerDisaggregationPrefillMixin:
 
         for req in done_reqs:
             req.time_stats.completion_time = time.perf_counter()
+            transfer_start = req.time_stats.prefill_transfer_queue_entry_time
+            if transfer_start > 0 and req.time_stats.completion_time >= transfer_start:
+                page_size = self.token_to_kv_pool_allocator.page_size
+                page_count = (req.start_send_idx + page_size - 1) // page_size
+                self.record_kv_transfer_metrics(
+                    bytes_transferred=self.estimate_kv_transfer_bytes(
+                        page_count=page_count
+                    ),
+                    latency_seconds=req.time_stats.completion_time - transfer_start,
+                    bootstrap_seconds=req.time_stats.bootstrap_duration,
+                    alloc_seconds=req.time_stats.alloc_waiting_duration,
+                )
 
         # Stream requests which have finished transfer
         self.stream_output(
@@ -723,7 +740,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if len(page_indices) == 0:
-            logger.info(
+            logger.debug(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return

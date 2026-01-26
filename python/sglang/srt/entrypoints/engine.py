@@ -17,6 +17,7 @@ The entry point of inference server. (SRT = SGLang Runtime)
 This file implements python APIs for the inference engine.
 """
 
+from typing import Any
 import asyncio
 import atexit
 import dataclasses
@@ -665,6 +666,40 @@ class Engine(EngineBase):
         """
 
         self.loop.run_until_complete(self.tokenizer_manager.freeze_gc())
+
+    async def migrate_request(
+        self,
+        rid: str,
+        bootstrap_host: str,
+        bootstrap_port: int,
+        bootstrap_room: int,
+        tokens_seen: int = 0,
+    ) -> Dict[str, Any]:
+        """Initiate migration of an in-flight request's KV cache to another worker.
+
+        This sends a MigrateReq to the scheduler which will:
+        1. Find and remove the request from active processing
+        2. Setup a KV sender with the provided bootstrap info
+        3. Transfer the KV cache to the destination worker
+
+        Args:
+            rid: The request ID to migrate.
+            bootstrap_host: Destination worker's bootstrap host.
+            bootstrap_port: Destination worker's bootstrap port.
+            bootstrap_room: Unique room ID for this migration transfer.
+            tokens_seen: Number of tokens the frontend has already seen/yielded.
+
+        Returns:
+            List of pending outputs (token chunks the frontend hasn't seen yet).
+        """
+        return await self.tokenizer_manager.migrate_request(
+            rid=rid,
+            bootstrap_host=bootstrap_host,
+            bootstrap_port=bootstrap_port,
+            bootstrap_room=bootstrap_room,
+            tokens_seen=tokens_seen,
+        )
+
 
     """
     Execute an RPC call on all scheduler processes.

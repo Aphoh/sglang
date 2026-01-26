@@ -655,6 +655,9 @@ class Req:
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
+        # For decode->decode migration: when True, migration owns KV cache release
+        self.is_migrating = False
+
         # Incremental streamining
         self.send_token_offset: int = 0
         self.send_decode_id_offset: int = 0
@@ -747,6 +750,7 @@ class Req:
         self.time_stats: TimeStats = TimeStats(disagg_mode=disagg_mode)
         self.has_log_time_stats: bool = False
         self.last_tic = time.monotonic()
+        self.kv_transfer_bytes: float = 0.0
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host

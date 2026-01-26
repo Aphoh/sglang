@@ -28,6 +28,7 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 GUARD = "NixlMsgGuard".encode("ascii")
+NIXL_WAIT_LOG_INTERVAL_S = envs.SGLANG_NIXL_WAIT_LOG_INTERVAL_S.get()
 
 
 @dataclasses.dataclass
@@ -146,32 +147,26 @@ class NixlKVManager(CommonKVManager):
         self.agent = nixl_agent(str(uuid.uuid4()))
         self.register_buffer_to_engine()
 
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._start_bootstrap_thread()
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
-                TransferStatus
-            )
-            self.heartbeat_failures = {}
-            self.session_pool = defaultdict(requests.Session)
-            self.session_pool_lock = threading.Lock()
-            self.addr_to_rooms_tracker = defaultdict(set)
-            self.connection_lock = threading.Lock()
+        # Receiver infrastructure - always initialize for both modes
+        # (decode uses it for receiving, prefill doesn't but it's harmless)
+        self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(TransferStatus)
+        self.heartbeat_failures: Dict[str, int] = {}
+        self.session_pool = defaultdict(requests.Session)
+        self.session_pool_lock = threading.Lock()
+        self.addr_to_rooms_tracker = defaultdict(set)
 
-            # Heartbeat interval should be at least 2 seconds
-            self.heartbeat_interval = max(
-                envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
-            )
-            # Heartbeat failure should be at least 1
-            self.max_failures = max(
-                envs.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
-            )
-            self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
-            self._start_heartbeat_checker_thread()
-        else:
-            raise ValueError(
-                f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
-            )
+        # Heartbeat/timeout settings
+        self.heartbeat_interval = max(
+            envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
+        )
+        self.max_failures = max(
+            envs.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
+        )
+        self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
+
+        # Start both threads - enables any node to act as sender or receiver
+        self._start_bootstrap_thread()
+        self._start_heartbeat_checker_thread()
 
     def _start_heartbeat_checker_thread(self):
         """
@@ -306,7 +301,7 @@ class NixlKVManager(CommonKVManager):
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
         agent_name = decode_kv_args.agent_name
         if agent_name in self.decode_kv_args_table:
-            logger.info(f"Peer {agent_name} was already registered, ignoring.")
+            logger.debug(f"Peer {agent_name} was already registered, ignoring.")
             return
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
@@ -568,8 +563,9 @@ class NixlKVManager(CommonKVManager):
         chunk_id: int,
         aux_index: Optional[int] = None,
     ):
-        assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last or (is_last and aux_index is not None)
+        # Only require aux_index if we have aux data to send (e.g., for EAGLE speculation)
+        has_aux_data = len(self.kv_args.aux_data_ptrs) > 0
+        assert not is_last or not has_aux_data or aux_index is not None
 
         reqs_to_be_processed = self.transfer_infos[bootstrap_room].values()
         handles = []
@@ -578,7 +574,21 @@ class NixlKVManager(CommonKVManager):
             if req.is_dummy():
                 continue
 
+            logger.debug(
+                f"add_transfer_request: room={bootstrap_room}, "
+                f"index_slice={index_slice}, "
+                f"kv_indices_len={len(kv_indices)}, "
+                f"dst_kv_indices_total_len={len(req.dst_kv_indices)}, "
+                f"chunk_id={chunk_id}, is_last={is_last}"
+            )
             chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
+            if len(chunked_dst_kv_indice) != len(kv_indices):
+                logger.error(
+                    f"KV indices mismatch! chunked_dst_kv_indice_len={len(chunked_dst_kv_indice)}, "
+                    f"kv_indices_len={len(kv_indices)}, "
+                    f"dst_kv_indices={req.dst_kv_indices.tolist()}, "
+                    f"index_slice={index_slice}"
+                )
             assert len(chunked_dst_kv_indice) == len(kv_indices)
             assert req.agent_name in self.decode_kv_args_table
 
@@ -614,7 +624,7 @@ class NixlKVManager(CommonKVManager):
 
             handles.append(kv_xfer_handle)
             # Only the last chunk we need to send the aux data.
-            if is_last:
+            if is_last and self.pp_group.is_last_rank and has_aux_data:
                 assert aux_index is not None
                 aux_xfer_handle = self.send_aux(
                     req.agent_name,
@@ -666,7 +676,7 @@ class NixlKVManager(CommonKVManager):
 
     def _start_bootstrap_thread(self):
         def bootstrap_thread():
-            """This thread recvs transfer info from the decode engine"""
+            """This thread recvs transfer info from the receiver (decode engine)"""
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
                 logger.debug(
@@ -699,7 +709,7 @@ class NixlKVManager(CommonKVManager):
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread).start()
+        threading.Thread(target=bootstrap_thread, daemon=True).start()
 
 
 class NixlKVSender(CommonKVSender):
@@ -721,6 +731,13 @@ class NixlKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
     ):
+        logger.debug(
+            f"NixlKVSender.send: room={self.bootstrap_room}, "
+            f"kv_indices_len={len(kv_indices)}, "
+            f"curr_idx={self.curr_idx}, "
+            f"num_kv_indices={self.num_kv_indices}, "
+            f"chunk_id={self.chunk_id}"
+        )
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
@@ -771,6 +788,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.bootstrap_room
             )
         self.init_time = None
+        self.last_wait_log_time = 0.0
 
     def init(
         self,
@@ -778,6 +796,14 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
+        logger.debug(
+            f"NixlKVReceiver.init: room={self.bootstrap_room}, "
+            f"kv_indices_len={len(kv_indices)}, "
+            f"aux_index={aux_index}, "
+            f"bootstrap_addr={self.bootstrap_addr}, "
+            f"engine_rank={getattr(self.kv_mgr.kv_args, 'engine_rank', None)}, "
+            f"prefill_dp_rank={self.prefill_dp_rank}"
+        )
         if self.bootstrap_infos is None:
             logger.error(
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
@@ -792,7 +818,7 @@ class NixlKVReceiver(CommonKVReceiver):
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
             logger.debug(
-                f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
+                f"Sending to sender with bootstrap room {self.bootstrap_room} {is_dummy=}"
             )
             with lock:
                 sock.send_multipart(
@@ -834,18 +860,57 @@ class NixlKVReceiver(CommonKVReceiver):
             return KVPoll.Failed
 
         self.kv_mgr.update_transfer_status()
+        if (
+            NIXL_WAIT_LOG_INTERVAL_S > 0
+            and elapsed >= NIXL_WAIT_LOG_INTERVAL_S
+            and (now - self.last_wait_log_time) >= NIXL_WAIT_LOG_INTERVAL_S
+        ):
+            status = self.kv_mgr.transfer_statuses.get(self.bootstrap_room)
+            received_kvs = len(status.received_kvs) if status else 0
+            expected_kvs = status.num_kvs_expected if status else None
+            received_aux = status.received_aux if status else False
+            logger.info(
+                "[DEBUG NIXL wait] room=%s elapsed=%.1fs received_kvs=%s/%s "
+                "received_aux=%s addr=%s",
+                self.bootstrap_room,
+                elapsed,
+                received_kvs,
+                expected_kvs,
+                received_aux,
+                self.bootstrap_addr,
+            )
+            if expected_kvs is None and received_kvs > 0 and not received_aux:
+                logger.error(
+                    "[NIXL STUCK] room=%s elapsed=%.1fs received_kvs=%s/%s "
+                    "received_aux=%s addr=%s (expected_kvs missing; possible init/send mismatch)",
+                    self.bootstrap_room,
+                    elapsed,
+                    received_kvs,
+                    expected_kvs,
+                    received_aux,
+                    self.bootstrap_addr,
+                )
+            self.last_wait_log_time = now
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room
             )
             # Check if the transfer failed
+            elapsed = None
+            if self.init_time is not None:
+                elapsed = time.time() - self.init_time
             if self.kv_mgr.transfer_statuses[self.bootstrap_room].is_failed():
                 self.conclude_state = KVPoll.Failed
                 logger.error(
-                    f"Transfer for room {self.bootstrap_room} failed due to node failure"
+                    f"NixlKVReceiver.transfer_done: room={self.bootstrap_room} FAILED "
+                    f"elapsed_s={elapsed} due to node failure"
                 )
             else:
                 self.conclude_state = KVPoll.Success
+                logger.debug(
+                    f"NixlKVReceiver.transfer_done: room={self.bootstrap_room} SUCCESS "
+                    f"elapsed_s={elapsed}"
+                )
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
@@ -877,6 +942,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
                     ]
                 )
+            logger.debug(f"Sent KV args to sender at {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')}")
 
     def failure_exception(self):
         raise RuntimeError("NIXL KVReceiver Exception")

@@ -29,6 +29,38 @@ from sglang.srt.utils.gauge_histogram import GaugeHistogram
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
+KV_TRANSFER_TIME_MS_BUCKETS = [
+    0.1,
+    0.2,
+    0.5,
+    1,
+    2,
+    5,
+    10,
+    20,
+    50,
+    100,
+    200,
+    500,
+    1000,
+    2000,
+    5000,
+]
+KV_TRANSFER_SPEED_GB_S_BUCKETS = [
+    0.1,
+    0.2,
+    0.5,
+    1,
+    2,
+    5,
+    10,
+    20,
+    50,
+    100,
+    200,
+    500,
+]
+
 
 logger = logging.getLogger(__name__)
 
@@ -458,34 +490,29 @@ class SchedulerMetricsCollector:
             documentation="The number of transfer failed requests.",
             labelnames=labels.keys(),
         )
-        self.num_prefill_retries_total = Counter(
-            name="sglang:num_prefill_retries_total",
-            documentation="Total number of prefill retries.",
-            labelnames=labels.keys(),
-        )
-        self.kv_transfer_speed_gb_s = Gauge(
+        self.kv_transfer_speed_gb_s = Histogram(
             name="sglang:kv_transfer_speed_gb_s",
-            documentation="The transfer speed of the KV cache in GB/s.",
+            documentation="Histogram of KV cache transfer speed in GB/s.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=KV_TRANSFER_SPEED_GB_S_BUCKETS,
         )
-        self.kv_transfer_latency_ms = Gauge(
+        self.kv_transfer_latency_ms = Histogram(
             name="sglang:kv_transfer_latency_ms",
-            documentation="The transfer latency of the KV cache in ms.",
+            documentation="Histogram of KV cache transfer latency in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=KV_TRANSFER_TIME_MS_BUCKETS,
         )
-        self.kv_transfer_bootstrap_ms = Gauge(
+        self.kv_transfer_bootstrap_ms = Histogram(
             name="sglang:kv_transfer_bootstrap_ms",
-            documentation="The bootstrap time of the KV transfer in ms.",
+            documentation="Histogram of KV transfer bootstrap time in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=KV_TRANSFER_TIME_MS_BUCKETS,
         )
-        self.kv_transfer_alloc_ms = Gauge(
+        self.kv_transfer_alloc_ms = Histogram(
             name="sglang:kv_transfer_alloc_ms",
-            documentation="The allocation waiting time of the KV transfer in ms.",
+            documentation="Histogram of KV transfer allocation wait time in ms.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+            buckets=KV_TRANSFER_TIME_MS_BUCKETS,
         )
         self.kv_transfer_total_mb = Gauge(
             name="sglang:kv_transfer_total_mb",
@@ -846,6 +873,30 @@ class SchedulerMetricsCollector:
                 "output_allow",
                 "output_reason",
                 "actual_execution",
+            ]
+        )
+        self.histogram_forward_pass_latency = Histogram(
+            name="sglang:forward_pass_latency_seconds",
+            documentation="Histogram of forward pass latency in seconds.",
+            labelnames=labels.keys(),
+            buckets=[
+                0.005,
+                0.01,
+                0.015,
+                0.02,
+                0.025,
+                0.03,
+                0.04,
+                0.05,
+                0.06,
+                0.08,
+                0.1,
+                0.15,
+                0.2,
+                0.3,
+                0.5,
+                1.0,
+                2.0,
             ],
         )
 
@@ -855,6 +906,36 @@ class SchedulerMetricsCollector:
 
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
+
+    def observe_forward_pass_latency(self, latency: float, batch_size: int) -> None:
+        """
+        Record forward pass latency for batch_size requests.
+
+        Each request in the batch experienced this forward pass latency.
+        O(1) update instead of O(batch_size).
+        """
+        if batch_size <= 0:
+            return
+        his = self.histogram_forward_pass_latency.labels(**self.labels)
+        his._sum.inc(latency * batch_size)
+        for i, bound in enumerate(his._upper_bounds):
+            if latency <= bound:
+                his._buckets[i].inc(batch_size)
+                break
+
+    def observe_kv_transfer_metrics(
+        self,
+        latency_ms: float,
+        speed_gb_s: float,
+        bootstrap_ms: Optional[float] = None,
+        alloc_ms: Optional[float] = None,
+    ) -> None:
+        self._log_histogram(self.kv_transfer_latency_ms, latency_ms)
+        self._log_histogram(self.kv_transfer_speed_gb_s, speed_gb_s)
+        if bootstrap_ms is not None:
+            self._log_histogram(self.kv_transfer_bootstrap_ms, bootstrap_ms)
+        if alloc_ms is not None:
+            self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
 
     def increment_bootstrap_failed_reqs(self) -> None:
         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)
@@ -994,12 +1075,6 @@ class SchedulerMetricsCollector:
         self._log_gauge(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
-        self._log_gauge(self.kv_transfer_speed_gb_s, stats.kv_transfer_speed_gb_s)
-        self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
-        self._log_gauge(self.kv_transfer_bootstrap_ms, stats.kv_transfer_bootstrap_ms)
-        self._log_gauge(self.kv_transfer_alloc_ms, stats.kv_transfer_alloc_ms)
-        self._log_gauge(self.kv_transfer_total_mb, stats.kv_transfer_total_mb)
-
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
         self._log_gauge(self.num_paused_reqs, stats.num_paused_reqs)
