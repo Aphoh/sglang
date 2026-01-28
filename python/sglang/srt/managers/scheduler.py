@@ -114,7 +114,6 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
-    RedirectReq,
     SlowDownReqInput,
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
@@ -429,8 +428,8 @@ class Scheduler(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
 
-            self.send_to_tokenizer = SenderWrapper(send_to_tokenizer, "tokenizer")
-            self.send_to_detokenizer = SenderWrapper(send_to_detokenizer, "detokenizer")
+            self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
+            self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
 
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
@@ -442,8 +441,8 @@ class Scheduler(
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
-            self.send_to_tokenizer = SenderWrapper(None, "tokenizer")
-            self.send_to_detokenizer = SenderWrapper(None, "detokenizer")
+            self.send_to_tokenizer = SenderWrapper(None)
+            self.send_to_detokenizer = SenderWrapper(None)
 
         if self.current_scheduler_metrics_enabled:
             self.send_metrics_from_scheduler = get_zmq_socket(
@@ -2270,17 +2269,6 @@ class Scheduler(
         #       we shall keep its reference not being release during all the forwarding pass
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
-
-    @staticmethod
-    def _format_rid_prefixes(reqs: List[BaseReq], max_count: int) -> str:
-        prefixes: List[str] = []
-        for req in reqs[:max_count]:
-            rid = getattr(req, "rid", None)
-            prefixes.append(rid[:6] if isinstance(rid, str) else "n/a")
-        remaining = len(reqs) - max_count
-        if remaining > 0:
-            prefixes.append(f"+{remaining}")
-        return ",".join(prefixes)
 
     def run_batch(
         self,

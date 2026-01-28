@@ -1681,7 +1681,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             with self.soft_watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             self._result_dispatcher(recv_obj)
-            after_dispatch = time.perf_counter()
             self.last_receive_tstamp = time.time()
             self.soft_watchdog.feed()
 
@@ -1711,8 +1710,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 "total_retractions": recv_obj.retraction_counts[i],
             }
 
-            if self.server_args.speculative_algorithm:
-                self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
             if self.enable_metrics:
                 self._add_metric_if_present(recv_obj, "queue_time", meta_info, i)
                 self._add_metric_if_present(
@@ -1800,8 +1797,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
-                if self.server_args.speculative_algorithm:
-                    self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
                 state.finished_time = time.time()
                 state.finished_time_perf = time.perf_counter()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
@@ -1818,11 +1813,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
             state.out_list.append(out_dict)
-            if (
-                self.disaggregation_mode == DisaggregationMode.DECODE
-                and not getattr(state, "_first_event_set", False)
-            ):
-                setattr(state, "_first_event_set", True)
             state.event.set()
 
             # Log metrics and dump

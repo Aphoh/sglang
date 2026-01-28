@@ -404,7 +404,6 @@ class ServerArgs:
     dp_size: int = 1
     load_balance_method: str = "round_robin"
     load_watch_interval: float = 0.1
-    max_reqs_per_dp_worker: Optional[int] = None
     # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
     prefill_round_robin_balance: bool = False
 
@@ -5375,8 +5374,6 @@ class PortArgs:
                     wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_ipc_name, "metrics_ipc_name")
-                    if server_args.max_reqs_per_dp_worker is not None:
-                        wait_port_available(dp_feedback_port, "dp_feedback_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:

@@ -47,8 +47,8 @@ from sglang.srt.utils import get_int_env_var
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     NSATokenToKVPool,
-    SWAKVPool,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler

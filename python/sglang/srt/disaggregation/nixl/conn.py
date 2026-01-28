@@ -96,14 +96,14 @@ class KVArgsRegisterInfo:
 class TransferStatus:
     """Used by KV Receiver to know when a transfer is done."""
 
-    # KV chunks received per pp_rank: {pp_rank: set of chunk_ids}
-    received_kvs_per_pp: Dict[int, Set[int]] = dataclasses.field(
+    # KV chunks received per sender: {sender_key: set of chunk_ids}
+    received_kvs_per_sender: Dict[str, Set[int]] = dataclasses.field(
         default_factory=lambda: defaultdict(set)
     )
-    # Expected chunk count per pp_rank (set when is_last=True): {pp_rank: expected_count}
-    expected_kvs_per_pp: Dict[int, int] = dataclasses.field(default_factory=dict)
-    # Number of PP ranks expected to send data.
-    num_pp_ranks_expected: Optional[int] = None
+    # Expected chunk count per sender (set when is_last=True): {sender_key: expected_count}
+    expected_kvs_per_sender: Dict[str, int] = dataclasses.field(default_factory=dict)
+    # Number of senders expected to send data.
+    num_senders_expected: Optional[int] = None
     # Whether aux data has been received.
     received_aux: bool = False
     # Mark as failed
@@ -112,14 +112,14 @@ class TransferStatus:
     def is_done(self):
         if self.is_failure:
             return True
-        if self.num_pp_ranks_expected is None or not self.received_aux:
+        if self.num_senders_expected is None or not self.received_aux:
             return False
-        # All PP ranks must have reported their expected count
-        if len(self.expected_kvs_per_pp) < self.num_pp_ranks_expected:
+        # All senders must have reported their expected count
+        if len(self.expected_kvs_per_sender) < self.num_senders_expected:
             return False
-        # Each PP rank must have received all expected chunks
-        for pp_rank, expected in self.expected_kvs_per_pp.items():
-            if len(self.received_kvs_per_pp[pp_rank]) != expected:
+        # Each sender must have received all expected chunks
+        for sender_key, expected in self.expected_kvs_per_sender.items():
+            if len(self.received_kvs_per_sender[sender_key]) != expected:
                 return False
         return True
 
@@ -301,7 +301,7 @@ class NixlKVManager(CommonKVManager):
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
         agent_name = decode_kv_args.agent_name
         if agent_name in self.decode_kv_args_table:
-            logger.debug(f"Peer {agent_name} was already registered, ignoring.")
+            logger.info(f"Peer {agent_name} was already registered, ignoring.")
             return
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
@@ -652,18 +652,19 @@ class NixlKVManager(CommonKVManager):
                     chunk_id = int(components[2])
                     is_last = bool(int(components[3]))
                     pp_rank = int(components[4]) if len(components) > 4 else 0
-                    # Track received chunks per pp_rank
-                    self.transfer_statuses[room].received_kvs_per_pp[pp_rank].add(
-                        chunk_id
-                    )
+                    sender_key = peer_name
+                    # Track received chunks per sender
+                    self.transfer_statuses[room].received_kvs_per_sender[
+                        sender_key
+                    ].add(chunk_id)
                     if is_last:
-                        # Record expected chunk count for this pp_rank
-                        self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = (
-                            chunk_id + 1
-                        )
-                        # Set num_pp_ranks_expected from table (or default to 1)
-                        if self.transfer_statuses[room].num_pp_ranks_expected is None:
-                            self.transfer_statuses[room].num_pp_ranks_expected = (
+                        # Record expected chunk count for this sender
+                        self.transfer_statuses[room].expected_kvs_per_sender[
+                            sender_key
+                        ] = chunk_id + 1
+                        # Set num_senders_expected from table (or default to 1)
+                        if self.transfer_statuses[room].num_senders_expected is None:
+                            self.transfer_statuses[room].num_senders_expected = (
                                 self.required_prefill_response_num_table.get(room, 1)
                             )
                 elif components[1] == "aux":
@@ -704,12 +705,29 @@ class NixlKVManager(CommonKVManager):
                 required_dst_info_num = self.transfer_infos[room][
                     agent_name
                 ].required_dst_info_num
-                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
+                role = (
+                    "prefill"
+                    if self.disaggregation_mode == DisaggregationMode.PREFILL
+                    else "decode"
+                )
+                logger.info(
+                    "[disagg-bootstrap] %s recv transfer info room=%s agent=%s got=%s/%s",
+                    role,
+                    room,
+                    agent_name,
+                    len(self.transfer_infos[room]),
+                    required_dst_info_num,
+                )
                 if len(self.transfer_infos[room]) == required_dst_info_num:
-                    logger.debug(f"{room=} is bootstrapped")
+                    logger.info(
+                        "[disagg-bootstrap] %s room=%s bootstrapped required=%s",
+                        role,
+                        room,
+                        required_dst_info_num,
+                    )
                     self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread, daemon=True).start()
+        threading.Thread(target=bootstrap_thread).start()
 
 
 class NixlKVSender(CommonKVSender):
@@ -860,45 +878,11 @@ class NixlKVReceiver(CommonKVReceiver):
             return KVPoll.Failed
 
         self.kv_mgr.update_transfer_status()
-        if (
-            NIXL_WAIT_LOG_INTERVAL_S > 0
-            and elapsed >= NIXL_WAIT_LOG_INTERVAL_S
-            and (now - self.last_wait_log_time) >= NIXL_WAIT_LOG_INTERVAL_S
-        ):
-            status = self.kv_mgr.transfer_statuses.get(self.bootstrap_room)
-            received_kvs = len(status.received_kvs) if status else 0
-            expected_kvs = status.num_kvs_expected if status else None
-            received_aux = status.received_aux if status else False
-            logger.info(
-                "[DEBUG NIXL wait] room=%s elapsed=%.1fs received_kvs=%s/%s "
-                "received_aux=%s addr=%s",
-                self.bootstrap_room,
-                elapsed,
-                received_kvs,
-                expected_kvs,
-                received_aux,
-                self.bootstrap_addr,
-            )
-            if expected_kvs is None and received_kvs > 0 and not received_aux:
-                logger.error(
-                    "[NIXL STUCK] room=%s elapsed=%.1fs received_kvs=%s/%s "
-                    "received_aux=%s addr=%s (expected_kvs missing; possible init/send mismatch)",
-                    self.bootstrap_room,
-                    elapsed,
-                    received_kvs,
-                    expected_kvs,
-                    received_aux,
-                    self.bootstrap_addr,
-                )
-            self.last_wait_log_time = now
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room
             )
             # Check if the transfer failed
-            elapsed = None
-            if self.init_time is not None:
-                elapsed = time.time() - self.init_time
             if self.kv_mgr.transfer_statuses[self.bootstrap_room].is_failed():
                 self.conclude_state = KVPoll.Failed
                 logger.error(
