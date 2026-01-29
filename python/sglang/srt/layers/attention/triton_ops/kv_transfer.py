@@ -20,7 +20,7 @@ These kernels enable efficient mixed-TP KV cache transfers by:
 
 Primary API:
 - gather_kv(): Gather KV from GPU to pinned CPU (uses chunked staging for best performance)
-- scatter_kv(): Scatter KV from pinned CPU to GPU (TODO)
+- scatter_kv(): Scatter KV from pinned CPU to GPU (direct reads, no staging needed)
 
 The chunked approach uses a fixed-size GPU staging buffer (default 256MB) to achieve
 ~80% of PCIe bandwidth while limiting GPU memory overhead. This outperforms pure
@@ -562,4 +562,230 @@ def gather_kv(
         num_heads_to_gather=num_heads_to_gather,
         staging_buffer_size_mb=staging_buffer_size_mb,
         staging_buffer=staging_buffer,
+    )
+
+
+# =============================================================================
+# Scatter Kernel: Host -> Device (Pinned CPU -> GPU KV Cache)
+# =============================================================================
+
+
+@triton.jit
+def _scatter_kv_kernel(
+    # Source pinned CPU buffer - GPU-accessible via zero-copy
+    src_ptr,
+    # Slot indices to scatter to
+    slot_indices_ptr,
+    # Destination KV cache - GPU memory
+    dst_ptr,
+    # Dimensions
+    num_tokens,
+    head_dim: tl.constexpr,
+    # Head slicing params
+    head_start: tl.constexpr,
+    num_heads_to_scatter: tl.constexpr,
+    # Source strides (in elements) - input is [num_tokens, num_heads_to_scatter, head_dim]
+    in_token_stride,
+    in_head_stride,
+    # Destination strides (in elements)
+    dst_slot_stride,
+    dst_head_stride,
+    # Block sizes
+    BLOCK_TOKENS: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """
+    Scatter KV data from contiguous pinned CPU buffer to scattered GPU slots.
+
+    This kernel handles a single layer's K or V buffer.
+
+    Input layout: [num_tokens, num_heads_to_scatter, head_dim] (contiguous, pinned CPU)
+    Output layout: [total_slots, num_heads, head_dim] on GPU
+
+    Grid: (num_heads_to_scatter,) - one program per head
+
+    Note: Reads from pinned CPU are naturally coalesced by the GPU memory controller,
+    so no staging buffer is needed (unlike the gather direction).
+    """
+    head_id = tl.program_id(0)  # relative head (0 to num_heads_to_scatter-1)
+
+    # Destination head index (absolute in destination KV cache)
+    dst_head = head_start + head_id
+
+    # Process tokens in blocks
+    for token_block_start in range(0, num_tokens, BLOCK_TOKENS):
+        token_offsets = token_block_start + tl.arange(0, BLOCK_TOKENS)
+        token_mask = token_offsets < num_tokens
+
+        # Load slot indices for these tokens
+        slot_ids = tl.load(slot_indices_ptr + token_offsets, mask=token_mask, other=0)
+
+        # Process head_dim in blocks
+        for dim_start in range(0, head_dim, BLOCK_DIM):
+            dim_offsets = dim_start + tl.arange(0, BLOCK_DIM)
+            dim_mask = dim_offsets < head_dim
+
+            # Compute source addresses in pinned CPU buffer (contiguous)
+            # src[token, head_id, dim] = base + token * token_stride + head_id * head_stride + dim
+            src_offsets = (
+                token_offsets[:, None] * in_token_stride
+                + head_id * in_head_stride
+                + dim_offsets[None, :]
+            )
+
+            # Load from pinned CPU buffer (zero-copy read over PCIe, coalesced)
+            mask = token_mask[:, None] & dim_mask[None, :]
+            data = tl.load(src_ptr + src_offsets, mask=mask, other=0.0)
+
+            # Compute destination addresses in GPU KV cache (scattered)
+            # dst[slot_id, dst_head, dim] = base + slot_id * slot_stride + dst_head * head_stride + dim
+            dst_offsets = (
+                slot_ids[:, None] * dst_slot_stride
+                + dst_head * dst_head_stride
+                + dim_offsets[None, :]
+            )
+
+            # Store to GPU KV cache (scattered writes, but to fast GPU memory)
+            tl.store(dst_ptr + dst_offsets, data, mask=mask)
+
+
+def scatter_kv_to_gpu(
+    pinned_input: torch.Tensor,  # pinned CPU buffer, viewed as flat
+    k_buffers: list[torch.Tensor],  # [num_layers] each [total_slots, num_heads, head_dim] on GPU
+    v_buffers: list[torch.Tensor],
+    slot_indices: torch.Tensor,  # [num_tokens] on GPU
+    head_start: int,
+    num_heads_to_scatter: int,
+) -> None:
+    """
+    Launch scatter kernel to distribute KV data from pinned CPU buffer to GPU KV cache.
+
+    Args:
+        pinned_input: Pinned CPU buffer to read from. Must be created with pin_memory=True.
+                      Should contain data in layout [num_layers, 2, num_tokens, num_heads_to_scatter, head_dim]
+        k_buffers: List of K cache tensors per layer, each [total_slots, num_heads, head_dim]
+        v_buffers: List of V cache tensors per layer, each [total_slots, num_heads, head_dim]
+        slot_indices: Tensor of slot indices to scatter to, shape [num_tokens], on GPU
+        head_start: First head index to scatter to (for head slicing in mixed-TP)
+        num_heads_to_scatter: Number of heads to scatter starting from head_start
+
+    Input layout in pinned_input: [num_layers, 2, num_tokens, num_heads_to_scatter, head_dim]
+    where dimension 1 is K=0, V=1
+    """
+    assert pinned_input.is_pinned(), "Input buffer must be pinned CPU memory"
+    assert slot_indices.is_cuda, "slot_indices must be on GPU"
+
+    num_layers = len(k_buffers)
+    num_tokens = slot_indices.shape[0]
+    num_heads = k_buffers[0].shape[1]
+    head_dim = k_buffers[0].shape[2]
+    dtype = k_buffers[0].dtype
+
+    assert head_start + num_heads_to_scatter <= num_heads, (
+        f"head_start ({head_start}) + num_heads_to_scatter ({num_heads_to_scatter}) "
+        f"exceeds num_heads ({num_heads})"
+    )
+
+    # Get destination strides (in elements, not bytes)
+    dst_slot_stride = k_buffers[0].stride(0)
+    dst_head_stride = k_buffers[0].stride(1)
+
+    # Determine block sizes
+    BLOCK_TOKENS = 64
+    BLOCK_DIM = min(64, triton.next_power_of_2(head_dim))
+
+    # Input strides for [num_tokens, num_heads_to_scatter, head_dim] layout
+    in_token_stride = num_heads_to_scatter * head_dim
+    in_head_stride = head_dim
+
+    # Size of one K or V buffer in input: num_tokens * num_heads_to_scatter * head_dim elements
+    kv_input_size = num_tokens * num_heads_to_scatter * head_dim
+
+    grid = (num_heads_to_scatter,)
+
+    # View pinned input as the right dtype
+    pinned_input_typed = pinned_input.view(dtype)
+
+    # Iterate over layers and K/V
+    for layer_idx in range(num_layers):
+        # Input offset for this layer
+        # Layout: [num_layers, 2, num_tokens, num_heads_to_scatter, head_dim]
+        layer_input_offset = layer_idx * 2 * kv_input_size
+
+        # K buffer for this layer
+        k_input_offset = layer_input_offset
+        _scatter_kv_kernel[grid](
+            pinned_input_typed[k_input_offset:],
+            slot_indices,
+            k_buffers[layer_idx],
+            num_tokens=num_tokens,
+            head_dim=head_dim,
+            head_start=head_start,
+            num_heads_to_scatter=num_heads_to_scatter,
+            in_token_stride=in_token_stride,
+            in_head_stride=in_head_stride,
+            dst_slot_stride=dst_slot_stride,
+            dst_head_stride=dst_head_stride,
+            BLOCK_TOKENS=BLOCK_TOKENS,
+            BLOCK_DIM=BLOCK_DIM,
+        )
+
+        # V buffer for this layer
+        v_input_offset = layer_input_offset + kv_input_size
+        _scatter_kv_kernel[grid](
+            pinned_input_typed[v_input_offset:],
+            slot_indices,
+            v_buffers[layer_idx],
+            num_tokens=num_tokens,
+            head_dim=head_dim,
+            head_start=head_start,
+            num_heads_to_scatter=num_heads_to_scatter,
+            in_token_stride=in_token_stride,
+            in_head_stride=in_head_stride,
+            dst_slot_stride=dst_slot_stride,
+            dst_head_stride=dst_head_stride,
+            BLOCK_TOKENS=BLOCK_TOKENS,
+            BLOCK_DIM=BLOCK_DIM,
+        )
+
+    # Ensure kernel completes before returning
+    torch.cuda.synchronize()
+
+
+def scatter_kv(
+    pinned_input: torch.Tensor,
+    k_buffers: list[torch.Tensor],
+    v_buffers: list[torch.Tensor],
+    slot_indices: torch.Tensor,
+    head_start: int = 0,
+    num_heads_to_scatter: int = None,
+) -> None:
+    """
+    Scatter KV cache data from pinned CPU memory to GPU.
+
+    This is the primary API for host-to-device KV transfers. Unlike the gather
+    direction, no staging buffer is needed because reads from pinned CPU memory
+    are naturally coalesced by the GPU memory controller.
+
+    Args:
+        pinned_input: Pinned CPU buffer to read from. Must be created with pin_memory=True.
+        k_buffers: List of K cache tensors per layer, each [total_slots, num_heads, head_dim]
+        v_buffers: List of V cache tensors per layer, each [total_slots, num_heads, head_dim]
+        slot_indices: Tensor of slot indices to scatter to, shape [num_tokens], on GPU
+        head_start: First head index to scatter to (for head slicing in mixed-TP). Default 0.
+        num_heads_to_scatter: Number of heads to scatter. Default None means all heads.
+
+    Input layout in pinned_input: [num_layers, 2, num_tokens, num_heads_to_scatter, head_dim]
+    where dimension 1 is K=0, V=1
+    """
+    if num_heads_to_scatter is None:
+        num_heads_to_scatter = k_buffers[0].shape[1] - head_start
+
+    scatter_kv_to_gpu(
+        pinned_input=pinned_input,
+        k_buffers=k_buffers,
+        v_buffers=v_buffers,
+        slot_indices=slot_indices,
+        head_start=head_start,
+        num_heads_to_scatter=num_heads_to_scatter,
     )
