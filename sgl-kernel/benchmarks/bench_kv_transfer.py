@@ -16,7 +16,7 @@ import triton
 triton_ops_path = Path(__file__).parent.parent.parent / "python" / "sglang" / "srt" / "layers" / "attention" / "triton_ops"
 sys.path.insert(0, str(triton_ops_path))
 
-from kv_transfer import gather_kv, gather_kv_to_pinned, gather_kv_with_staging, gather_kv_chunked
+from kv_transfer import gather_kv, gather_kv_to_pinned, gather_kv_with_staging, gather_kv_chunked, scatter_kv_to_gpu
 
 
 def benchmark_gather_kv(
@@ -545,6 +545,105 @@ def benchmark_memory_usage(
     }
 
 
+def benchmark_scatter_kv(
+    num_layers: int,
+    num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+    total_slots: int,
+    head_start: int,
+    num_heads_to_scatter: int,
+    pattern: str,
+    dtype: torch.dtype,
+    warmup: int = 10,
+    rep: int = 100,
+) -> dict:
+    """
+    Benchmark the scatter_kv_to_gpu kernel (pinned CPU -> GPU).
+    """
+    # Create input in pinned memory
+    bytes_per_element = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+    total_bytes = num_layers * 2 * num_tokens * num_heads_to_scatter * head_dim * bytes_per_element
+
+    input_size = num_layers * 2 * num_tokens * num_heads_to_scatter * head_dim
+    pinned_input = torch.randn(input_size, dtype=dtype, device="cpu", pin_memory=True)
+
+    # Create slot indices based on pattern
+    if pattern == "contiguous":
+        start = total_slots // 4
+        slot_indices = torch.arange(start, start + num_tokens, device="cuda", dtype=torch.int32)
+    elif pattern == "random":
+        slot_indices = torch.randperm(total_slots, device="cuda")[:num_tokens].to(torch.int32)
+    elif pattern == "strided":
+        stride = max(1, total_slots // num_tokens)
+        slot_indices = torch.arange(0, num_tokens * stride, stride, device="cuda", dtype=torch.int32)[:num_tokens]
+    else:
+        slot_indices = torch.randperm(total_slots, device="cuda")[:num_tokens].to(torch.int32)
+
+    # Create destination KV buffers
+    k_buffers = [
+        torch.zeros(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
+        for _ in range(num_layers)
+    ]
+    v_buffers = [
+        torch.zeros(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
+        for _ in range(num_layers)
+    ]
+
+    # Warmup
+    for _ in range(warmup):
+        scatter_kv_to_gpu(
+            pinned_input=pinned_input,
+            k_buffers=k_buffers,
+            v_buffers=v_buffers,
+            slot_indices=slot_indices,
+            head_start=head_start,
+            num_heads_to_scatter=num_heads_to_scatter,
+        )
+
+    # Benchmark
+    torch.cuda.synchronize()
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+
+    for i in range(rep):
+        start_events[i].record()
+        scatter_kv_to_gpu(
+            pinned_input=pinned_input,
+            k_buffers=k_buffers,
+            v_buffers=v_buffers,
+            slot_indices=slot_indices,
+            head_start=head_start,
+            num_heads_to_scatter=num_heads_to_scatter,
+        )
+        end_events[i].record()
+
+    torch.cuda.synchronize()
+
+    times_ms = [start_events[i].elapsed_time(end_events[i]) for i in range(rep)]
+    avg_time_ms = sum(times_ms) / len(times_ms)
+    min_time_ms = min(times_ms)
+
+    avg_bandwidth_gbs = (total_bytes / 1e9) / (avg_time_ms / 1000)
+    peak_bandwidth_gbs = (total_bytes / 1e9) / (min_time_ms / 1000)
+
+    del k_buffers, v_buffers, pinned_input
+    torch.cuda.empty_cache()
+
+    return {
+        "num_layers": num_layers,
+        "num_tokens": num_tokens,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "pattern": pattern,
+        "total_bytes_mb": total_bytes / 1e6,
+        "avg_time_ms": avg_time_ms,
+        "min_time_ms": min_time_ms,
+        "avg_bandwidth_gbs": avg_bandwidth_gbs,
+        "peak_bandwidth_gbs": peak_bandwidth_gbs,
+    }
+
+
 def benchmark_large_pool_fragmented(
     staging_buffer_size_mb: float = 256.0,
     warmup: int = 5,
@@ -741,6 +840,55 @@ def benchmark_large_pool_fragmented(
 
         del staging_buffer
 
+    # Benchmark scatter (host -> device)
+    print("\n  Benchmarking scatter (pinned CPU -> GPU)...")
+
+    # Fill pinned buffer with data to scatter
+    pinned_input = torch.randn(output_size, dtype=dtype, device="cpu", pin_memory=True)
+
+    # Create fresh destination buffers
+    k_buffers_dst = [
+        torch.zeros(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
+        for _ in range(num_layers)
+    ]
+    v_buffers_dst = [
+        torch.zeros(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
+        for _ in range(num_layers)
+    ]
+
+    for _ in range(warmup):
+        scatter_kv_to_gpu(
+            pinned_input=pinned_input,
+            k_buffers=k_buffers_dst,
+            v_buffers=v_buffers_dst,
+            slot_indices=slot_indices,
+            head_start=0,
+            num_heads_to_scatter=num_heads,
+        )
+
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+    for i in range(rep):
+        start_events[i].record()
+        scatter_kv_to_gpu(
+            pinned_input=pinned_input,
+            k_buffers=k_buffers_dst,
+            v_buffers=v_buffers_dst,
+            slot_indices=slot_indices,
+            head_start=0,
+            num_heads_to_scatter=num_heads,
+        )
+        end_events[i].record()
+    torch.cuda.synchronize()
+
+    times_ms = [start_events[i].elapsed_time(end_events[i]) for i in range(rep)]
+    scatter_time_ms = sum(times_ms) / len(times_ms)
+    scatter_bw = (transfer_bytes / 1e9) / (scatter_time_ms / 1000)
+    results["scatter"] = {"time_ms": scatter_time_ms, "bandwidth_gbs": scatter_bw}
+    print(f"    Scatter: {scatter_time_ms:.1f} ms, {scatter_bw:.2f} GB/s ({scatter_bw/memcpy_bw*100:.0f}% of memcpy)")
+
+    del k_buffers_dst, v_buffers_dst, pinned_input
+
     # Clean up
     del k_buffers, v_buffers, pinned_output, slot_indices
     torch.cuda.empty_cache()
@@ -783,12 +931,16 @@ def main():
         print(f"\n {'Method':<25} {'Time (ms)':<12} {'BW (GB/s)':<12} {'% of memcpy':<12}")
         print("-" * 60)
         print(f" {'Raw memcpy':<25} {results['memcpy']['time_ms']:<12.1f} {results['memcpy']['bandwidth_gbs']:<12.2f} {'100%':<12}")
+        print(f"\n Device -> Host (Gather):")
         print(f" {'Zero-copy':<25} {results['zero_copy']['time_ms']:<12.1f} {results['zero_copy']['bandwidth_gbs']:<12.2f} {results['zero_copy']['bandwidth_gbs']/memcpy_bw*100:.0f}%")
         for key in results:
             if key.startswith("chunked_"):
                 r = results[key]
                 name = f"Chunked ({r['staging_mb']:.0f}MB staging)"
                 print(f" {name:<25} {r['time_ms']:<12.1f} {r['bandwidth_gbs']:<12.2f} {r['bandwidth_gbs']/memcpy_bw*100:.0f}%")
+        if "scatter" in results:
+            print(f"\n Host -> Device (Scatter):")
+            print(f" {'Scatter (direct)':<25} {results['scatter']['time_ms']:<12.1f} {results['scatter']['bandwidth_gbs']:<12.2f} {results['scatter']['bandwidth_gbs']/memcpy_bw*100:.0f}%")
 
         if args.large_pool_only:
             return

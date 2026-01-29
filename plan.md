@@ -41,20 +41,44 @@ uncoalesced writes over PCIe. The solution is a **chunked staging buffer approac
 
 **Benchmark Results (H100 PCIe, 40GB pool, 92 layers, 32K tokens, 6.17GB transfer):**
 
-| Method | Time (ms) | BW (GB/s) | % of PCIe |
-|--------|-----------|-----------|-----------|
-| Raw memcpy | 512 | 12.06 | 100% |
-| Zero-copy | 965 | 6.40 | **53%** |
-| Chunked (256MB staging) | 630 | 9.79 | **81%** |
+| Direction | Method | Time (ms) | BW (GB/s) | % of memcpy |
+|-----------|--------|-----------|-----------|-------------|
+| D→H | Memcpy baseline | 512 | 12.1 | 100% |
+| D→H | Zero-copy | 965 | 6.4 | 53% |
+| D→H | Chunked (256MB staging) | 630 | 9.8 | **81%** |
+| H→D | Memcpy baseline | 217 | 28.4 | 100% |
+| H→D | Scatter (direct) | 236 | 26.2 | **92%** |
 
-The chunked approach achieves 81% of PCIe bandwidth while limiting GPU memory overhead
-to only 256MB regardless of transfer size.
+- **Gather (D→H)**: Chunked approach achieves 81% of memcpy with 256MB staging overhead
+- **Scatter (H→D)**: Direct approach achieves 92% of memcpy with no staging needed
 
-### TODO: Host → Device (Scatter) Kernel
+### Completed: Host → Device (Scatter) Kernel
 
-For the scatter kernel (pinned CPU → GPU), we don't need the staging buffer approach
-because reads from pinned memory are naturally coalesced by the GPU's memory controller.
-The kernel can read directly from pinned CPU and write scattered to GPU KV cache.
+**Location**: `python/sglang/srt/layers/attention/triton_ops/kv_transfer.py`
+
+```python
+def scatter_kv(
+    pinned_input: torch.Tensor,     # pinned CPU buffer
+    k_buffers: list[torch.Tensor],  # [num_layers] each [total_slots, num_heads, head_dim]
+    v_buffers: list[torch.Tensor],
+    slot_indices: torch.Tensor,     # [num_tokens] on GPU
+    head_start: int = 0,
+    num_heads_to_scatter: int = None,
+) -> None
+```
+
+For the scatter kernel (pinned CPU → GPU), no staging buffer is needed because reads
+from pinned memory are naturally coalesced by the GPU's memory controller.
+
+**Benchmark Results (H100 PCIe, 40GB pool, 92 layers, 32K tokens):**
+
+| Method | Time (ms) | BW (GB/s) | % of H→D memcpy |
+|--------|-----------|-----------|-----------------|
+| H→D memcpy baseline | 217 | 28.4 | 100% |
+| Scatter (direct) | 236 | 26.2 | **92%** |
+
+The scatter kernel achieves 92% of raw memcpy bandwidth with no staging buffer needed.
+Reads from pinned CPU are naturally coalesced, and writes to GPU HBM are fast.
 
 ## Architecture
 
