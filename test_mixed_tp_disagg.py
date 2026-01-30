@@ -56,6 +56,58 @@ COLORS = {
 PYTHON_EXE = str(Path.home() / "proj/dynamo/.venv/bin/python")
 
 
+def cleanup_stale_processes():
+    """Kill any leftover sglang/dynamo processes from previous runs."""
+    import signal
+
+    print("🧹 Cleaning up stale processes...")
+
+    # Find and kill processes matching patterns
+    patterns = ["sglang.launch_server", "dynamo.sglang", "dynamo.frontend"]
+
+    for pattern in patterns:
+        try:
+            # Use pgrep to find PIDs
+            result = subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True,
+                text=True
+            )
+            if result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                for pid in pids:
+                    try:
+                        os.kill(int(pid), signal.SIGKILL)
+                        print(f"   Killed PID {pid} ({pattern})")
+                    except (ProcessLookupError, ValueError):
+                        pass
+        except Exception:
+            pass
+
+    # Also check for processes on our ports
+    for port in [8080, 10000, 11500]:
+        try:
+            result = subprocess.run(
+                ["lsof", "-t", f"-i:{port}"],
+                capture_output=True,
+                text=True
+            )
+            if result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                for pid in pids:
+                    try:
+                        os.kill(int(pid), signal.SIGKILL)
+                        print(f"   Killed PID {pid} (port {port})")
+                    except (ProcessLookupError, ValueError):
+                        pass
+        except Exception:
+            pass
+
+    # Give processes time to die
+    time.sleep(2)
+    print("   Done!")
+
+
 def get_common_args(model_path: Path, debug: bool = False) -> list[str]:
     """Get common arguments for sglang workers."""
     return [
@@ -70,25 +122,19 @@ def get_common_args(model_path: Path, debug: bool = False) -> list[str]:
     ]
 
 
-def stream_output(proc: subprocess.Popen, name: str):
-    """Stream stdout from a process with a colored prefix."""
-    color = COLORS.get(name, "")
-    reset = COLORS["reset"]
-    prefix = f"{color}[{name}]{reset} "
-
-    for line in iter(proc.stdout.readline, ""):
-        if line:
-            # Check for TRITON-KV log messages
-            if "[TRITON-KV]" in line:
-                print(f"{prefix}\033[1;33m{line}\033[0m", end="", flush=True)
-            else:
-                print(f"{prefix}{line}", end="", flush=True)
+def stream_output(proc: subprocess.Popen, name: str, log_file: str):
+    """Stream stdout from a process to a log file."""
+    with open(log_file, 'w') as f:
+        for line in iter(proc.stdout.readline, ""):
+            if line:
+                f.write(line)
+                f.flush()
 
 
 def start_worker(
     name: str, args: list[str], env: dict[str, str] | None = None
 ) -> subprocess.Popen:
-    """Start a worker process and stream its logs."""
+    """Start a worker process and stream its logs to a file."""
     proc_env = os.environ.copy()
     if env:
         proc_env.update(env)
@@ -104,9 +150,13 @@ def start_worker(
 
     processes[name] = proc
 
-    # Start thread to stream output
+    # Create log file in /tmp/
+    log_file = f"/tmp/sglang_{name}.log"
+    print(f"📝 Logging {name} output to {log_file}")
+
+    # Start thread to stream output to file
     threading.Thread(
-        target=stream_output, args=(proc, name), daemon=True
+        target=stream_output, args=(proc, name, log_file), daemon=True
     ).start()
 
     return proc
@@ -118,9 +168,8 @@ def monitor_processes():
         for name, proc in list(processes.items()):
             ret = proc.poll()
             if ret is not None:
-                color = COLORS.get(name, "")
-                reset = COLORS["reset"]
-                print(f"\n{color}💀 [{name}] exited with code {ret}{reset}")
+                print(f"\n💀 [{name}] exited with code {ret}")
+                print(f"   See /tmp/sglang_{name}.log for details")
                 stop_event.set()
                 return
         time.sleep(0.5)
@@ -254,8 +303,11 @@ def main():
     )
     args = parser.parse_args()
 
+    # Clean up any stale processes from previous runs
+    cleanup_stale_processes()
+
     model_path = Path(args.model_path)
-    
+
     # TP configuration
     if args.reverse_tp:
         prefill_tp = 1
