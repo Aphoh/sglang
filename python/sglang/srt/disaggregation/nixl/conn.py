@@ -126,14 +126,14 @@ class KVArgsRegisterInfo:
 class TransferStatus:
     """Used by KV Receiver to know when a transfer is done."""
 
-    # KV chunks received per pp_rank: {pp_rank: set of chunk_ids}
-    received_kvs_per_pp: Dict[int, Set[int]] = dataclasses.field(
+    # KV chunks received per sender: {sender_key: set of chunk_ids}
+    received_kvs_per_sender: Dict[str, Set[int]] = dataclasses.field(
         default_factory=lambda: defaultdict(set)
     )
-    # Expected chunk count per pp_rank (set when is_last=True): {pp_rank: expected_count}
-    expected_kvs_per_pp: Dict[int, int] = dataclasses.field(default_factory=dict)
-    # Number of PP ranks expected to send data.
-    num_pp_ranks_expected: Optional[int] = None
+    # Expected chunk count per sender (set when is_last=True): {sender_key: expected_count}
+    expected_kvs_per_sender: Dict[str, int] = dataclasses.field(default_factory=dict)
+    # Number of senders expected to send data.
+    num_senders_expected: Optional[int] = None
     # Whether aux data has been received.
     received_aux: bool = False
     # Mark as failed
@@ -142,14 +142,14 @@ class TransferStatus:
     def is_done(self):
         if self.is_failure:
             return True
-        if self.num_pp_ranks_expected is None or not self.received_aux:
+        if self.num_senders_expected is None or not self.received_aux:
             return False
-        # All PP ranks must have reported their expected count
-        if len(self.expected_kvs_per_pp) < self.num_pp_ranks_expected:
+        # All senders must have reported their expected count
+        if len(self.expected_kvs_per_sender) < self.num_senders_expected:
             return False
-        # Each PP rank must have received all expected chunks
-        for pp_rank, expected in self.expected_kvs_per_pp.items():
-            if len(self.received_kvs_per_pp[pp_rank]) != expected:
+        # Each sender must have received all expected chunks
+        for sender_key, expected in self.expected_kvs_per_sender.items():
+            if len(self.received_kvs_per_sender[sender_key]) != expected:
                 return False
         return True
 
@@ -1010,19 +1010,21 @@ class NixlKVManager(CommonKVManager):
                 if components[1] == "kv":
                     chunk_id = int(components[2])
                     is_last = bool(int(components[3]))
-                    pp_rank = int(components[4]) if len(components) > 4 else 0
-                    # Track received chunks per pp_rank
-                    self.transfer_statuses[room].received_kvs_per_pp[pp_rank].add(
-                        chunk_id
-                    )
+                    # Use peer_name as sender_key to correctly track multiple senders
+                    # (important for mixed-TP where multiple prefill ranks send to one decode)
+                    sender_key = peer_name
+                    # Track received chunks per sender
+                    self.transfer_statuses[room].received_kvs_per_sender[
+                        sender_key
+                    ].add(chunk_id)
                     if is_last:
-                        # Record expected chunk count for this pp_rank
-                        self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = (
-                            chunk_id + 1
-                        )
-                        # Set num_pp_ranks_expected from table (or default to 1)
-                        if self.transfer_statuses[room].num_pp_ranks_expected is None:
-                            self.transfer_statuses[room].num_pp_ranks_expected = (
+                        # Record expected chunk count for this sender
+                        self.transfer_statuses[room].expected_kvs_per_sender[
+                            sender_key
+                        ] = (chunk_id + 1)
+                        # Set num_senders_expected from table (or default to 1)
+                        if self.transfer_statuses[room].num_senders_expected is None:
+                            self.transfer_statuses[room].num_senders_expected = (
                                 self.required_prefill_response_num_table.get(room, 1)
                             )
                 elif components[1] == "aux":
