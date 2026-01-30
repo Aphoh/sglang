@@ -316,7 +316,7 @@ class DecodePreallocQueue:
             kv_args.state_item_lens = []
             kv_args.state_type = "none"
 
-        # Add sender-specific fields needed for decode->decode migration
+        # Add fields needed for KV transfer
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
@@ -684,9 +684,6 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
-            decode_req.req.kv_transfer_bytes = self.scheduler.estimate_kv_transfer_bytes(
-                page_count=len(page_indices)
-            )
             logger.debug(
                 "[disagg-transfer] decode init kv rid=%s room=%s pages=%s aux_index=%s",
                 decode_req.req.rid,
@@ -937,13 +934,6 @@ class DecodeTransferQueue:
                 self._commit_transfer_to_req(decode_req)
                 transfer_start = decode_req.req.time_stats.decode_transfer_queue_entry_time
                 transfer_end = decode_req.req.time_stats.wait_queue_entry_time
-                if transfer_start > 0 and transfer_end >= transfer_start:
-                    self.scheduler.record_kv_transfer_metrics(
-                        bytes_transferred=decode_req.req.kv_transfer_bytes,
-                        latency_seconds=transfer_end - transfer_start,
-                        bootstrap_seconds=decode_req.req.time_stats.bootstrap_duration,
-                        alloc_seconds=decode_req.req.time_stats.alloc_waiting_duration,
-                    )
                 logger.debug(
                     "[disagg-transfer] decode transfer done rid=%s room=%s "
                     "latency_s=%.3f",
@@ -998,8 +988,8 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
             self.process_decode_queue()
-            # Process any in-flight migration transfers (decode->decode)
-            self.process_migration_inflight_queue()
+
+            # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
@@ -1025,8 +1015,7 @@ class SchedulerDisaggregationDecodeMixin:
             # polling and allocating kv cache
             self.process_decode_queue()
 
-            # Process any in-flight migration transfers (decode->decode)
-            self.process_migration_inflight_queue()
+            # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
