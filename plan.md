@@ -160,3 +160,151 @@ scatter_kv(
 | GPU staging memory | None | 256MB fixed |
 | PCIe efficiency | N/A (RDMA per slot) | ~80% of bandwidth |
 | CPU orchestration | High (Python loops) | Minimal |
+
+---
+
+## Next Steps: Integration & Testing
+
+### Phase 1: Understand the Dynamo Test Environment
+
+**Location**: `~/proj/dynamo`
+
+Dynamo is NVIDIA's inference orchestration framework that can launch disaggregated P/D sglang workers.
+
+1. **Explore key files**:
+   - `~/proj/dynamo/test_decode_disagg.py` - Existing disagg test (if present)
+   - `~/proj/dynamo/lib/bindings/python/` - Python bindings for dynamo
+   - `~/proj/dynamo/deploy/` - Deployment configurations
+   - Look for sglang-related test files: `find ~/proj/dynamo -name "*.py" | xargs grep -l sglang`
+
+2. **Understand the test pattern**:
+   - How dynamo launches sglang workers (prefill vs decode)
+   - How KV transfer is triggered between workers
+   - What configuration is needed for disaggregated mode
+
+3. **Python environment**: `~/proj/dynamo/.venv/bin/python` has sglang installed as editable
+
+### Phase 2: Create Test Scaffolding
+
+Create a new test file: `~/proj/dynamo/test_mixed_tp_disagg.py`
+
+**Test Requirements**:
+```python
+"""
+Test harness for mixed-TP disaggregated prefill/decode with Triton KV transfer.
+
+Setup (3x A100 GPUs):
+- Prefill worker: TP=2 (GPU 0,1), all heads
+- Decode worker: TP=1 (GPU 2), subset of heads
+
+Model: ~/proj/models/qwen3-4b
+
+Test Flow:
+1. Start prefill worker with TP=2
+2. Start decode worker with TP=1
+3. Send prefill request → triggers gather_kv on prefill side
+4. NIXL transfers CPU buffer to decode worker
+5. Decode worker receives → triggers scatter_kv
+6. Decode generates tokens to verify correctness
+"""
+```
+
+**Key test scenarios**:
+1. **Basic KV transfer**: Verify data arrives correctly at decode worker
+2. **Head slicing**: Prefill TP=2 sends subset of heads to decode TP=1
+3. **Multi-request**: Multiple concurrent prefill→decode transfers
+4. **Correctness**: Decode output matches non-disaggregated baseline
+
+### Phase 3: Integrate Triton Kernels into sglang Disagg Path
+
+**Files to modify in sglang**:
+
+1. **`python/sglang/srt/disaggregation/nixl/conn.py`**:
+   - Add import: `from sglang.srt.layers.attention.triton_ops.kv_transfer import gather_kv, scatter_kv`
+   - Modify sender path to use `gather_kv` instead of per-slot RDMA
+   - Modify receiver path to use `scatter_kv`
+   - Add logging to confirm new codepath is used
+
+2. **`python/sglang/srt/disaggregation/base/conn.py`**:
+   - Check if base class needs changes for CPU buffer management
+
+3. **Configuration**:
+   - Add flag to enable/disable Triton KV transfer (for A/B testing)
+   - E.g., `--kv-transfer-method triton|legacy`
+
+### Phase 4: Add Logging for Verification
+
+Add debug logging to verify the new codepath is executed:
+
+```python
+# In gather_kv:
+import logging
+logger = logging.getLogger(__name__)
+logger.info(f"[TRITON-KV] gather_kv: {num_tokens} tokens, {num_layers} layers, "
+            f"heads [{head_start}:{head_start+num_heads}], staging={staging_buffer is not None}")
+
+# In scatter_kv:
+logger.info(f"[TRITON-KV] scatter_kv: {num_tokens} tokens, {num_layers} layers, "
+            f"heads [{head_start}:{head_start+num_heads}]")
+```
+
+**Verification checklist**:
+- [ ] Log message appears during prefill worker KV send
+- [ ] Log message appears during decode worker KV receive
+- [ ] Transfer size matches expected (tokens × layers × heads × head_dim × 2 × dtype_size)
+- [ ] Decode generates correct tokens
+
+### Phase 5: Test Commands
+
+```bash
+# Activate dynamo environment
+source ~/proj/dynamo/.venv/bin/activate
+
+# Run the test (adjust based on dynamo's test runner)
+python ~/proj/dynamo/test_mixed_tp_disagg.py \
+    --model ~/proj/models/qwen3-4b \
+    --prefill-tp 2 \
+    --decode-tp 1 \
+    --num-gpus 3
+
+# Or if dynamo uses pytest:
+pytest ~/proj/dynamo/test_mixed_tp_disagg.py -v -s
+```
+
+### Phase 6: Debug Workflow
+
+If KV transfer fails:
+
+1. **Check logs for `[TRITON-KV]`** - confirms new codepath
+2. **Verify pinned buffer allocation** - must be page-aligned
+3. **Check slot_indices** - must be valid indices into KV cache
+4. **NIXL transfer completion** - ensure CPU→CPU transfer completes before scatter
+5. **Head index math** - verify head_start/num_heads matches TP configuration
+
+### Open Questions to Resolve
+
+1. **How does dynamo configure TP for different workers?**
+   - Need to find where TP is specified per-worker
+
+2. **How is NIXL connection established between workers?**
+   - Look for nixl initialization in dynamo/sglang integration
+
+3. **What's the buffer handoff protocol?**
+   - When does prefill signal "buffer ready"?
+   - When does decode know transfer is complete?
+
+4. **Head assignment for mixed TP**:
+   - Prefill TP=2: Worker 0 has heads [0:H/2], Worker 1 has heads [H/2:H]
+   - Decode TP=1: Single worker needs all heads
+   - Each prefill worker sends its heads to decode worker
+
+### File Checklist
+
+| File | Status | Description |
+|------|--------|-------------|
+| `kv_transfer.py` | ✅ Done | Triton gather/scatter kernels |
+| `test_kv_transfer.py` | ✅ Done | Unit tests for kernels |
+| `bench_kv_transfer.py` | ✅ Done | Bandwidth benchmarks |
+| `nixl/conn.py` | ⬜ TODO | Integrate gather/scatter into disagg path |
+| `test_mixed_tp_disagg.py` | ⬜ TODO | Dynamo integration test |
+| Logging | ⬜ TODO | Add [TRITON-KV] logging for verification |
