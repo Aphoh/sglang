@@ -886,26 +886,29 @@ class NixlKVManager(CommonKVManager):
             decode_info = self.decode_kv_args_table[req.agent_name]
 
             # Check if Triton transfer is enabled and supported
+            # NOTE: Triton transfer currently only works when prefill_tp <= decode_tp.
+            # When prefill_tp > decode_tp, multiple prefill ranks would write to the same
+            # destination buffer, causing data corruption. Fall back to legacy slice method.
+            prefill_tp_size = self.attn_tp_size
             use_triton = (
                 self.kv_transfer_method == "triton"
                 and decode_info.dst_pinned_ptr != 0
                 and self.kv_args.k_buffers is not None
                 and self.kv_args.v_buffers is not None
                 and not self.is_mla_backend  # MLA backend not supported yet
+                and prefill_tp_size <= decode_tp_size  # Only when prefill doesn't need coordination
             )
 
             if use_triton:
-                # Calculate head slicing for mixed-TP
-                prefill_tp_size = self.attn_tp_size
+                # Calculate head slicing for mixed-TP (prefill_tp <= decode_tp)
                 num_kv_heads = self.kv_args.kv_head_num
-                local_tp_rank = self.kv_args.engine_rank % prefill_tp_size
 
-                if prefill_tp_size > decode_tp_size:
-                    # Prefill has more ranks - each prefill rank sends its heads
+                if prefill_tp_size == decode_tp_size:
+                    # Same TP - send all local heads
                     head_start = 0
                     num_heads_to_send = num_kv_heads
                 else:
-                    # Decode has more ranks - need to slice heads
+                    # Decode has more ranks - need to slice heads for the target decode rank
                     decode_tp_rank = decode_info.decode_tp_rank % decode_tp_size
                     dst_heads_per_rank = num_kv_heads * prefill_tp_size // decode_tp_size
                     head_start = (decode_tp_rank * dst_heads_per_rank) % num_kv_heads
