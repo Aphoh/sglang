@@ -11,6 +11,7 @@ set -euo pipefail
 # - CUDA_VERSION (default: 13.0.1)
 # - TAG_VERSION (default: v1)
 # - IMAGE_REPO (default: nvcr.io/nvidian/dynamo-dev/warnold-utils)
+# - UBUNTU_MIRROR (optional: custom Ubuntu mirror URL)
 # - DRY_RUN=1 (print command only)
 #
 # Flags:
@@ -29,6 +30,7 @@ done
 CUDA_VERSION="${CUDA_VERSION:-13.0.1}"
 TAG_VERSION="${TAG_VERSION:-v1}"
 IMAGE_REPO="${IMAGE_REPO:-nvcr.io/nvidian/dynamo-dev/warnold-utils}"
+UBUNTU_MIRROR="${UBUNTU_MIRROR:-https://urm.nvidia.com/artifactory/ubuntu-remote}"
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -53,6 +55,11 @@ if [[ "$LOCAL_BUILD" == "1" ]]; then
     docker build
     --build-arg "CUDA_VERSION=${CUDA_VERSION}"
     --build-arg "BRANCH_TYPE=local"
+  )
+  if [[ -n "${UBUNTU_MIRROR}" ]]; then
+    CMD+=(--build-arg "UBUNTU_MIRROR=${UBUNTU_MIRROR}")
+  fi
+  CMD+=(
     -t "${IMAGE_TAG}"
     -f docker/Dockerfile
     .
@@ -65,12 +72,17 @@ else
     --platform "${PLATFORM}"
     --build-arg "CUDA_VERSION=${CUDA_VERSION}"
     --build-arg "BRANCH_TYPE=local"
+  )
+  if [[ -n "${UBUNTU_MIRROR}" ]]; then
+    CMD+=(--build-arg "UBUNTU_MIRROR=${UBUNTU_MIRROR}")
+  fi
+  CMD+=(
     --cache-from "type=registry,ref=${CACHE_REF}"
   )
   # Only add --cache-to if not disabled (significantly speeds up export)
-  # Using mode=min (default) instead of mode=max to only cache final image layers
+  # Using mode=max to cache all intermediate stages for better rebuild performance
   if [[ "$NO_CACHE_EXPORT" == "0" ]]; then
-    CMD+=(--cache-to "type=registry,ref=${CACHE_REF}")
+    CMD+=(--cache-to "type=registry,ref=${CACHE_REF},mode=max")
   fi
   CMD+=(
     -t "${IMAGE_TAG}"
@@ -82,6 +94,9 @@ else
   echo "  platform: ${PLATFORM}"
   echo "  cache:    ${CACHE_REF}"
   echo "  cuda:     ${CUDA_VERSION}"
+  if [[ -n "${UBUNTU_MIRROR}" ]]; then
+    echo "  mirror:   ${UBUNTU_MIRROR}"
+  fi
   if [[ "$NO_CACHE_EXPORT" == "1" ]]; then
     echo "  cache-export: disabled (--no-cache-export)"
   fi

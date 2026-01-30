@@ -32,8 +32,28 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin" \
 
 # Replace Ubuntu sources if specified
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
-    sed -i "s|http://.*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
-    sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+    # Determine ports mirror (ARM uses separate ports mirror) \
+    UBUNTU_PORTS_MIRROR=$(echo "$UBUNTU_MIRROR" | sed 's|ubuntu-remote|ubuntu-ports-remote|') && \
+    # Handle traditional sources.list format \
+    if [ -f /etc/apt/sources.list ]; then \
+        sed -i -e "s|http://[^/]*archive\.ubuntu\.com[^ ]*|$UBUNTU_MIRROR|g" \
+               -e "s|http://[^/]*security\.ubuntu\.com[^ ]*|$UBUNTU_MIRROR|g" \
+               -e "s|http://[^/]*ports\.ubuntu\.com[^ ]*|$UBUNTU_PORTS_MIRROR|g" \
+               -e "s|https://[^/]*archive\.ubuntu\.com[^ ]*|$UBUNTU_MIRROR|g" \
+               -e "s|https://[^/]*security\.ubuntu\.com[^ ]*|$UBUNTU_MIRROR|g" \
+               -e "s|https://[^/]*ports\.ubuntu\.com[^ ]*|$UBUNTU_PORTS_MIRROR|g" \
+               /etc/apt/sources.list; \
+    fi && \
+    # Handle DEB822 format in sources.list.d/ (Ubuntu 24.04+) \
+    if [ -d /etc/apt/sources.list.d ]; then \
+        find /etc/apt/sources.list.d -type f \( -name "*.list" -o -name "*.sources" \) -exec \
+            sed -i -e "s|http://[^/]*archive\.ubuntu\.com[^ ]*|$UBUNTU_MIRROR|g" \
+                   -e "s|http://[^/]*security\.ubuntu\.com[^ ]*|$UBUNTU_MIRROR|g" \
+                   -e "s|http://[^/]*ports\.ubuntu\.com[^ ]*|$UBUNTU_PORTS_MIRROR|g" \
+                   -e "s|https://[^/]*archive\.ubuntu\.com[^ ]*|$UBUNTU_MIRROR|g" \
+                   -e "s|https://[^/]*security\.ubuntu\.com[^ ]*|$UBUNTU_MIRROR|g" \
+                   -e "s|https://[^/]*ports\.ubuntu\.com[^ ]*|$UBUNTU_PORTS_MIRROR|g" {} \; ; \
+    fi; \
 fi
 
 # Python setup (combined with apt update to reduce layers)
@@ -148,13 +168,6 @@ ENV LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8
 
 ########################################################
-########## Local Source Stage #########################
-########################################################
-
-FROM scratch AS local_src
-COPY . /src
-
-########################################################
 ########## PARALLEL BUILDER STAGES ####################
 ########################################################
 #
@@ -208,7 +221,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi
 
 # Copy ONLY dependency specification file (for better caching)
-COPY --from=local_src /src/python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
+COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
 
 # Install sglang dependencies (torch, transformers, etc.)
 # This layer is cached unless pyproject.toml changes
@@ -533,7 +546,7 @@ RUN python3 -m pip install --upgrade "urllib3>=2.6.3"
 # Copy sglang source and do editable install (LAST for better caching)
 # =============================================================================
 
-COPY --from=local_src /src /tmp/local_src
+COPY . /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         cp -r /tmp/local_src /sgl-workspace/sglang; \
     elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
