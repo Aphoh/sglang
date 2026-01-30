@@ -614,6 +614,7 @@ class NixlKVManager(CommonKVManager):
         notif: str,
         head_start: int = 0,
         num_heads_to_send: int = None,
+        dst_head_offset: int = 0,
     ):
         """
         Send KV cache using Triton gather kernel + single NIXL transfer.
@@ -648,7 +649,7 @@ class NixlKVManager(CommonKVManager):
                 "when using Triton KV transfer."
             )
 
-        # Get tensor buffers
+        # Get tensor buffers (these should be the same as kv_data_ptrs)
         k_buffers = self.kv_args.k_buffers
         v_buffers = self.kv_args.v_buffers
         num_layers = len(k_buffers)
@@ -660,7 +661,20 @@ class NixlKVManager(CommonKVManager):
         if num_heads_to_send is None:
             num_heads_to_send = num_heads - head_start
 
-        # Calculate transfer size
+        # Convert page indices to slot indices FIRST
+        # prefill_kv_indices contains PAGE indices, but we need SLOT indices
+        # Each page contains page_size slots
+        page_size = self.kv_args.page_size
+        slot_indices_list = []
+        for page_idx in prefill_kv_indices:
+            for slot_in_page in range(page_size):
+                slot_indices_list.append(int(page_idx) * page_size + slot_in_page)
+        slot_indices_tensor = torch.tensor(
+            slot_indices_list, device=k_buffers[0].device, dtype=torch.int64
+        )
+        num_tokens = len(slot_indices_list)  # Now num_tokens is actual slot count
+
+        # Calculate transfer size AFTER page-to-slot expansion
         bytes_per_element = 2 if dtype in (torch.float16, torch.bfloat16) else 4
         transfer_elements = num_layers * 2 * num_tokens * num_heads_to_send * head_dim
         transfer_bytes = transfer_elements * bytes_per_element
@@ -683,11 +697,6 @@ class NixlKVManager(CommonKVManager):
             if not self.triton_pinned_descs:
                 raise Exception("NIXL memory registration failed for Triton pinned buffer")
 
-        # Convert numpy indices to torch tensor on GPU
-        slot_indices_tensor = torch.from_numpy(prefill_kv_indices).to(
-            k_buffers[0].device, dtype=torch.int64
-        )
-
         logger.debug(
             f"[TRITON-KV] send_kvcache_triton: {num_tokens} tokens, {num_layers} layers, "
             f"heads [{head_start}:{head_start + num_heads_to_send}], "
@@ -706,11 +715,15 @@ class NixlKVManager(CommonKVManager):
         )
 
         # Step 2: Transfer pinned buffer to destination via NIXL (single transfer)
+        # Calculate destination offset based on dst_head_offset for mixed-TP transfers
+        head_stride_bytes = num_layers * 2 * num_tokens * head_dim * bytes_per_element
+        dst_offset = dst_head_offset * head_stride_bytes
+
         src_addrs = [
             (self.triton_pinned_buffer.data_ptr(), transfer_bytes, 0)
         ]
         dst_addrs = [
-            (dst_pinned_ptr, transfer_bytes, 0)
+            (dst_pinned_ptr + dst_offset, transfer_bytes, 0)
         ]
 
         src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
@@ -774,17 +787,23 @@ class NixlKVManager(CommonKVManager):
         k_buffers = self.kv_args.k_buffers
         v_buffers = self.kv_args.v_buffers
         num_layers = len(k_buffers)
-        num_tokens = len(kv_indices)
         num_heads = k_buffers[0].shape[1]
         head_dim = k_buffers[0].shape[2]
 
         if num_heads_received is None:
             num_heads_received = num_heads - head_start
 
-        # Convert numpy indices to torch tensor on GPU
-        slot_indices_tensor = torch.from_numpy(kv_indices).to(
-            k_buffers[0].device, dtype=torch.int64
+        # Convert page indices to slot indices
+        # kv_indices contains PAGE indices, but we need SLOT indices
+        page_size = self.kv_args.page_size
+        slot_indices_list = []
+        for page_idx in kv_indices:
+            for slot_in_page in range(page_size):
+                slot_indices_list.append(int(page_idx) * page_size + slot_in_page)
+        slot_indices_tensor = torch.tensor(
+            slot_indices_list, device=k_buffers[0].device, dtype=torch.int64
         )
+        num_tokens = len(slot_indices_list)  # Actual number of slots
 
         logger.debug(
             f"[TRITON-KV] scatter_received_kv: {num_tokens} tokens, {num_layers} layers, "
@@ -887,8 +906,7 @@ class NixlKVManager(CommonKVManager):
 
             # Check if Triton transfer is enabled and supported
             # NOTE: Triton transfer currently only works when prefill_tp <= decode_tp.
-            # When prefill_tp > decode_tp, multiple prefill ranks would write to the same
-            # destination buffer, causing data corruption. Fall back to legacy slice method.
+            # Check if Triton transfer is enabled and supported
             prefill_tp_size = self.attn_tp_size
             use_triton = (
                 self.kv_transfer_method == "triton"
@@ -896,27 +914,46 @@ class NixlKVManager(CommonKVManager):
                 and self.kv_args.k_buffers is not None
                 and self.kv_args.v_buffers is not None
                 and not self.is_mla_backend  # MLA backend not supported yet
-                and prefill_tp_size <= decode_tp_size  # Only when prefill doesn't need coordination
             )
 
             if use_triton:
-                # Calculate head slicing for mixed-TP (prefill_tp <= decode_tp)
+                # Calculate head slicing and destination offset for mixed-TP
+                # The pinned buffer uses HEAD-FIRST layout: [head, layer, kv, token, head_dim]
+                # This allows easy head slicing via dst_head_offset.
                 num_kv_heads = self.kv_args.kv_head_num
+                local_tp_rank = self.kv_args.engine_rank % prefill_tp_size
 
                 if prefill_tp_size == decode_tp_size:
-                    # Same TP - send all local heads
+                    # Same TP - send all local heads to offset 0
                     head_start = 0
                     num_heads_to_send = num_kv_heads
+                    dst_head_offset = 0
+                elif prefill_tp_size > decode_tp_size:
+                    # Prefill has more ranks (e.g., TP=2 prefill -> TP=1 decode)
+                    # Each prefill rank sends ALL its local heads
+                    # to different offsets in the decode's buffer
+                    head_start = 0
+                    num_heads_to_send = num_kv_heads
+                    # Destination offset = local_tp_rank * local_num_heads
+                    # So rank 0 writes to heads [0:4], rank 1 writes to heads [4:8]
+                    dst_head_offset = local_tp_rank * num_kv_heads
                 else:
-                    # Decode has more ranks - need to slice heads for the target decode rank
+                    # Decode has more ranks (e.g., TP=1 prefill -> TP=2 decode)
+                    # Prefill sends different head slices to different decode ranks
                     decode_tp_rank = decode_info.decode_tp_rank % decode_tp_size
-                    dst_heads_per_rank = num_kv_heads * prefill_tp_size // decode_tp_size
-                    head_start = (decode_tp_rank * dst_heads_per_rank) % num_kv_heads
-                    num_heads_to_send = dst_heads_per_rank
+                    # Total heads in prefill = num_kv_heads (all heads on this single prefill rank)
+                    # Each decode rank needs: total_prefill_heads / decode_tp_size
+                    total_prefill_heads = num_kv_heads * prefill_tp_size  # = num_kv_heads since prefill_tp=1
+                    heads_per_decode_rank = total_prefill_heads // decode_tp_size
+                    head_start = decode_tp_rank * heads_per_decode_rank
+                    num_heads_to_send = heads_per_decode_rank
+                    # Each decode rank receives at offset 0 of its own buffer
+                    dst_head_offset = 0
 
                 logger.debug(
                     f"[TRITON-KV] Using Triton transfer: room={bootstrap_room}, "
                     f"tokens={len(kv_indices)}, heads=[{head_start}:{head_start + num_heads_to_send}], "
+                    f"dst_head_offset={dst_head_offset}, "
                     f"prefill_tp={prefill_tp_size}, decode_tp={decode_tp_size}"
                 )
 
@@ -928,6 +965,7 @@ class NixlKVManager(CommonKVManager):
                     notif=notif,
                     head_start=head_start,
                     num_heads_to_send=num_heads_to_send,
+                    dst_head_offset=dst_head_offset,
                 )
             elif self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
                 kv_xfer_handle = self.send_kvcache(
