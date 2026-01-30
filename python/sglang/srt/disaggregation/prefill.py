@@ -61,14 +61,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-KV_POLL_NAME = {
-    KVPoll.Failed: "Failed",
-    KVPoll.Bootstrapping: "Bootstrapping",
-    KVPoll.WaitingForInput: "WaitingForInput",
-    KVPoll.Transferring: "Transferring",
-    KVPoll.Success: "Success",
-}
-
 
 class PrefillBootstrapQueue:
     """
@@ -211,18 +203,6 @@ class PrefillBootstrapQueue:
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
-        logger.debug(
-            "[disagg-bootstrap] prefill enqueue rid=%s room=%s host=%s port=%s "
-            "tp=%s pp=%s dp=%s",
-            req.rid,
-            req.bootstrap_room,
-            req.bootstrap_host,
-            self.bootstrap_port,
-            self.tp_rank,
-            self.pp_rank,
-            self.scheduler.dp_rank,
-        )
-
         if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
             kv_sender_class = get_kv_class(TransferBackend.FAKE, KVClassType.SENDER)
         else:
@@ -331,20 +311,7 @@ class PrefillBootstrapQueue:
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
-            if req.time_stats.prefill_bootstrap_queue_entry_time > 0:
-                req.time_stats.bootstrap_duration = (
-                    req.time_stats.wait_queue_entry_time
-                    - req.time_stats.prefill_bootstrap_queue_entry_time
-                )
             req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
-            logger.debug(
-                "[disagg-bootstrap] prefill bootstrapped rid=%s room=%s poll=%s "
-                "bootstrap_s=%.3f",
-                req.rid,
-                req.bootstrap_room,
-                KV_POLL_NAME.get(poll, poll),
-                req.time_stats.bootstrap_duration,
-            )
 
             trace_slice_end(
                 RequestStage.PREFILL_BOOTSTRAP, req.rid, auto_next_anon=True
@@ -627,15 +594,6 @@ class SchedulerDisaggregationPrefillMixin:
 
         for req in done_reqs:
             req.time_stats.completion_time = time.perf_counter()
-            transfer_start = req.time_stats.prefill_transfer_queue_entry_time
-            if transfer_start > 0 and req.time_stats.completion_time >= transfer_start:
-                logger.debug(
-                    "[disagg-transfer] prefill transfer done rid=%s room=%s "
-                    "latency_s=%.3f",
-                    req.rid,
-                    req.bootstrap_room,
-                    req.time_stats.completion_time - transfer_start,
-                )
 
         # Stream requests which have finished transfer
         self.stream_output(
@@ -782,19 +740,8 @@ class SchedulerDisaggregationPrefillMixin:
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if len(page_indices) == 0:
-            logger.debug(
+            logger.info(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
-        if last_chunk:
-            logger.debug(
-                "[disagg-transfer] prefill send kv rid=%s room=%s pages=%s "
-                "start_idx=%s end_idx=%s aux_index=%s",
-                req.rid,
-                req.bootstrap_room,
-                len(page_indices),
-                start_idx,
-                end_idx,
-                req.metadata_buffer_index,
-            )
         req.disagg_kv_sender.send(page_indices, state_indices)
