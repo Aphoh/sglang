@@ -53,7 +53,7 @@ def _gather_kv_kernel(
     # Source strides (in elements)
     src_slot_stride,
     src_head_stride,
-    # Output strides (in elements) - output is [num_tokens, num_heads_to_gather, head_dim]
+    # Output strides (in elements) - can be very large for HEAD-FIRST layout, use int64
     out_token_stride,
     out_head_stride,
     # Block sizes
@@ -66,7 +66,7 @@ def _gather_kv_kernel(
     This kernel handles a single layer's K or V buffer.
 
     Input layout: [total_slots, num_heads, head_dim] on GPU
-    Output layout: [num_tokens, num_heads_to_gather, head_dim] (contiguous)
+    Output layout: HEAD-FIRST, base pointer offset to (layer, kv) position
 
     Grid: (num_heads_to_gather,) - one program per head
     """
@@ -75,37 +75,46 @@ def _gather_kv_kernel(
     # Source head index (absolute in source KV cache)
     src_head = head_start + head_id
 
+    # Cast to int64 to avoid overflow with large buffers
+    src_slot_stride_i64 = src_slot_stride.to(tl.int64)
+    src_head_stride_i64 = src_head_stride.to(tl.int64)
+    out_token_stride_i64 = out_token_stride.to(tl.int64)
+    out_head_stride_i64 = out_head_stride.to(tl.int64)
+    src_head_i64 = src_head.to(tl.int64)
+    head_id_i64 = head_id.to(tl.int64)
+
     # Process tokens in blocks
     for token_block_start in range(0, num_tokens, BLOCK_TOKENS):
         token_offsets = token_block_start + tl.arange(0, BLOCK_TOKENS)
         token_mask = token_offsets < num_tokens
+        token_offsets_i64 = token_offsets.to(tl.int64)
 
         # Load slot indices for these tokens
         slot_ids = tl.load(slot_indices_ptr + token_offsets, mask=token_mask, other=0)
+        slot_ids_i64 = slot_ids.to(tl.int64)
 
         # Process head_dim in blocks
         for dim_start in range(0, head_dim, BLOCK_DIM):
             dim_offsets = dim_start + tl.arange(0, BLOCK_DIM)
             dim_mask = dim_offsets < head_dim
+            dim_offsets_i64 = dim_offsets.to(tl.int64)
 
-            # Compute source addresses in GPU KV cache
-            # src[slot_id, src_head, dim] = base + slot_id * slot_stride + src_head * head_stride + dim
+            # Compute source addresses in GPU KV cache (use int64)
             src_offsets = (
-                slot_ids[:, None] * src_slot_stride
-                + src_head * src_head_stride
-                + dim_offsets[None, :]
+                slot_ids_i64[:, None] * src_slot_stride_i64
+                + src_head_i64 * src_head_stride_i64
+                + dim_offsets_i64[None, :]
             )
 
             # Load from GPU source
             mask = token_mask[:, None] & dim_mask[None, :]
             data = tl.load(src_ptr + src_offsets, mask=mask, other=0.0)
 
-            # Compute output addresses
-            # out[token, head_id, dim] = base + token * token_stride + head_id * head_stride + dim
+            # Compute output addresses (use int64 for large HEAD-FIRST strides)
             out_offsets = (
-                token_offsets[:, None] * out_token_stride
-                + head_id * out_head_stride
-                + dim_offsets[None, :]
+                head_id_i64 * out_head_stride_i64
+                + token_offsets_i64[:, None] * out_token_stride_i64
+                + dim_offsets_i64[None, :]
             )
 
             # Store to output buffer (may be pinned CPU - zero-copy write over PCIe)
@@ -132,8 +141,8 @@ def gather_kv_to_pinned(
         head_start: First head index to gather (for head slicing in mixed-TP)
         num_heads_to_gather: Number of heads to gather starting from head_start
 
-    Output layout in pinned_output: [num_layers, 2, num_tokens, num_heads_to_gather, head_dim]
-    where dimension 1 is K=0, V=1
+    Output layout in pinned_output: [num_heads_to_gather, num_layers, 2, num_tokens, head_dim]
+    This is HEAD-FIRST layout for easy head slicing in mixed-TP transfers.
     """
     assert pinned_output.is_pinned(), "Output buffer must be pinned CPU memory"
     assert slot_indices.is_cuda, "slot_indices must be on GPU"
@@ -157,12 +166,16 @@ def gather_kv_to_pinned(
     BLOCK_TOKENS = 64
     BLOCK_DIM = min(64, triton.next_power_of_2(head_dim))
 
-    # Output strides for [num_tokens, num_heads_to_gather, head_dim] layout
-    out_token_stride = num_heads_to_gather * head_dim
-    out_head_stride = head_dim
-
-    # Size of one K or V buffer in output: num_tokens * num_heads_to_gather * head_dim elements
-    kv_output_size = num_tokens * num_heads_to_gather * head_dim
+    # HEAD-FIRST output layout: [num_heads_to_gather, num_layers, 2, num_tokens, head_dim]
+    # Strides for this layout (in elements):
+    # - head_stride: distance between heads = num_layers * 2 * num_tokens * head_dim
+    # - layer_stride: distance between layers = 2 * num_tokens * head_dim
+    # - kv_stride: distance between K and V = num_tokens * head_dim
+    # - token_stride: distance between tokens = head_dim
+    out_head_stride = num_layers * 2 * num_tokens * head_dim
+    layer_stride = 2 * num_tokens * head_dim
+    kv_stride = num_tokens * head_dim
+    out_token_stride = head_dim  # tokens are contiguous within each head's slice
 
     grid = (num_heads_to_gather,)
 
@@ -171,16 +184,13 @@ def gather_kv_to_pinned(
 
     # Iterate over layers and K/V
     for layer_idx in range(num_layers):
-        # Output offset for this layer
-        # Layout: [num_layers, 2, num_tokens, num_heads_to_gather, head_dim]
-        layer_output_offset = layer_idx * 2 * kv_output_size
-
-        # K buffer for this layer
-        k_output_offset = layer_output_offset
+        # Base offset for this (layer, K) in HEAD-FIRST layout
+        # Each head will add head_id * out_head_stride in the kernel
+        k_base_offset = layer_idx * layer_stride  # + 0 * kv_stride for K
         _gather_kv_kernel[grid](
             k_buffers[layer_idx],
             slot_indices,
-            pinned_output_typed[k_output_offset:],
+            pinned_output_typed[k_base_offset:],
             num_tokens=num_tokens,
             head_dim=head_dim,
             head_start=head_start,
@@ -193,12 +203,12 @@ def gather_kv_to_pinned(
             BLOCK_DIM=BLOCK_DIM,
         )
 
-        # V buffer for this layer
-        v_output_offset = layer_output_offset + kv_output_size
+        # Base offset for this (layer, V) in HEAD-FIRST layout
+        v_base_offset = layer_idx * layer_stride + kv_stride
         _gather_kv_kernel[grid](
             v_buffers[layer_idx],
             slot_indices,
-            pinned_output_typed[v_output_offset:],
+            pinned_output_typed[v_base_offset:],
             num_tokens=num_tokens,
             head_dim=head_dim,
             head_start=head_start,
@@ -232,7 +242,7 @@ def _gather_kv_to_staging_kernel(
     # Source strides (in elements)
     src_slot_stride,
     src_head_stride,
-    # Output strides (in elements) - output is [num_tokens, num_heads_to_gather, head_dim]
+    # Output strides (in elements) - can be large for HEAD-FIRST layout
     out_token_stride,
     out_head_stride,
     # Block sizes
@@ -247,29 +257,40 @@ def _gather_kv_to_staging_kernel(
     head_id = tl.program_id(0)
     src_head = head_start + head_id
 
+    # Cast to int64 to avoid overflow with large buffers
+    src_slot_stride_i64 = src_slot_stride.to(tl.int64)
+    src_head_stride_i64 = src_head_stride.to(tl.int64)
+    out_token_stride_i64 = out_token_stride.to(tl.int64)
+    out_head_stride_i64 = out_head_stride.to(tl.int64)
+    src_head_i64 = src_head.to(tl.int64)
+    head_id_i64 = head_id.to(tl.int64)
+
     for token_block_start in range(0, num_tokens, BLOCK_TOKENS):
         token_offsets = token_block_start + tl.arange(0, BLOCK_TOKENS)
         token_mask = token_offsets < num_tokens
+        token_offsets_i64 = token_offsets.to(tl.int64)
 
         slot_ids = tl.load(slot_indices_ptr + token_offsets, mask=token_mask, other=0)
+        slot_ids_i64 = slot_ids.to(tl.int64)
 
         for dim_start in range(0, head_dim, BLOCK_DIM):
             dim_offsets = dim_start + tl.arange(0, BLOCK_DIM)
             dim_mask = dim_offsets < head_dim
+            dim_offsets_i64 = dim_offsets.to(tl.int64)
 
             src_offsets = (
-                slot_ids[:, None] * src_slot_stride
-                + src_head * src_head_stride
-                + dim_offsets[None, :]
+                slot_ids_i64[:, None] * src_slot_stride_i64
+                + src_head_i64 * src_head_stride_i64
+                + dim_offsets_i64[None, :]
             )
 
             mask = token_mask[:, None] & dim_mask[None, :]
             data = tl.load(src_ptr + src_offsets, mask=mask, other=0.0)
 
             out_offsets = (
-                token_offsets[:, None] * out_token_stride
-                + head_id * out_head_stride
-                + dim_offsets[None, :]
+                head_id_i64 * out_head_stride_i64
+                + token_offsets_i64[:, None] * out_token_stride_i64
+                + dim_offsets_i64[None, :]
             )
 
             # Store to GPU staging buffer (fast coalesced writes)
@@ -300,6 +321,8 @@ def gather_kv_with_staging(
         head_start: First head index to gather
         num_heads_to_gather: Number of heads to gather
         staging_buffer: Optional pre-allocated GPU staging buffer. If None, will allocate.
+
+    Output layout: [num_heads_to_gather, num_layers, 2, num_tokens, head_dim] (HEAD-FIRST)
     """
     assert pinned_output.is_pinned(), "Output buffer must be pinned CPU memory"
     assert slot_indices.is_cuda, "slot_indices must be on GPU"
@@ -327,24 +350,24 @@ def gather_kv_with_staging(
     BLOCK_TOKENS = 64
     BLOCK_DIM = min(64, triton.next_power_of_2(head_dim))
 
-    out_token_stride = num_heads_to_gather * head_dim
-    out_head_stride = head_dim
-    kv_output_size = num_tokens * num_heads_to_gather * head_dim
+    # HEAD-FIRST output layout: [num_heads_to_gather, num_layers, 2, num_tokens, head_dim]
+    out_head_stride = num_layers * 2 * num_tokens * head_dim
+    layer_stride = 2 * num_tokens * head_dim
+    kv_stride = num_tokens * head_dim
+    out_token_stride = head_dim
 
     grid = (num_heads_to_gather,)
 
     staging_typed = staging_buffer.view(dtype)
 
-    # Step 1: Gather into GPU staging buffer (fast)
+    # Step 1: Gather into GPU staging buffer in HEAD-FIRST layout
     for layer_idx in range(num_layers):
-        layer_output_offset = layer_idx * 2 * kv_output_size
-
-        # K buffer
-        k_output_offset = layer_output_offset
+        # K buffer - base offset for (layer, K=0)
+        k_base_offset = layer_idx * layer_stride
         _gather_kv_to_staging_kernel[grid](
             k_buffers[layer_idx],
             slot_indices,
-            staging_typed[k_output_offset:],
+            staging_typed[k_base_offset:],
             num_tokens=num_tokens,
             head_dim=head_dim,
             head_start=head_start,
@@ -357,12 +380,12 @@ def gather_kv_with_staging(
             BLOCK_DIM=BLOCK_DIM,
         )
 
-        # V buffer
-        v_output_offset = layer_output_offset + kv_output_size
+        # V buffer - base offset for (layer, V=1)
+        v_base_offset = layer_idx * layer_stride + kv_stride
         _gather_kv_to_staging_kernel[grid](
             v_buffers[layer_idx],
             slot_indices,
-            staging_typed[v_output_offset:],
+            staging_typed[v_base_offset:],
             num_tokens=num_tokens,
             head_dim=head_dim,
             head_start=head_start,
@@ -398,7 +421,7 @@ def gather_kv_chunked(
     This approach:
     1. Allocates a fixed-size GPU staging buffer (default 256MB)
     2. Processes layers/KV in chunks that fit in the staging buffer
-    3. For each chunk: gather scattered KV into staging, then copy to pinned CPU
+    3. For each chunk: gather scattered KV into staging (in HEAD-FIRST layout), then copy to pinned CPU
     4. Repeat until all data is transferred
 
     This limits GPU memory overhead to staging_buffer_size_mb while potentially
@@ -413,6 +436,9 @@ def gather_kv_chunked(
         num_heads_to_gather: Number of heads to gather
         staging_buffer_size_mb: Size of GPU staging buffer in MB (default 256MB)
         staging_buffer: Optional pre-allocated GPU staging buffer. If None, will allocate.
+
+    Output layout in pinned_output: [num_heads_to_gather, num_layers, 2, num_tokens, head_dim]
+    This HEAD-FIRST layout allows easy slicing by head for mixed-TP transfers.
     """
     assert pinned_output.is_pinned(), "Output buffer must be pinned CPU memory"
     assert slot_indices.is_cuda, "slot_indices must be on GPU"
@@ -428,25 +454,42 @@ def gather_kv_chunked(
 
     bytes_per_element = 2 if dtype in (torch.float16, torch.bfloat16) else 4
 
-    # Size of one K or V buffer: num_tokens * num_heads_to_gather * head_dim elements
-    single_kv_elements = num_tokens * num_heads_to_gather * head_dim
-    single_kv_bytes = single_kv_elements * bytes_per_element
+    # Size of one K or V slice for one head: num_tokens * head_dim elements
+    single_head_kv_elements = num_tokens * head_dim
+
+    # Total elements for full output
+    total_elements = num_heads_to_gather * num_layers * 2 * num_tokens * head_dim
 
     # Calculate staging buffer size in elements
     staging_buffer_bytes = int(staging_buffer_size_mb * 1e6)
     staging_buffer_elements = staging_buffer_bytes // bytes_per_element
 
-    # How many K or V buffers fit in the staging buffer?
-    # We want to gather at least one full K or V buffer at a time for simplicity
-    kvs_per_chunk = max(1, staging_buffer_elements // single_kv_elements)
+    # If staging buffer can hold everything, just use gather_kv_with_staging
+    if staging_buffer_elements >= total_elements:
+        return gather_kv_with_staging(
+            k_buffers=k_buffers,
+            v_buffers=v_buffers,
+            slot_indices=slot_indices,
+            pinned_output=pinned_output,
+            head_start=head_start,
+            num_heads_to_gather=num_heads_to_gather,
+            staging_buffer=staging_buffer,
+        )
 
-    # Allocate staging buffer (sized to hold kvs_per_chunk worth of data)
-    actual_staging_elements = kvs_per_chunk * single_kv_elements
+    # Otherwise, process in chunks. Each chunk processes some (layer, kv) pairs.
+    # Since kernels output in HEAD-FIRST layout directly, we need staging to
+    # match that layout for the subset of (layer, kv) pairs we're processing.
+
+    # We'll process one (layer, kv) at a time for simplicity with chunking
+    # Each (layer, kv) contributes num_heads_to_gather * num_tokens * head_dim elements
+    single_layer_kv_elements = num_heads_to_gather * num_tokens * head_dim
+
+    # Allocate staging for one (layer, kv)
     if staging_buffer is None:
-        staging_buffer = torch.empty(actual_staging_elements, dtype=dtype, device=device)
+        staging_buffer = torch.empty(single_layer_kv_elements, dtype=dtype, device=device)
     else:
         assert staging_buffer.device == device
-        assert staging_buffer.numel() >= actual_staging_elements
+        assert staging_buffer.numel() >= single_layer_kv_elements
 
     src_slot_stride = k_buffers[0].stride(0)
     src_head_stride = k_buffers[0].stride(1)
@@ -454,38 +497,34 @@ def gather_kv_chunked(
     BLOCK_TOKENS = 64
     BLOCK_DIM = min(64, triton.next_power_of_2(head_dim))
 
-    out_token_stride = num_heads_to_gather * head_dim
-    out_head_stride = head_dim
+    # HEAD-FIRST layout strides (in elements)
+    # Full output: [num_heads_to_gather, num_layers, 2, num_tokens, head_dim]
+    out_head_stride_full = num_layers * 2 * num_tokens * head_dim
+    layer_stride = 2 * num_tokens * head_dim
+    kv_stride = num_tokens * head_dim
+    out_token_stride = head_dim
+
+    # For staging buffer (holds one layer_kv): [num_heads_to_gather, 1, 1, num_tokens, head_dim]
+    # which is effectively [num_heads_to_gather, num_tokens, head_dim] flattened
+    # Kernel writes with head_stride = num_tokens * head_dim for staging
+    staging_head_stride = num_tokens * head_dim
 
     grid = (num_heads_to_gather,)
 
     staging_typed = staging_buffer.view(dtype)
     pinned_output_typed = pinned_output.view(dtype)
 
-    # Build list of (layer_idx, is_v, buffer) tuples for all K/V to transfer
-    # is_v: 0 for K, 1 for V
-    kv_list = []
+    # Process each (layer, kv) pair
     for layer_idx in range(num_layers):
-        kv_list.append((layer_idx, 0, k_buffers[layer_idx]))  # K
-        kv_list.append((layer_idx, 1, v_buffers[layer_idx]))  # V
+        for is_v in [0, 1]:  # 0=K, 1=V
+            buffer = k_buffers[layer_idx] if is_v == 0 else v_buffers[layer_idx]
 
-    # Process in chunks
-    total_kvs = len(kv_list)
-    kv_idx = 0
-
-    while kv_idx < total_kvs:
-        # Determine how many KVs to process in this chunk
-        chunk_size = min(kvs_per_chunk, total_kvs - kv_idx)
-
-        # Gather this chunk into staging buffer
-        for i in range(chunk_size):
-            layer_idx, is_v, buffer = kv_list[kv_idx + i]
-            staging_offset = i * single_kv_elements
-
+            # Gather into staging buffer
+            # Staging layout: [num_heads_to_gather, num_tokens, head_dim]
             _gather_kv_to_staging_kernel[grid](
                 buffer,
                 slot_indices,
-                staging_typed[staging_offset:],
+                staging_typed,
                 num_tokens=num_tokens,
                 head_dim=head_dim,
                 head_start=head_start,
@@ -493,29 +532,27 @@ def gather_kv_chunked(
                 src_slot_stride=src_slot_stride,
                 src_head_stride=src_head_stride,
                 out_token_stride=out_token_stride,
-                out_head_stride=out_head_stride,
+                out_head_stride=staging_head_stride,
                 BLOCK_TOKENS=BLOCK_TOKENS,
                 BLOCK_DIM=BLOCK_DIM,
             )
 
-        # Synchronize to ensure gather is complete
-        torch.cuda.synchronize()
+            torch.cuda.synchronize()
 
-        # Copy this chunk from staging to pinned CPU
-        chunk_elements = chunk_size * single_kv_elements
+            # Copy from staging to pinned in HEAD-FIRST layout
+            # Staging: [num_heads_to_gather, num_tokens, head_dim] contiguous
+            # Pinned: [num_heads_to_gather, num_layers, 2, num_tokens, head_dim]
+            # For this (layer, kv), copy each head's data to correct position
+            for h in range(num_heads_to_gather):
+                # Source in staging: h * staging_head_stride
+                staging_offset = h * staging_head_stride
+                # Dest in pinned: h * out_head_stride_full + layer_idx * layer_stride + is_v * kv_stride
+                pinned_offset = h * out_head_stride_full + layer_idx * layer_stride + is_v * kv_stride
 
-        # Calculate output offset: each KV is at (layer_idx * 2 + is_v) * single_kv_elements
-        for i in range(chunk_size):
-            layer_idx, is_v, _ = kv_list[kv_idx + i]
-            output_offset = (layer_idx * 2 + is_v) * single_kv_elements
-            staging_offset = i * single_kv_elements
-
-            pinned_output_typed[output_offset:output_offset + single_kv_elements].copy_(
-                staging_typed[staging_offset:staging_offset + single_kv_elements],
-                non_blocking=False
-            )
-
-        kv_idx += chunk_size
+                pinned_output_typed[pinned_offset:pinned_offset + single_head_kv_elements].copy_(
+                    staging_typed[staging_offset:staging_offset + single_head_kv_elements],
+                    non_blocking=False
+                )
 
     torch.cuda.synchronize()
 
@@ -551,8 +588,10 @@ def gather_kv(
         staging_buffer: Optional pre-allocated GPU staging buffer for reuse across calls.
         staging_buffer_size_mb: Size of staging buffer in MB if not provided. Default 256MB.
 
-    Output layout in pinned_output: [num_layers, 2, num_tokens, num_heads_to_gather, head_dim]
-    where dimension 1 is K=0, V=1
+    Output layout in pinned_output: [num_heads_to_gather, num_layers, 2, num_tokens, head_dim]
+    This HEAD-FIRST layout allows easy slicing by head for mixed-TP transfers:
+    - To send heads [a:b], slice pinned_output[a*head_stride : b*head_stride]
+    - head_stride = num_layers * 2 * num_tokens * head_dim * bytes_per_element
     """
     if num_heads_to_gather is None:
         num_heads_to_gather = k_buffers[0].shape[1] - head_start
@@ -590,8 +629,8 @@ def gather_kv(
 
 
 @triton.jit
-def _scatter_kv_kernel(
-    # Source pinned CPU buffer - GPU-accessible via zero-copy
+def _scatter_kv_kernel_head_first(
+    # Source pinned CPU buffer in HEAD-FIRST layout - GPU-accessible via zero-copy
     src_ptr,
     # Slot indices to scatter to
     slot_indices_ptr,
@@ -603,9 +642,10 @@ def _scatter_kv_kernel(
     # Head slicing params
     head_start: tl.constexpr,
     num_heads_to_scatter: tl.constexpr,
-    # Source strides (in elements) - input is [num_tokens, num_heads_to_scatter, head_dim]
-    in_token_stride,
-    in_head_stride,
+    # Source strides for HEAD-FIRST layout [head, layer, kv, token, head_dim]
+    # Base pointer is already offset to correct (layer, kv) position
+    in_head_stride,  # distance between heads in source (can be very large, use int64)
+    in_token_stride,  # = head_dim (tokens contiguous within head slice)
     # Destination strides (in elements)
     dst_slot_stride,
     dst_head_stride,
@@ -614,57 +654,66 @@ def _scatter_kv_kernel(
     BLOCK_DIM: tl.constexpr,
 ):
     """
-    Scatter KV data from contiguous pinned CPU buffer to scattered GPU slots.
+    Scatter KV data from HEAD-FIRST pinned CPU buffer to scattered GPU slots.
 
     This kernel handles a single layer's K or V buffer.
 
-    Input layout: [num_tokens, num_heads_to_scatter, head_dim] (contiguous, pinned CPU)
+    Input layout: HEAD-FIRST [num_heads, num_layers, 2, num_tokens, head_dim]
+                  Base pointer is offset to (layer, kv), so effective input is
+                  [num_heads, num_tokens, head_dim] with head_stride spacing.
     Output layout: [total_slots, num_heads, head_dim] on GPU
 
     Grid: (num_heads_to_scatter,) - one program per head
-
-    Note: Reads from pinned CPU are naturally coalesced by the GPU memory controller,
-    so no staging buffer is needed (unlike the gather direction).
     """
     head_id = tl.program_id(0)  # relative head (0 to num_heads_to_scatter-1)
 
     # Destination head index (absolute in destination KV cache)
     dst_head = head_start + head_id
 
+    # Cast strides to int64 to avoid overflow with large buffers
+    in_head_stride_i64 = in_head_stride.to(tl.int64)
+    in_token_stride_i64 = in_token_stride.to(tl.int64)
+    dst_slot_stride_i64 = dst_slot_stride.to(tl.int64)
+    dst_head_stride_i64 = dst_head_stride.to(tl.int64)
+    head_id_i64 = head_id.to(tl.int64)
+    dst_head_i64 = dst_head.to(tl.int64)
+
     # Process tokens in blocks
     for token_block_start in range(0, num_tokens, BLOCK_TOKENS):
         token_offsets = token_block_start + tl.arange(0, BLOCK_TOKENS)
         token_mask = token_offsets < num_tokens
+        token_offsets_i64 = token_offsets.to(tl.int64)
 
         # Load slot indices for these tokens
         slot_ids = tl.load(slot_indices_ptr + token_offsets, mask=token_mask, other=0)
+        slot_ids_i64 = slot_ids.to(tl.int64)
 
         # Process head_dim in blocks
         for dim_start in range(0, head_dim, BLOCK_DIM):
             dim_offsets = dim_start + tl.arange(0, BLOCK_DIM)
             dim_mask = dim_offsets < head_dim
+            dim_offsets_i64 = dim_offsets.to(tl.int64)
 
-            # Compute source addresses in pinned CPU buffer (contiguous)
-            # src[token, head_id, dim] = base + token * token_stride + head_id * head_stride + dim
+            # Compute source addresses in HEAD-FIRST pinned buffer (use int64)
+            # src[head_id, token, dim] = base + head_id * head_stride + token * token_stride + dim
             src_offsets = (
-                token_offsets[:, None] * in_token_stride
-                + head_id * in_head_stride
-                + dim_offsets[None, :]
+                head_id_i64 * in_head_stride_i64
+                + token_offsets_i64[:, None] * in_token_stride_i64
+                + dim_offsets_i64[None, :]
             )
 
-            # Load from pinned CPU buffer (zero-copy read over PCIe, coalesced)
+            # Load from pinned CPU buffer (zero-copy read over PCIe)
             mask = token_mask[:, None] & dim_mask[None, :]
             data = tl.load(src_ptr + src_offsets, mask=mask, other=0.0)
 
-            # Compute destination addresses in GPU KV cache (scattered)
-            # dst[slot_id, dst_head, dim] = base + slot_id * slot_stride + dst_head * head_stride + dim
+            # Compute destination addresses in GPU KV cache (use int64)
             dst_offsets = (
-                slot_ids[:, None] * dst_slot_stride
-                + dst_head * dst_head_stride
-                + dim_offsets[None, :]
+                slot_ids_i64[:, None] * dst_slot_stride_i64
+                + dst_head_i64 * dst_head_stride_i64
+                + dim_offsets_i64[None, :]
             )
 
-            # Store to GPU KV cache (scattered writes, but to fast GPU memory)
+            # Store to GPU KV cache
             tl.store(dst_ptr + dst_offsets, data, mask=mask)
 
 
@@ -681,15 +730,16 @@ def scatter_kv_to_gpu(
 
     Args:
         pinned_input: Pinned CPU buffer to read from. Must be created with pin_memory=True.
-                      Should contain data in layout [num_layers, 2, num_tokens, num_heads_to_scatter, head_dim]
+                      Should contain data in HEAD-FIRST layout:
+                      [num_heads_to_scatter, num_layers, 2, num_tokens, head_dim]
         k_buffers: List of K cache tensors per layer, each [total_slots, num_heads, head_dim]
         v_buffers: List of V cache tensors per layer, each [total_slots, num_heads, head_dim]
         slot_indices: Tensor of slot indices to scatter to, shape [num_tokens], on GPU
         head_start: First head index to scatter to (for head slicing in mixed-TP)
         num_heads_to_scatter: Number of heads to scatter starting from head_start
 
-    Input layout in pinned_input: [num_layers, 2, num_tokens, num_heads_to_scatter, head_dim]
-    where dimension 1 is K=0, V=1
+    Input layout in pinned_input: [num_heads_to_scatter, num_layers, 2, num_tokens, head_dim]
+    This HEAD-FIRST layout allows easy slicing by head for mixed-TP transfers.
     """
     assert pinned_input.is_pinned(), "Input buffer must be pinned CPU memory"
     assert slot_indices.is_cuda, "slot_indices must be on GPU"
@@ -713,54 +763,54 @@ def scatter_kv_to_gpu(
     BLOCK_TOKENS = 64
     BLOCK_DIM = min(64, triton.next_power_of_2(head_dim))
 
-    # Input strides for [num_tokens, num_heads_to_scatter, head_dim] layout
-    in_token_stride = num_heads_to_scatter * head_dim
-    in_head_stride = head_dim
-
-    # Size of one K or V buffer in input: num_tokens * num_heads_to_scatter * head_dim elements
-    kv_input_size = num_tokens * num_heads_to_scatter * head_dim
-
-    grid = (num_heads_to_scatter,)
+    # HEAD-FIRST input layout: [head, layer, kv, token, head_dim]
+    # Strides for input layout (in elements):
+    # - head_stride: distance between heads = num_layers * 2 * num_tokens * head_dim
+    # - layer_stride: distance between layers = 2 * num_tokens * head_dim
+    # - kv_stride: distance between K and V = num_tokens * head_dim
+    # - token_stride: distance between tokens = head_dim (contiguous within head slice)
+    in_head_stride = num_layers * 2 * num_tokens * head_dim
+    layer_stride = 2 * num_tokens * head_dim
+    kv_stride = num_tokens * head_dim
+    in_token_stride = head_dim  # tokens are contiguous within each head's slice
 
     # View pinned input as the right dtype
     pinned_input_typed = pinned_input.view(dtype)
 
-    # Iterate over layers and K/V
-    for layer_idx in range(num_layers):
-        # Input offset for this layer
-        # Layout: [num_layers, 2, num_tokens, num_heads_to_scatter, head_dim]
-        layer_input_offset = layer_idx * 2 * kv_input_size
+    grid = (num_heads_to_scatter,)
 
-        # K buffer for this layer
-        k_input_offset = layer_input_offset
-        _scatter_kv_kernel[grid](
-            pinned_input_typed[k_input_offset:],
+    # Iterate over layers and K/V - kernel reads directly from HEAD-FIRST layout
+    for layer_idx in range(num_layers):
+        # K buffer - base offset for (layer, K=0)
+        k_base_offset = layer_idx * layer_stride  # + 0 * kv_stride for K
+        _scatter_kv_kernel_head_first[grid](
+            pinned_input_typed[k_base_offset:],
             slot_indices,
             k_buffers[layer_idx],
             num_tokens=num_tokens,
             head_dim=head_dim,
             head_start=head_start,
             num_heads_to_scatter=num_heads_to_scatter,
-            in_token_stride=in_token_stride,
             in_head_stride=in_head_stride,
+            in_token_stride=in_token_stride,
             dst_slot_stride=dst_slot_stride,
             dst_head_stride=dst_head_stride,
             BLOCK_TOKENS=BLOCK_TOKENS,
             BLOCK_DIM=BLOCK_DIM,
         )
 
-        # V buffer for this layer
-        v_input_offset = layer_input_offset + kv_input_size
-        _scatter_kv_kernel[grid](
-            pinned_input_typed[v_input_offset:],
+        # V buffer - base offset for (layer, V=1)
+        v_base_offset = layer_idx * layer_stride + kv_stride
+        _scatter_kv_kernel_head_first[grid](
+            pinned_input_typed[v_base_offset:],
             slot_indices,
             v_buffers[layer_idx],
             num_tokens=num_tokens,
             head_dim=head_dim,
             head_start=head_start,
             num_heads_to_scatter=num_heads_to_scatter,
-            in_token_stride=in_token_stride,
             in_head_stride=in_head_stride,
+            in_token_stride=in_token_stride,
             dst_slot_stride=dst_slot_stride,
             dst_head_stride=dst_head_stride,
             BLOCK_TOKENS=BLOCK_TOKENS,
@@ -782,9 +832,7 @@ def scatter_kv(
     """
     Scatter KV cache data from pinned CPU memory to GPU.
 
-    This is the primary API for host-to-device KV transfers. Unlike the gather
-    direction, no staging buffer is needed because reads from pinned CPU memory
-    are naturally coalesced by the GPU memory controller.
+    This is the primary API for host-to-device KV transfers.
 
     Args:
         pinned_input: Pinned CPU buffer to read from. Must be created with pin_memory=True.
@@ -794,8 +842,8 @@ def scatter_kv(
         head_start: First head index to scatter to (for head slicing in mixed-TP). Default 0.
         num_heads_to_scatter: Number of heads to scatter. Default None means all heads.
 
-    Input layout in pinned_input: [num_layers, 2, num_tokens, num_heads_to_scatter, head_dim]
-    where dimension 1 is K=0, V=1
+    Input layout in pinned_input: [num_heads_to_scatter, num_layers, 2, num_tokens, head_dim]
+    This HEAD-FIRST layout allows easy slicing by head for mixed-TP transfers.
     """
     if num_heads_to_scatter is None:
         num_heads_to_scatter = k_buffers[0].shape[1] - head_start

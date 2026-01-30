@@ -458,7 +458,11 @@ def benchmark_cuda_memcpy(
     rep: int = 100,
 ) -> dict:
     """
-    Benchmark raw CUDA memcpy from GPU to pinned CPU.
+    Benchmark raw CUDA memcpy in both directions.
+
+    Returns bandwidth for:
+    - D2H (Device to Host): GPU -> pinned CPU
+    - H2D (Host to Device): pinned CPU -> GPU
 
     This represents the theoretical maximum PCIe bandwidth achievable.
     """
@@ -472,12 +476,12 @@ def benchmark_cuda_memcpy(
     # Pinned CPU tensor
     cpu_tensor = torch.empty(num_elements, dtype=dtype, device="cpu", pin_memory=True)
 
-    # Warmup
+    # Warmup D2H
     for _ in range(warmup):
         cpu_tensor.copy_(gpu_tensor, non_blocking=False)
         torch.cuda.synchronize()
 
-    # Benchmark
+    # Benchmark D2H (GPU -> CPU)
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
 
@@ -488,22 +492,44 @@ def benchmark_cuda_memcpy(
 
     torch.cuda.synchronize()
 
-    times_ms = [start_events[i].elapsed_time(end_events[i]) for i in range(rep)]
-    avg_time_ms = sum(times_ms) / len(times_ms)
-    min_time_ms = min(times_ms)
+    d2h_times_ms = [start_events[i].elapsed_time(end_events[i]) for i in range(rep)]
+    d2h_avg_time_ms = sum(d2h_times_ms) / len(d2h_times_ms)
+    d2h_min_time_ms = min(d2h_times_ms)
+    d2h_avg_bw = (total_bytes / 1e9) / (d2h_avg_time_ms / 1000)
+    d2h_peak_bw = (total_bytes / 1e9) / (d2h_min_time_ms / 1000)
 
-    avg_bandwidth_gbs = (total_bytes / 1e9) / (avg_time_ms / 1000)
-    peak_bandwidth_gbs = (total_bytes / 1e9) / (min_time_ms / 1000)
+    # Warmup H2D
+    for _ in range(warmup):
+        gpu_tensor.copy_(cpu_tensor, non_blocking=False)
+        torch.cuda.synchronize()
+
+    # Benchmark H2D (CPU -> GPU)
+    for i in range(rep):
+        start_events[i].record()
+        gpu_tensor.copy_(cpu_tensor, non_blocking=False)
+        end_events[i].record()
+
+    torch.cuda.synchronize()
+
+    h2d_times_ms = [start_events[i].elapsed_time(end_events[i]) for i in range(rep)]
+    h2d_avg_time_ms = sum(h2d_times_ms) / len(h2d_times_ms)
+    h2d_min_time_ms = min(h2d_times_ms)
+    h2d_avg_bw = (total_bytes / 1e9) / (h2d_avg_time_ms / 1000)
+    h2d_peak_bw = (total_bytes / 1e9) / (h2d_min_time_ms / 1000)
 
     del gpu_tensor, cpu_tensor
     torch.cuda.empty_cache()
 
     return {
         "size_mb": size_mb,
-        "avg_time_ms": avg_time_ms,
-        "min_time_ms": min_time_ms,
-        "avg_bandwidth_gbs": avg_bandwidth_gbs,
-        "peak_bandwidth_gbs": peak_bandwidth_gbs,
+        "d2h_avg_time_ms": d2h_avg_time_ms,
+        "d2h_min_time_ms": d2h_min_time_ms,
+        "d2h_avg_bandwidth_gbs": d2h_avg_bw,
+        "d2h_peak_bandwidth_gbs": d2h_peak_bw,
+        "h2d_avg_time_ms": h2d_avg_time_ms,
+        "h2d_min_time_ms": h2d_min_time_ms,
+        "h2d_avg_bandwidth_gbs": h2d_avg_bw,
+        "h2d_peak_bandwidth_gbs": h2d_peak_bw,
     }
 
 
@@ -670,30 +696,8 @@ def benchmark_large_pool_fragmented(
     num_tokens = 32768  # 32K
 
     # 40GB pool size - calculate how many slots we can fit
-    # Each slot has K + V = 2 * num_heads * head_dim = 1024 elements = 2048 bytes per layer
-    # But we have multiple layers, so per-slot is num_heads * head_dim elements
     pool_size_gb = 40
     pool_size_bytes = int(pool_size_gb * 1e9)
-
-    # Each slot in the KV cache is [num_heads, head_dim] = 512 elements = 1024 bytes (fp16)
-    bytes_per_slot_per_layer = num_heads * head_dim * bytes_per_element  # 1024 bytes
-    # Total bytes per slot across all layers (for K only, or V only)
-    # But our buffers are per-layer, each sized [total_slots, num_heads, head_dim]
-    # So total_slots determines how big each layer's buffer is
-
-    # To get 40GB total: num_layers * 2 (K+V) * total_slots * num_heads * head_dim * 2 bytes = 40GB
-    # 92 * 2 * total_slots * 8 * 64 * 2 = 40e9
-    # total_slots = 40e9 / (92 * 2 * 8 * 64 * 2) = 40e9 / 188416 = ~212,314 slots
-    # But this doesn't give us fragmentation - we want MORE slots than we're using
-
-    # Let's calculate differently: we want the pool to be 40GB
-    # and we want to use only 32K slots from that pool (our sequence length)
-    # So: total_slots = pool_size / (num_layers * 2 * bytes_per_slot)
-    # Actually, we store K and V separately per layer, so:
-    # Memory for one layer = total_slots * num_heads * head_dim * bytes_per_element
-    # Memory for K = num_layers * total_slots * num_heads * head_dim * bytes_per_element
-    # Memory for V = same
-    # Total = 2 * num_layers * total_slots * num_heads * head_dim * bytes_per_element
 
     # total_slots = pool_size_bytes / (2 * num_layers * num_heads * head_dim * bytes_per_element)
     total_slots = pool_size_bytes // (2 * num_layers * num_heads * head_dim * bytes_per_element)
@@ -703,7 +707,6 @@ def benchmark_large_pool_fragmented(
     print(f"    fragmentation ratio = {total_slots / num_tokens:.1f}x")
 
     # Calculate transfer size
-    # Transfer = num_layers * 2 * num_tokens * num_heads * head_dim * bytes_per_element
     transfer_bytes = num_layers * 2 * num_tokens * num_heads * head_dim * bytes_per_element
     print(f"    transfer size = {transfer_bytes / 1e9:.2f} GB ({transfer_bytes / 1e6:.1f} MB)")
 
@@ -722,42 +725,69 @@ def benchmark_large_pool_fragmented(
     # Create slot indices - random access pattern for maximum fragmentation
     slot_indices = torch.randperm(total_slots, device="cuda")[:num_tokens].to(torch.int32)
 
-    # Allocate pinned output
+    # Allocate pinned buffer
     output_size = num_layers * 2 * num_tokens * num_heads * head_dim
-    pinned_output = torch.empty(output_size, dtype=dtype, device="cpu", pin_memory=True)
+    pinned_buffer = torch.empty(output_size, dtype=dtype, device="cpu", pin_memory=True)
+
+    # Contiguous GPU buffer for baselines
+    contiguous_gpu = torch.randn(output_size, dtype=dtype, device="cuda")
 
     results = {}
 
-    # Benchmark raw memcpy baseline
-    print("\n  Benchmarking raw memcpy (contiguous baseline)...")
-    contiguous_gpu = torch.randn(output_size, dtype=dtype, device="cuda")
+    # =========================================================================
+    # Benchmark D2H memcpy baseline (GPU -> pinned CPU)
+    # =========================================================================
+    print("\n  Benchmarking D2H memcpy (GPU -> pinned CPU)...")
     for _ in range(warmup):
-        pinned_output.copy_(contiguous_gpu, non_blocking=False)
+        pinned_buffer.copy_(contiguous_gpu, non_blocking=False)
         torch.cuda.synchronize()
 
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
     for i in range(rep):
         start_events[i].record()
-        pinned_output.copy_(contiguous_gpu, non_blocking=False)
+        pinned_buffer.copy_(contiguous_gpu, non_blocking=False)
         end_events[i].record()
     torch.cuda.synchronize()
 
     times_ms = [start_events[i].elapsed_time(end_events[i]) for i in range(rep)]
-    memcpy_time_ms = sum(times_ms) / len(times_ms)
-    memcpy_bw = (transfer_bytes / 1e9) / (memcpy_time_ms / 1000)
-    results["memcpy"] = {"time_ms": memcpy_time_ms, "bandwidth_gbs": memcpy_bw}
-    print(f"    Raw memcpy: {memcpy_time_ms:.1f} ms, {memcpy_bw:.2f} GB/s")
+    d2h_time_ms = sum(times_ms) / len(times_ms)
+    d2h_bw = (transfer_bytes / 1e9) / (d2h_time_ms / 1000)
+    results["d2h_memcpy"] = {"time_ms": d2h_time_ms, "bandwidth_gbs": d2h_bw}
+    print(f"    D2H memcpy: {d2h_time_ms:.1f} ms, {d2h_bw:.2f} GB/s")
+
+    # =========================================================================
+    # Benchmark H2D memcpy baseline (pinned CPU -> GPU)
+    # =========================================================================
+    print("\n  Benchmarking H2D memcpy (pinned CPU -> GPU)...")
+    for _ in range(warmup):
+        contiguous_gpu.copy_(pinned_buffer, non_blocking=False)
+        torch.cuda.synchronize()
+
+    for i in range(rep):
+        start_events[i].record()
+        contiguous_gpu.copy_(pinned_buffer, non_blocking=False)
+        end_events[i].record()
+    torch.cuda.synchronize()
+
+    times_ms = [start_events[i].elapsed_time(end_events[i]) for i in range(rep)]
+    h2d_time_ms = sum(times_ms) / len(times_ms)
+    h2d_bw = (transfer_bytes / 1e9) / (h2d_time_ms / 1000)
+    results["h2d_memcpy"] = {"time_ms": h2d_time_ms, "bandwidth_gbs": h2d_bw}
+    print(f"    H2D memcpy: {h2d_time_ms:.1f} ms, {h2d_bw:.2f} GB/s")
+
     del contiguous_gpu
 
-    # Benchmark zero-copy (direct to pinned)
-    print("\n  Benchmarking zero-copy (direct to pinned)...")
+    # =========================================================================
+    # Benchmark gather (scattered GPU -> pinned CPU) - compare to D2H
+    # =========================================================================
+    print("\n  Benchmarking gather (scattered GPU -> pinned CPU)...")
     for _ in range(warmup):
         gather_kv_to_pinned(
             k_buffers=k_buffers,
             v_buffers=v_buffers,
             slot_indices=slot_indices,
-            pinned_output=pinned_output,
+            pinned_output=pinned_buffer,
             head_start=0,
             num_heads_to_gather=num_heads,
         )
@@ -770,7 +800,7 @@ def benchmark_large_pool_fragmented(
             k_buffers=k_buffers,
             v_buffers=v_buffers,
             slot_indices=slot_indices,
-            pinned_output=pinned_output,
+            pinned_output=pinned_buffer,
             head_start=0,
             num_heads_to_gather=num_heads,
         )
@@ -778,14 +808,16 @@ def benchmark_large_pool_fragmented(
     torch.cuda.synchronize()
 
     times_ms = [start_events[i].elapsed_time(end_events[i]) for i in range(rep)]
-    zerocopy_time_ms = sum(times_ms) / len(times_ms)
-    zerocopy_bw = (transfer_bytes / 1e9) / (zerocopy_time_ms / 1000)
-    results["zero_copy"] = {"time_ms": zerocopy_time_ms, "bandwidth_gbs": zerocopy_bw}
-    print(f"    Zero-copy: {zerocopy_time_ms:.1f} ms, {zerocopy_bw:.2f} GB/s ({zerocopy_bw/memcpy_bw*100:.0f}% of memcpy)")
+    gather_time_ms = sum(times_ms) / len(times_ms)
+    gather_bw = (transfer_bytes / 1e9) / (gather_time_ms / 1000)
+    results["gather"] = {"time_ms": gather_time_ms, "bandwidth_gbs": gather_bw}
+    print(f"    Gather: {gather_time_ms:.1f} ms, {gather_bw:.2f} GB/s ({gather_bw/d2h_bw*100:.0f}% of D2H)")
 
-    # Benchmark chunked approach with different staging buffer sizes
+    # =========================================================================
+    # Benchmark chunked gather with different staging buffer sizes
+    # =========================================================================
     for staging_mb in [64, 128, 256, 512]:
-        print(f"\n  Benchmarking chunked (staging={staging_mb}MB)...")
+        print(f"\n  Benchmarking chunked gather (staging={staging_mb}MB)...")
 
         # Pre-allocate staging buffer
         single_kv_elements = num_tokens * num_heads * head_dim
@@ -803,7 +835,7 @@ def benchmark_large_pool_fragmented(
                 k_buffers=k_buffers,
                 v_buffers=v_buffers,
                 slot_indices=slot_indices,
-                pinned_output=pinned_output,
+                pinned_output=pinned_buffer,
                 head_start=0,
                 num_heads_to_gather=num_heads,
                 staging_buffer_size_mb=staging_mb,
@@ -818,7 +850,7 @@ def benchmark_large_pool_fragmented(
                 k_buffers=k_buffers,
                 v_buffers=v_buffers,
                 slot_indices=slot_indices,
-                pinned_output=pinned_output,
+                pinned_output=pinned_buffer,
                 head_start=0,
                 num_heads_to_gather=num_heads,
                 staging_buffer_size_mb=staging_mb,
@@ -836,12 +868,14 @@ def benchmark_large_pool_fragmented(
             "staging_mb": actual_staging_mb,
             "kvs_per_chunk": kvs_per_chunk,
         }
-        print(f"    Chunked ({staging_mb}MB): {chunked_time_ms:.1f} ms, {chunked_bw:.2f} GB/s ({chunked_bw/memcpy_bw*100:.0f}% of memcpy)")
+        print(f"    Chunked ({staging_mb}MB): {chunked_time_ms:.1f} ms, {chunked_bw:.2f} GB/s ({chunked_bw/d2h_bw*100:.0f}% of D2H)")
 
         del staging_buffer
 
-    # Benchmark scatter (host -> device)
-    print("\n  Benchmarking scatter (pinned CPU -> GPU)...")
+    # =========================================================================
+    # Benchmark scatter (pinned CPU -> scattered GPU) - compare to H2D
+    # =========================================================================
+    print("\n  Benchmarking scatter (pinned CPU -> scattered GPU)...")
 
     # Fill pinned buffer with data to scatter
     pinned_input = torch.randn(output_size, dtype=dtype, device="cpu", pin_memory=True)
@@ -885,12 +919,12 @@ def benchmark_large_pool_fragmented(
     scatter_time_ms = sum(times_ms) / len(times_ms)
     scatter_bw = (transfer_bytes / 1e9) / (scatter_time_ms / 1000)
     results["scatter"] = {"time_ms": scatter_time_ms, "bandwidth_gbs": scatter_bw}
-    print(f"    Scatter: {scatter_time_ms:.1f} ms, {scatter_bw:.2f} GB/s ({scatter_bw/memcpy_bw*100:.0f}% of memcpy)")
+    print(f"    Scatter: {scatter_time_ms:.1f} ms, {scatter_bw:.2f} GB/s ({scatter_bw/h2d_bw*100:.0f}% of H2D)")
 
     del k_buffers_dst, v_buffers_dst, pinned_input
 
     # Clean up
-    del k_buffers, v_buffers, pinned_output, slot_indices
+    del k_buffers, v_buffers, pinned_buffer, slot_indices
     torch.cuda.empty_cache()
 
     return results
@@ -927,20 +961,30 @@ def main():
         print("\n" + "=" * 80)
         print(" Summary: 40GB Pool Fragmentation Test")
         print("=" * 80)
-        memcpy_bw = results["memcpy"]["bandwidth_gbs"]
-        print(f"\n {'Method':<25} {'Time (ms)':<12} {'BW (GB/s)':<12} {'% of memcpy':<12}")
+        d2h_bw = results["d2h_memcpy"]["bandwidth_gbs"]
+        h2d_bw = results["h2d_memcpy"]["bandwidth_gbs"]
+
+        print(f"\n PCIe Baselines (contiguous transfers):")
+        print(f" {'Method':<25} {'Time (ms)':<12} {'BW (GB/s)':<12}")
+        print("-" * 50)
+        print(f" {'D2H memcpy (GPU->CPU)':<25} {results['d2h_memcpy']['time_ms']:<12.1f} {results['d2h_memcpy']['bandwidth_gbs']:<12.2f}")
+        print(f" {'H2D memcpy (CPU->GPU)':<25} {results['h2d_memcpy']['time_ms']:<12.1f} {results['h2d_memcpy']['bandwidth_gbs']:<12.2f}")
+
+        print(f"\n Device -> Host (Gather) - compared to D2H baseline:")
+        print(f" {'Method':<25} {'Time (ms)':<12} {'BW (GB/s)':<12} {'% of D2H':<12}")
         print("-" * 60)
-        print(f" {'Raw memcpy':<25} {results['memcpy']['time_ms']:<12.1f} {results['memcpy']['bandwidth_gbs']:<12.2f} {'100%':<12}")
-        print(f"\n Device -> Host (Gather):")
-        print(f" {'Zero-copy':<25} {results['zero_copy']['time_ms']:<12.1f} {results['zero_copy']['bandwidth_gbs']:<12.2f} {results['zero_copy']['bandwidth_gbs']/memcpy_bw*100:.0f}%")
-        for key in results:
+        print(f" {'Gather (zero-copy)':<25} {results['gather']['time_ms']:<12.1f} {results['gather']['bandwidth_gbs']:<12.2f} {results['gather']['bandwidth_gbs']/d2h_bw*100:.0f}%")
+        for key in sorted(results.keys()):
             if key.startswith("chunked_"):
                 r = results[key]
                 name = f"Chunked ({r['staging_mb']:.0f}MB staging)"
-                print(f" {name:<25} {r['time_ms']:<12.1f} {r['bandwidth_gbs']:<12.2f} {r['bandwidth_gbs']/memcpy_bw*100:.0f}%")
+                print(f" {name:<25} {r['time_ms']:<12.1f} {r['bandwidth_gbs']:<12.2f} {r['bandwidth_gbs']/d2h_bw*100:.0f}%")
+
         if "scatter" in results:
-            print(f"\n Host -> Device (Scatter):")
-            print(f" {'Scatter (direct)':<25} {results['scatter']['time_ms']:<12.1f} {results['scatter']['bandwidth_gbs']:<12.2f} {results['scatter']['bandwidth_gbs']/memcpy_bw*100:.0f}%")
+            print(f"\n Host -> Device (Scatter) - compared to H2D baseline:")
+            print(f" {'Method':<25} {'Time (ms)':<12} {'BW (GB/s)':<12} {'% of H2D':<12}")
+            print("-" * 60)
+            print(f" {'Scatter (zero-copy)':<25} {results['scatter']['time_ms']:<12.1f} {results['scatter']['bandwidth_gbs']:<12.2f} {results['scatter']['bandwidth_gbs']/h2d_bw*100:.0f}%")
 
         if args.large_pool_only:
             return
@@ -1075,10 +1119,10 @@ def main():
 
     print_results_table(baseline_results, "PyTorch Baseline Results")
 
-    # Benchmark raw CUDA memcpy
+    # Benchmark raw CUDA memcpy (both directions)
     print("\n" + "-" * 80)
-    print(" Benchmarking raw CUDA memcpy (GPU -> Pinned CPU)...")
-    print(" This shows the theoretical PCIe bandwidth ceiling.")
+    print(" Benchmarking raw CUDA memcpy (PCIe bandwidth ceiling)...")
+    print(" D2H = Device to Host (GPU -> CPU), H2D = Host to Device (CPU -> GPU)")
     print("-" * 80)
 
     memcpy_sizes = [16.8, 67.1, 268.4, 536.9, 1073.7]  # Match transfer sizes from above
@@ -1092,28 +1136,32 @@ def main():
             rep=args.rep,
         )
         memcpy_results.append(result)
-        print(f"  {size_mb:.1f} MB -> {result['avg_bandwidth_gbs']:.2f} GB/s (peak: {result['peak_bandwidth_gbs']:.2f})")
+        print(f"  {size_mb:.1f} MB -> D2H: {result['d2h_avg_bandwidth_gbs']:.2f} GB/s, H2D: {result['h2d_avg_bandwidth_gbs']:.2f} GB/s")
 
     print("\n" + "=" * 80)
     print(" Raw CUDA Memcpy Results (PCIe Bandwidth Ceiling)")
     print("=" * 80)
-    print(f"{'Size (MB)':<12} {'Time (ms)':<12} {'BW (GB/s)':<12} {'Peak BW':<12}")
-    print("-" * 48)
+    print(f"{'Size (MB)':<12} {'D2H Time':<12} {'D2H BW':<12} {'H2D Time':<12} {'H2D BW':<12}")
+    print("-" * 60)
     for r in memcpy_results:
-        print(f"{r['size_mb']:<12.1f} {r['avg_time_ms']:<12.3f} {r['avg_bandwidth_gbs']:<12.2f} {r['peak_bandwidth_gbs']:<12.2f}")
+        print(f"{r['size_mb']:<12.1f} {r['d2h_avg_time_ms']:<12.3f} {r['d2h_avg_bandwidth_gbs']:<12.2f} {r['h2d_avg_time_ms']:<12.3f} {r['h2d_avg_bandwidth_gbs']:<12.2f}")
 
     # Summary comparison
     print("\n" + "=" * 80)
     print(" Summary: Triton vs PyTorch vs Raw Memcpy")
     print("=" * 80)
 
-    # Get memcpy bandwidth for reference
-    memcpy_bw = memcpy_results[-1]["avg_bandwidth_gbs"] if memcpy_results else 0
+    # Get memcpy bandwidth for reference (use largest transfer size)
+    d2h_bw = memcpy_results[-1]["d2h_avg_bandwidth_gbs"] if memcpy_results else 0
+    h2d_bw = memcpy_results[-1]["h2d_avg_bandwidth_gbs"] if memcpy_results else 0
 
-    print(f"\n Raw CUDA memcpy bandwidth: ~{memcpy_bw:.1f} GB/s (PCIe ceiling)")
-    print("\n Bandwidth Comparison (random access pattern):")
+    print(f"\n PCIe bandwidth ceiling (contiguous memcpy):")
+    print(f"   D2H (GPU -> CPU): ~{d2h_bw:.1f} GB/s")
+    print(f"   H2D (CPU -> GPU): ~{h2d_bw:.1f} GB/s")
+
+    print("\n Gather Bandwidth Comparison (random access, GPU -> CPU):")
     print(f" {'Config':<25} {'Zero-Copy':<18} {'With Staging':<18} {'PyTorch':<18}")
-    print(f" {'(layers, tokens)':<25} {'GB/s (%memcpy)':<18} {'GB/s (%memcpy)':<18} {'GB/s (%memcpy)':<18}")
+    print(f" {'(layers, tokens)':<25} {'GB/s (% D2H)':<18} {'GB/s (% D2H)':<18} {'GB/s (% D2H)':<18}")
     print(" " + "-" * 75)
 
     for num_layers, num_tokens, num_heads, head_dim, total_slots in baseline_configs:
@@ -1138,13 +1186,13 @@ def main():
 
         config = f"({num_layers}, {num_tokens})"
 
-        def fmt(r):
+        def fmt(r, baseline_bw):
             if r is None:
                 return "-"
-            eff = (r['avg_bandwidth_gbs'] / memcpy_bw * 100) if memcpy_bw else 0
+            eff = (r['avg_bandwidth_gbs'] / baseline_bw * 100) if baseline_bw else 0
             return f"{r['avg_bandwidth_gbs']:.1f} ({eff:.0f}%)"
 
-        print(f" {config:<25} {fmt(triton_random):<18} {fmt(staging_random):<18} {fmt(pytorch_random):<18}")
+        print(f" {config:<25} {fmt(triton_random, d2h_bw):<18} {fmt(staging_random, d2h_bw):<18} {fmt(pytorch_random, d2h_bw):<18}")
 
     # Memory tradeoff analysis
     print("\n" + "-" * 80)

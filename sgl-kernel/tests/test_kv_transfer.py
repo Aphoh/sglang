@@ -29,7 +29,8 @@ def reference_gather_kv(
     """
     Reference implementation of KV gather using PyTorch operations.
 
-    Returns tensor of shape [num_layers, 2, num_tokens, num_heads_to_gather, head_dim]
+    Returns tensor of shape [num_heads_to_gather, num_layers, 2, num_tokens, head_dim]
+    This is the HEAD-FIRST layout for easy head slicing in mixed-TP transfers.
     """
     num_layers = len(k_buffers)
     num_tokens = slot_indices.shape[0]
@@ -37,7 +38,7 @@ def reference_gather_kv(
     dtype = k_buffers[0].dtype
 
     output = torch.zeros(
-        (num_layers, 2, num_tokens, num_heads_to_gather, head_dim),
+        (num_heads_to_gather, num_layers, 2, num_tokens, head_dim),
         dtype=dtype,
         device=k_buffers[0].device,
     )
@@ -45,8 +46,14 @@ def reference_gather_kv(
     head_end = head_start + num_heads_to_gather
 
     for layer_idx in range(num_layers):
-        output[layer_idx, 0] = k_buffers[layer_idx][slot_indices, head_start:head_end, :]
-        output[layer_idx, 1] = v_buffers[layer_idx][slot_indices, head_start:head_end, :]
+        # k_buffers[layer_idx][slot_indices, head_start:head_end, :] -> [num_tokens, num_heads, head_dim]
+        k_data = k_buffers[layer_idx][slot_indices, head_start:head_end, :]  # [num_tokens, num_heads, head_dim]
+        v_data = v_buffers[layer_idx][slot_indices, head_start:head_end, :]  # [num_tokens, num_heads, head_dim]
+        
+        # Transpose to [num_heads, num_tokens, head_dim] and assign to output
+        for h in range(num_heads_to_gather):
+            output[h, layer_idx, 0] = k_data[:, h, :]  # [num_tokens, head_dim]
+            output[h, layer_idx, 1] = v_data[:, h, :]  # [num_tokens, head_dim]
 
     return output
 
@@ -88,7 +95,8 @@ def test_gather_kv_full_heads(num_layers, num_tokens, num_heads, head_dim, dtype
         head_start=0, num_heads_to_gather=num_heads
     )
 
-    actual = pinned_output.view(num_layers, 2, num_tokens, num_heads, head_dim)
+    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
+    actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
 
@@ -133,7 +141,8 @@ def test_gather_kv_head_slicing(num_heads, head_start, num_heads_to_gather):
         head_start=head_start, num_heads_to_gather=num_heads_to_gather
     )
 
-    actual = pinned_output.view(num_layers, 2, num_tokens, num_heads_to_gather, head_dim)
+    # HEAD-FIRST layout: [num_heads_to_gather, num_layers, 2, num_tokens, head_dim]
+    actual = pinned_output.view(num_heads_to_gather, num_layers, 2, num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
 
@@ -177,7 +186,8 @@ def test_gather_kv_contiguous_indices():
         head_start=0, num_heads_to_gather=num_heads
     )
 
-    actual = pinned_output.view(num_layers, 2, num_tokens, num_heads, head_dim)
+    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
+    actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
 
@@ -253,7 +263,8 @@ def test_gather_kv_large_pool_sparse_access(total_slots, num_tokens):
         head_start=0, num_heads_to_gather=num_heads
     )
 
-    actual = pinned_output.view(num_layers, 2, num_tokens, num_heads, head_dim)
+    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
+    actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
 
@@ -301,7 +312,8 @@ def test_gather_kv_strided_access(stride):
         head_start=0, num_heads_to_gather=num_heads
     )
 
-    actual = pinned_output.view(num_layers, 2, num_tokens, num_heads, head_dim)
+    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
+    actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
 
@@ -361,7 +373,8 @@ def test_gather_kv_mixed_contiguous_scattered():
         head_start=0, num_heads_to_gather=num_heads
     )
 
-    actual = pinned_output.view(num_layers, 2, num_tokens, num_heads, head_dim)
+    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
+    actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
 
@@ -416,7 +429,8 @@ def test_gather_kv_boundary_slots():
         head_start=0, num_heads_to_gather=num_heads
     )
 
-    actual = pinned_output.view(num_layers, 2, num_tokens, num_heads, head_dim)
+    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
+    actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
 
@@ -481,7 +495,8 @@ def test_gather_kv_realistic_fragmentation():
         head_start=0, num_heads_to_gather=num_heads
     )
 
-    actual = pinned_output.view(num_layers, 2, actual_num_tokens, num_heads, head_dim)
+    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
+    actual = pinned_output.view(num_heads, num_layers, 2, actual_num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
 
@@ -528,7 +543,8 @@ def test_gather_kv_reverse_order_indices():
         head_start=0, num_heads_to_gather=num_heads
     )
 
-    actual = pinned_output.view(num_layers, 2, num_tokens, num_heads, head_dim)
+    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
+    actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
 
@@ -574,7 +590,8 @@ def test_gather_kv_long_sequence(num_tokens):
         head_start=0, num_heads_to_gather=num_heads
     )
 
-    actual = pinned_output.view(num_layers, 2, num_tokens, num_heads, head_dim)
+    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
+    actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
 
@@ -597,6 +614,7 @@ def reference_scatter_kv(
     """
     Reference implementation of KV scatter using PyTorch operations.
 
+    Input is in HEAD-FIRST layout: [num_heads_to_scatter, num_layers, 2, num_tokens, head_dim]
     Returns (k_buffers, v_buffers) with data scattered to the specified slots.
     """
     num_tokens = slot_indices.shape[0]
@@ -611,13 +629,16 @@ def reference_scatter_kv(
         for _ in range(num_layers)
     ]
 
-    # Reshape input to expected layout
-    input_shaped = pinned_input.view(num_layers, 2, num_tokens, num_heads_to_scatter, head_dim)
+    # Reshape input to HEAD-FIRST layout: [num_heads_to_scatter, num_layers, 2, num_tokens, head_dim]
+    input_shaped = pinned_input.view(num_heads_to_scatter, num_layers, 2, num_tokens, head_dim)
     head_end = head_start + num_heads_to_scatter
 
     for layer_idx in range(num_layers):
-        k_buffers[layer_idx][slot_indices, head_start:head_end, :] = input_shaped[layer_idx, 0].cuda()
-        v_buffers[layer_idx][slot_indices, head_start:head_end, :] = input_shaped[layer_idx, 1].cuda()
+        for h in range(num_heads_to_scatter):
+            # input_shaped[h, layer_idx, 0] is [num_tokens, head_dim] for K
+            # input_shaped[h, layer_idx, 1] is [num_tokens, head_dim] for V
+            k_buffers[layer_idx][slot_indices, head_start + h, :] = input_shaped[h, layer_idx, 0].cuda()
+            v_buffers[layer_idx][slot_indices, head_start + h, :] = input_shaped[h, layer_idx, 1].cuda()
 
     return k_buffers, v_buffers
 
