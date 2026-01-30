@@ -605,6 +605,18 @@ class NixlKVManager(CommonKVManager):
 
         return xfer_handle
 
+    def _expand_pages_to_slots(
+        self,
+        page_indices: npt.NDArray[np.int32],
+        page_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Expand page indices to slot indices (each page has page_size slots)."""
+        pages = torch.from_numpy(page_indices).to(device, dtype=torch.int64)
+        # For each page, generate slot indices: page_idx * page_size + [0, 1, ..., page_size-1]
+        offsets = torch.arange(page_size, device=device, dtype=torch.int64)
+        return (pages.unsqueeze(1) * page_size + offsets).flatten()
+
     def send_kvcache_triton(
         self,
         peer_name: str,
@@ -653,7 +665,6 @@ class NixlKVManager(CommonKVManager):
         k_buffers = self.kv_args.k_buffers
         v_buffers = self.kv_args.v_buffers
         num_layers = len(k_buffers)
-        num_tokens = len(prefill_kv_indices)
         num_heads = k_buffers[0].shape[1]
         head_dim = k_buffers[0].shape[2]
         dtype = k_buffers[0].dtype
@@ -661,18 +672,12 @@ class NixlKVManager(CommonKVManager):
         if num_heads_to_send is None:
             num_heads_to_send = num_heads - head_start
 
-        # Convert page indices to slot indices FIRST
-        # prefill_kv_indices contains PAGE indices, but we need SLOT indices
-        # Each page contains page_size slots
+        # Convert page indices to slot indices (each page has page_size slots)
         page_size = self.kv_args.page_size
-        slot_indices_list = []
-        for page_idx in prefill_kv_indices:
-            for slot_in_page in range(page_size):
-                slot_indices_list.append(int(page_idx) * page_size + slot_in_page)
-        slot_indices_tensor = torch.tensor(
-            slot_indices_list, device=k_buffers[0].device, dtype=torch.int64
+        slot_indices_tensor = self._expand_pages_to_slots(
+            prefill_kv_indices, page_size, k_buffers[0].device
         )
-        num_tokens = len(slot_indices_list)  # Now num_tokens is actual slot count
+        num_tokens = len(slot_indices_tensor)
 
         # Calculate transfer size AFTER page-to-slot expansion
         bytes_per_element = 2 if dtype in (torch.float16, torch.bfloat16) else 4
@@ -793,17 +798,12 @@ class NixlKVManager(CommonKVManager):
         if num_heads_received is None:
             num_heads_received = num_heads - head_start
 
-        # Convert page indices to slot indices
-        # kv_indices contains PAGE indices, but we need SLOT indices
+        # Convert page indices to slot indices (each page has page_size slots)
         page_size = self.kv_args.page_size
-        slot_indices_list = []
-        for page_idx in kv_indices:
-            for slot_in_page in range(page_size):
-                slot_indices_list.append(int(page_idx) * page_size + slot_in_page)
-        slot_indices_tensor = torch.tensor(
-            slot_indices_list, device=k_buffers[0].device, dtype=torch.int64
+        slot_indices_tensor = self._expand_pages_to_slots(
+            kv_indices, page_size, k_buffers[0].device
         )
-        num_tokens = len(slot_indices_list)  # Actual number of slots
+        num_tokens = len(slot_indices_tensor)
 
         logger.debug(
             f"[TRITON-KV] scatter_received_kv: {num_tokens} tokens, {num_layers} layers, "
@@ -905,8 +905,6 @@ class NixlKVManager(CommonKVManager):
             decode_info = self.decode_kv_args_table[req.agent_name]
 
             # Check if Triton transfer is enabled and supported
-            # NOTE: Triton transfer currently only works when prefill_tp <= decode_tp.
-            # Check if Triton transfer is enabled and supported
             prefill_tp_size = self.attn_tp_size
             use_triton = (
                 self.kv_transfer_method == "triton"
@@ -923,31 +921,19 @@ class NixlKVManager(CommonKVManager):
                 num_kv_heads = self.kv_args.kv_head_num
                 local_tp_rank = self.kv_args.engine_rank % prefill_tp_size
 
-                if prefill_tp_size == decode_tp_size:
-                    # Same TP - send all local heads to offset 0
+                if prefill_tp_size >= decode_tp_size:
+                    # Prefill TP >= Decode TP: each prefill rank sends all its local heads
+                    # to different offsets in decode's buffer (offset=0 when TPs match)
                     head_start = 0
                     num_heads_to_send = num_kv_heads
-                    dst_head_offset = 0
-                elif prefill_tp_size > decode_tp_size:
-                    # Prefill has more ranks (e.g., TP=2 prefill -> TP=1 decode)
-                    # Each prefill rank sends ALL its local heads
-                    # to different offsets in the decode's buffer
-                    head_start = 0
-                    num_heads_to_send = num_kv_heads
-                    # Destination offset = local_tp_rank * local_num_heads
-                    # So rank 0 writes to heads [0:4], rank 1 writes to heads [4:8]
                     dst_head_offset = local_tp_rank * num_kv_heads
                 else:
-                    # Decode has more ranks (e.g., TP=1 prefill -> TP=2 decode)
-                    # Prefill sends different head slices to different decode ranks
+                    # Prefill TP < Decode TP: prefill sends head slices to different decode ranks
                     decode_tp_rank = decode_info.decode_tp_rank % decode_tp_size
-                    # Total heads in prefill = num_kv_heads (all heads on this single prefill rank)
-                    # Each decode rank needs: total_prefill_heads / decode_tp_size
-                    total_prefill_heads = num_kv_heads * prefill_tp_size  # = num_kv_heads since prefill_tp=1
+                    total_prefill_heads = num_kv_heads * prefill_tp_size
                     heads_per_decode_rank = total_prefill_heads // decode_tp_size
                     head_start = decode_tp_rank * heads_per_decode_rank
                     num_heads_to_send = heads_per_decode_rank
-                    # Each decode rank receives at offset 0 of its own buffer
                     dst_head_offset = 0
 
                 logger.debug(
