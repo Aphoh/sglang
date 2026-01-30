@@ -27,9 +27,13 @@ The chunked approach uses a fixed-size GPU staging buffer (default 256MB) to ach
 zero-copy writes which achieve only ~50% of PCIe bandwidth due to uncoalesced writes.
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -553,6 +557,21 @@ def gather_kv(
     if num_heads_to_gather is None:
         num_heads_to_gather = k_buffers[0].shape[1] - head_start
 
+    num_layers = len(k_buffers)
+    num_tokens = slot_indices.shape[0]
+    head_dim = k_buffers[0].shape[2]
+    dtype = k_buffers[0].dtype
+    bytes_per_element = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+    transfer_bytes = num_layers * 2 * num_tokens * num_heads_to_gather * head_dim * bytes_per_element
+
+    logger.debug(
+        f"[TRITON-KV] gather_kv: {num_tokens} tokens, {num_layers} layers, "
+        f"heads [{head_start}:{head_start + num_heads_to_gather}], "
+        f"head_dim={head_dim}, dtype={dtype}, "
+        f"transfer_size={transfer_bytes / 1e6:.2f}MB, "
+        f"staging={'provided' if staging_buffer is not None else f'{staging_buffer_size_mb}MB'}"
+    )
+
     gather_kv_chunked(
         k_buffers=k_buffers,
         v_buffers=v_buffers,
@@ -780,6 +799,20 @@ def scatter_kv(
     """
     if num_heads_to_scatter is None:
         num_heads_to_scatter = k_buffers[0].shape[1] - head_start
+
+    num_layers = len(k_buffers)
+    num_tokens = slot_indices.shape[0]
+    head_dim = k_buffers[0].shape[2]
+    dtype = k_buffers[0].dtype
+    bytes_per_element = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+    transfer_bytes = num_layers * 2 * num_tokens * num_heads_to_scatter * head_dim * bytes_per_element
+
+    logger.debug(
+        f"[TRITON-KV] scatter_kv: {num_tokens} tokens, {num_layers} layers, "
+        f"heads [{head_start}:{head_start + num_heads_to_scatter}], "
+        f"head_dim={head_dim}, dtype={dtype}, "
+        f"transfer_size={transfer_bytes / 1e6:.2f}MB"
+    )
 
     scatter_kv_to_gpu(
         pinned_input=pinned_input,

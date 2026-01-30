@@ -151,6 +151,23 @@ class PrefillBootstrapQueue:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
         kv_args.page_size = self.token_to_kv_pool.page_size
 
+        # Add tensor buffer references for Triton KV transfer
+        if getattr(self.scheduler.server_args, "kv_transfer_method", "legacy") == "triton":
+            if hasattr(self.token_to_kv_pool, "k_buffer") and hasattr(
+                self.token_to_kv_pool, "v_buffer"
+            ):
+                kv_args.k_buffers = self.token_to_kv_pool.k_buffer
+                kv_args.v_buffers = self.token_to_kv_pool.v_buffer
+                kv_args.head_dim = self.token_to_kv_pool.head_dim
+                logger.debug(
+                    f"[TRITON-KV] Populated tensor buffers for Triton transfer: "
+                    f"{len(kv_args.k_buffers)} layers, head_dim={kv_args.head_dim}"
+                )
+            else:
+                logger.warning(
+                    "[TRITON-KV] Cannot enable Triton transfer: KV pool does not have k_buffer/v_buffer"
+                )
+
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
@@ -194,7 +211,7 @@ class PrefillBootstrapQueue:
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
-        logger.info(
+        logger.debug(
             "[disagg-bootstrap] prefill enqueue rid=%s room=%s host=%s port=%s "
             "tp=%s pp=%s dp=%s",
             req.rid,
@@ -320,7 +337,7 @@ class PrefillBootstrapQueue:
                     - req.time_stats.prefill_bootstrap_queue_entry_time
                 )
             req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
-            logger.info(
+            logger.debug(
                 "[disagg-bootstrap] prefill bootstrapped rid=%s room=%s poll=%s "
                 "bootstrap_s=%.3f",
                 req.rid,
@@ -622,7 +639,7 @@ class SchedulerDisaggregationPrefillMixin:
                     bootstrap_seconds=req.time_stats.bootstrap_duration,
                     alloc_seconds=req.time_stats.alloc_waiting_duration,
                 )
-                logger.info(
+                logger.debug(
                     "[disagg-transfer] prefill transfer done rid=%s room=%s "
                     "latency_s=%.3f",
                     req.rid,
@@ -780,7 +797,7 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
         if last_chunk:
-            logger.info(
+            logger.debug(
                 "[disagg-transfer] prefill send kv rid=%s room=%s pages=%s "
                 "start_idx=%s end_idx=%s aux_index=%s",
                 req.rid,

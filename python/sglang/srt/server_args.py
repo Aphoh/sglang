@@ -643,6 +643,8 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+    # KV transfer method: "legacy" (per-slot RDMA) or "triton" (Triton gather/scatter + single transfer)
+    kv_transfer_method: Literal["legacy", "triton"] = "legacy"
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -4584,6 +4586,15 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+        parser.add_argument(
+            "--kv-transfer-method",
+            type=str,
+            default=ServerArgs.kv_transfer_method,
+            choices=["legacy", "triton"],
+            help="KV transfer method. 'legacy' uses per-slot RDMA descriptors. "
+            "'triton' uses Triton gather/scatter kernels with a single NIXL transfer, "
+            "reducing descriptor count from O(tokens × layers) to O(1). Default is 'legacy'.",
         )
 
         # Encode prefill disaggregation

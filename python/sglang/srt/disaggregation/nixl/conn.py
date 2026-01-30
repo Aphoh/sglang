@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set
 import numpy as np
 import numpy.typing as npt
 import requests
+import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -26,6 +27,23 @@ from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+# Default staging buffer size for Triton KV transfer (256MB)
+DEFAULT_TRITON_STAGING_BUFFER_SIZE_MB = 256.0
+
+
+def _import_triton_kv_transfer():
+    """Lazily import Triton KV transfer functions to avoid import errors when not used."""
+    try:
+        from sglang.srt.layers.attention.triton_ops.kv_transfer import (
+            gather_kv,
+            scatter_kv,
+        )
+
+        return gather_kv, scatter_kv
+    except ImportError as e:
+        logger.warning(f"[TRITON-KV] Failed to import Triton KV transfer: {e}")
+        return None, None
 
 GUARD = "NixlMsgGuard".encode("ascii")
 NIXL_WAIT_LOG_INTERVAL_S = envs.SGLANG_NIXL_WAIT_LOG_INTERVAL_S.get()
@@ -74,9 +92,20 @@ class KVArgsRegisterInfo:
     decode_tp_size: int
     decode_tp_rank: int
     dst_kv_item_len: int
+    # For Triton KV transfer: pinned CPU buffer address and size
+    dst_pinned_ptr: int = 0
+    dst_pinned_size: int = 0
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        # Handle backwards compatibility - older senders may not include pinned buffer info
+        dst_pinned_ptr = 0
+        dst_pinned_size = 0
+        if len(msg) > 11:
+            dst_pinned_ptr = int(msg[11].decode("ascii"))
+        if len(msg) > 12:
+            dst_pinned_size = int(msg[12].decode("ascii"))
+        
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -89,6 +118,8 @@ class KVArgsRegisterInfo:
             decode_tp_size=int(msg[8].decode("ascii")),
             decode_tp_rank=int(msg[9].decode("ascii")),
             dst_kv_item_len=int(msg[10].decode("ascii")),
+            dst_pinned_ptr=dst_pinned_ptr,
+            dst_pinned_size=dst_pinned_size,
         )
 
 
@@ -145,6 +176,21 @@ class NixlKVManager(CommonKVManager):
                 "to run SGLang with NixlTransferEngine."
             ) from e
         self.agent = nixl_agent(str(uuid.uuid4()))
+
+        # Store KV transfer method configuration
+        self.kv_transfer_method = getattr(server_args, "kv_transfer_method", "legacy")
+        self.triton_staging_buffer: Optional[torch.Tensor] = None
+        self.triton_pinned_buffer: Optional[torch.Tensor] = None
+        self.triton_pinned_descs = None
+
+        # Initialize Triton transfer infrastructure if enabled
+        if self.kv_transfer_method == "triton":
+            self._init_triton_transfer_buffers()
+            logger.debug(
+                f"[TRITON-KV] Triton KV transfer enabled, "
+                f"staging_buffer={DEFAULT_TRITON_STAGING_BUFFER_SIZE_MB}MB"
+            )
+
         self.register_buffer_to_engine()
 
         # Receiver infrastructure - always initialize for both modes
@@ -297,6 +343,49 @@ class NixlKVManager(CommonKVManager):
         logger.debug(f"Register aux tensors, len(aux_addrs)= {len(aux_addrs)}")
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
+
+        # Register Triton pinned buffer with NIXL if enabled
+        if self.kv_transfer_method == "triton" and self.triton_pinned_buffer is not None:
+            pinned_addr = [
+                (self.triton_pinned_buffer.data_ptr(), self.triton_pinned_buffer.nbytes, 0, "")
+            ]
+            self.triton_pinned_descs = self.agent.register_memory(pinned_addr, "DRAM")
+            if not self.triton_pinned_descs:
+                raise Exception("NIXL memory registration failed for Triton pinned buffer")
+            logger.debug(
+                f"[TRITON-KV] Registered pinned buffer with NIXL: "
+                f"{self.triton_pinned_buffer.nbytes / 1e6:.2f}MB"
+            )
+
+    def _init_triton_transfer_buffers(self):
+        """Initialize GPU staging buffer and pinned CPU buffer for Triton KV transfer."""
+        # Calculate total KV size to determine pinned buffer size
+        # kv_data_lens contains the total bytes for each KV buffer (K and V for each layer)
+        total_kv_bytes = sum(self.kv_args.kv_data_lens)
+
+        # Allocate GPU staging buffer (fixed size, 256MB by default)
+        staging_size_bytes = int(DEFAULT_TRITON_STAGING_BUFFER_SIZE_MB * 1e6)
+        staging_elements = staging_size_bytes // 2  # Assuming bfloat16/float16
+        self.triton_staging_buffer = torch.empty(
+            staging_elements, dtype=torch.bfloat16, device=f"cuda:{self.kv_args.gpu_id}"
+        )
+
+        # Allocate pinned CPU buffer for KV transfer
+        # Size should accommodate the maximum possible transfer (all KV data)
+        # For now, allocate 1GB as a reasonable default that can hold most transfers
+        # In practice, transfers are typically smaller as we only transfer for specific requests
+        pinned_size_bytes = min(total_kv_bytes, 1024 * 1024 * 1024)  # Cap at 1GB
+        pinned_elements = pinned_size_bytes // 2  # Assuming bfloat16/float16
+        self.triton_pinned_buffer = torch.empty(
+            pinned_elements, dtype=torch.bfloat16, pin_memory=True
+        )
+
+        logger.debug(
+            f"[TRITON-KV] Initialized transfer buffers: "
+            f"staging={self.triton_staging_buffer.nbytes / 1e6:.2f}MB (GPU), "
+            f"pinned={self.triton_pinned_buffer.nbytes / 1e6:.2f}MB (CPU), "
+            f"total_kv_capacity={total_kv_bytes / 1e9:.2f}GB"
+        )
 
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
         agent_name = decode_kv_args.agent_name
@@ -516,6 +605,206 @@ class NixlKVManager(CommonKVManager):
 
         return xfer_handle
 
+    def send_kvcache_triton(
+        self,
+        peer_name: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_pinned_ptr: int,
+        dst_pinned_size: int,
+        notif: str,
+        head_start: int = 0,
+        num_heads_to_send: int = None,
+    ):
+        """
+        Send KV cache using Triton gather kernel + single NIXL transfer.
+
+        This method:
+        1. Uses gather_kv to collect scattered KV data into local pinned buffer
+        2. Transfers the contiguous pinned buffer to destination pinned buffer via NIXL
+        3. Destination will use scatter_kv to distribute to its KV cache
+
+        This reduces NIXL descriptor count from O(tokens × layers) to O(1).
+
+        Args:
+            peer_name: NIXL peer agent name
+            prefill_kv_indices: Indices of KV slots to transfer
+            dst_pinned_ptr: Destination pinned buffer pointer
+            dst_pinned_size: Destination pinned buffer size in bytes
+            notif: Notification message for transfer completion
+            head_start: First head index to gather (for head slicing)
+            num_heads_to_send: Number of heads to gather
+        """
+        gather_kv, _ = _import_triton_kv_transfer()
+        if gather_kv is None:
+            raise RuntimeError(
+                "[TRITON-KV] Triton KV transfer not available. "
+                "Make sure triton is installed."
+            )
+
+        # Validate we have tensor buffers available
+        if self.kv_args.k_buffers is None or self.kv_args.v_buffers is None:
+            raise RuntimeError(
+                "[TRITON-KV] k_buffers and v_buffers must be set in KVArgs "
+                "when using Triton KV transfer."
+            )
+
+        # Get tensor buffers
+        k_buffers = self.kv_args.k_buffers
+        v_buffers = self.kv_args.v_buffers
+        num_layers = len(k_buffers)
+        num_tokens = len(prefill_kv_indices)
+        num_heads = k_buffers[0].shape[1]
+        head_dim = k_buffers[0].shape[2]
+        dtype = k_buffers[0].dtype
+
+        if num_heads_to_send is None:
+            num_heads_to_send = num_heads - head_start
+
+        # Calculate transfer size
+        bytes_per_element = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+        transfer_elements = num_layers * 2 * num_tokens * num_heads_to_send * head_dim
+        transfer_bytes = transfer_elements * bytes_per_element
+
+        # Ensure pinned buffer is large enough
+        if self.triton_pinned_buffer is None or self.triton_pinned_buffer.nbytes < transfer_bytes:
+            # Reallocate pinned buffer if needed
+            logger.debug(
+                f"[TRITON-KV] Reallocating pinned buffer: "
+                f"{transfer_bytes / 1e6:.2f}MB needed"
+            )
+            self.triton_pinned_buffer = torch.empty(
+                transfer_elements, dtype=dtype, pin_memory=True
+            )
+            # Re-register with NIXL
+            pinned_addr = [
+                (self.triton_pinned_buffer.data_ptr(), self.triton_pinned_buffer.nbytes, 0, "")
+            ]
+            self.triton_pinned_descs = self.agent.register_memory(pinned_addr, "DRAM")
+            if not self.triton_pinned_descs:
+                raise Exception("NIXL memory registration failed for Triton pinned buffer")
+
+        # Convert numpy indices to torch tensor on GPU
+        slot_indices_tensor = torch.from_numpy(prefill_kv_indices).to(
+            k_buffers[0].device, dtype=torch.int64
+        )
+
+        logger.debug(
+            f"[TRITON-KV] send_kvcache_triton: {num_tokens} tokens, {num_layers} layers, "
+            f"heads [{head_start}:{head_start + num_heads_to_send}], "
+            f"transfer_size={transfer_bytes / 1e6:.2f}MB"
+        )
+
+        # Step 1: Gather KV data to pinned buffer using Triton kernel
+        gather_kv(
+            k_buffers=k_buffers,
+            v_buffers=v_buffers,
+            slot_indices=slot_indices_tensor,
+            pinned_output=self.triton_pinned_buffer,
+            head_start=head_start,
+            num_heads_to_gather=num_heads_to_send,
+            staging_buffer=self.triton_staging_buffer,
+        )
+
+        # Step 2: Transfer pinned buffer to destination via NIXL (single transfer)
+        src_addrs = [
+            (self.triton_pinned_buffer.data_ptr(), transfer_bytes, 0)
+        ]
+        dst_addrs = [
+            (dst_pinned_ptr, transfer_bytes, 0)
+        ]
+
+        src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
+        dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
+
+        xfer_handle = self.agent.initialize_xfer(
+            "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
+        )
+        if not xfer_handle:
+            raise Exception("[TRITON-KV] Failed to create Triton KV transfer")
+
+        state = self.agent.transfer(xfer_handle)
+        if state == "ERR":
+            raise Exception("[TRITON-KV] Failed to post Triton KV transfer")
+
+        logger.debug(
+            f"[TRITON-KV] Transfer initiated: {transfer_bytes / 1e6:.2f}MB "
+            f"({num_tokens} tokens × {num_layers} layers)"
+        )
+
+        return xfer_handle
+
+    def scatter_received_kv(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        head_start: int = 0,
+        num_heads_received: int = None,
+    ):
+        """
+        Scatter received KV data from pinned buffer to KV cache.
+
+        This should be called on the receiver side after NIXL transfer completes
+        when using Triton KV transfer method.
+
+        Args:
+            kv_indices: Indices of KV slots to scatter to
+            head_start: First head index to scatter to (for head slicing)
+            num_heads_received: Number of heads received
+        """
+        _, scatter_kv = _import_triton_kv_transfer()
+        if scatter_kv is None:
+            raise RuntimeError(
+                "[TRITON-KV] Triton KV transfer not available. "
+                "Make sure triton is installed."
+            )
+
+        # Validate we have tensor buffers available
+        if self.kv_args.k_buffers is None or self.kv_args.v_buffers is None:
+            raise RuntimeError(
+                "[TRITON-KV] k_buffers and v_buffers must be set in KVArgs "
+                "when using Triton KV transfer."
+            )
+
+        if self.triton_pinned_buffer is None:
+            raise RuntimeError(
+                "[TRITON-KV] Pinned buffer not initialized. "
+                "Ensure Triton transfer is enabled."
+            )
+
+        # Get tensor buffers
+        k_buffers = self.kv_args.k_buffers
+        v_buffers = self.kv_args.v_buffers
+        num_layers = len(k_buffers)
+        num_tokens = len(kv_indices)
+        num_heads = k_buffers[0].shape[1]
+        head_dim = k_buffers[0].shape[2]
+
+        if num_heads_received is None:
+            num_heads_received = num_heads - head_start
+
+        # Convert numpy indices to torch tensor on GPU
+        slot_indices_tensor = torch.from_numpy(kv_indices).to(
+            k_buffers[0].device, dtype=torch.int64
+        )
+
+        logger.debug(
+            f"[TRITON-KV] scatter_received_kv: {num_tokens} tokens, {num_layers} layers, "
+            f"heads [{head_start}:{head_start + num_heads_received}]"
+        )
+
+        # Scatter from pinned buffer to KV cache
+        scatter_kv(
+            pinned_input=self.triton_pinned_buffer,
+            k_buffers=k_buffers,
+            v_buffers=v_buffers,
+            slot_indices=slot_indices_tensor,
+            head_start=head_start,
+            num_heads_to_scatter=num_heads_received,
+        )
+
+        logger.debug(
+            f"[TRITON-KV] Scatter complete: {num_tokens} tokens × {num_layers} layers"
+        )
+
     def send_aux(
         self,
         peer_name: str,
@@ -594,32 +883,70 @@ class NixlKVManager(CommonKVManager):
 
             notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.pp_rank}"
             decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
+            decode_info = self.decode_kv_args_table[req.agent_name]
 
-            if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
+            # Check if Triton transfer is enabled and supported
+            use_triton = (
+                self.kv_transfer_method == "triton"
+                and decode_info.dst_pinned_ptr != 0
+                and self.kv_args.k_buffers is not None
+                and self.kv_args.v_buffers is not None
+                and not self.is_mla_backend  # MLA backend not supported yet
+            )
+
+            if use_triton:
+                # Calculate head slicing for mixed-TP
+                prefill_tp_size = self.attn_tp_size
+                num_kv_heads = self.kv_args.kv_head_num
+                local_tp_rank = self.kv_args.engine_rank % prefill_tp_size
+
+                if prefill_tp_size > decode_tp_size:
+                    # Prefill has more ranks - each prefill rank sends its heads
+                    head_start = 0
+                    num_heads_to_send = num_kv_heads
+                else:
+                    # Decode has more ranks - need to slice heads
+                    decode_tp_rank = decode_info.decode_tp_rank % decode_tp_size
+                    dst_heads_per_rank = num_kv_heads * prefill_tp_size // decode_tp_size
+                    head_start = (decode_tp_rank * dst_heads_per_rank) % num_kv_heads
+                    num_heads_to_send = dst_heads_per_rank
+
+                logger.debug(
+                    f"[TRITON-KV] Using Triton transfer: room={bootstrap_room}, "
+                    f"tokens={len(kv_indices)}, heads=[{head_start}:{head_start + num_heads_to_send}], "
+                    f"prefill_tp={prefill_tp_size}, decode_tp={decode_tp_size}"
+                )
+
+                kv_xfer_handle = self.send_kvcache_triton(
+                    peer_name=req.agent_name,
+                    prefill_kv_indices=kv_indices,
+                    dst_pinned_ptr=decode_info.dst_pinned_ptr,
+                    dst_pinned_size=decode_info.dst_pinned_size,
+                    notif=notif,
+                    head_start=head_start,
+                    num_heads_to_send=num_heads_to_send,
+                )
+            elif self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
                 kv_xfer_handle = self.send_kvcache(
                     req.agent_name,
                     kv_indices,
-                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
+                    decode_info.dst_kv_ptrs,
                     chunked_dst_kv_indice,
-                    self.decode_kv_args_table[req.agent_name].gpu_id,
+                    decode_info.gpu_id,
                     notif,
                 )
             else:
                 kv_xfer_handle = self.send_kvcache_slice(
                     req.agent_name,
                     kv_indices,
-                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
+                    decode_info.dst_kv_ptrs,
                     chunked_dst_kv_indice,
-                    self.decode_kv_args_table[req.agent_name].gpu_id,
+                    decode_info.gpu_id,
                     notif,
                     prefill_tp_size=self.attn_tp_size,
                     decode_tp_size=decode_tp_size,
-                    decode_tp_rank=self.decode_kv_args_table[
-                        req.agent_name
-                    ].decode_tp_rank,
-                    dst_kv_item_len=self.decode_kv_args_table[
-                        req.agent_name
-                    ].dst_kv_item_len,
+                    decode_tp_rank=decode_info.decode_tp_rank,
+                    dst_kv_item_len=decode_info.dst_kv_item_len,
                 )
 
             handles.append(kv_xfer_handle)
@@ -629,7 +956,7 @@ class NixlKVManager(CommonKVManager):
                 aux_xfer_handle = self.send_aux(
                     req.agent_name,
                     aux_index,
-                    self.decode_kv_args_table[req.agent_name].dst_aux_ptrs,
+                    decode_info.dst_aux_ptrs,
                     req.dst_aux_index,
                     str(req.room) + "_aux",
                 )
@@ -710,7 +1037,7 @@ class NixlKVManager(CommonKVManager):
                     if self.disaggregation_mode == DisaggregationMode.PREFILL
                     else "decode"
                 )
-                logger.info(
+                logger.debug(
                     "[disagg-bootstrap] %s recv transfer info room=%s agent=%s got=%s/%s",
                     role,
                     room,
@@ -719,7 +1046,7 @@ class NixlKVManager(CommonKVManager):
                     required_dst_info_num,
                 )
                 if len(self.transfer_infos[room]) == required_dst_info_num:
-                    logger.info(
+                    logger.debug(
                         "[disagg-bootstrap] %s room=%s bootstrapped required=%s",
                         role,
                         room,
@@ -807,6 +1134,9 @@ class NixlKVReceiver(CommonKVReceiver):
             )
         self.init_time = None
         self.last_wait_log_time = 0.0
+        # Store kv_indices for Triton scatter after transfer completes
+        self._triton_kv_indices: Optional[npt.NDArray[np.int32]] = None
+        self._triton_scatter_done = False
 
     def init(
         self,
@@ -855,6 +1185,11 @@ class NixlKVReceiver(CommonKVReceiver):
         self.started_transfer = True
         self.init_time = time.time()
 
+        # Store kv_indices for Triton scatter after transfer completes
+        if self.kv_mgr.kv_transfer_method == "triton":
+            self._triton_kv_indices = kv_indices.copy()
+            self._triton_scatter_done = False
+
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
@@ -890,6 +1225,34 @@ class NixlKVReceiver(CommonKVReceiver):
                     f"elapsed_s={elapsed} due to node failure"
                 )
             else:
+                # For Triton transfer, scatter received data from pinned buffer to GPU KV cache
+                if (
+                    self.kv_mgr.kv_transfer_method == "triton"
+                    and self._triton_kv_indices is not None
+                    and not self._triton_scatter_done
+                ):
+                    try:
+                        # Calculate head parameters for scatter
+                        # The receiver gets data with head slicing already applied by sender
+                        # So we scatter to head_start=0 with all received heads
+                        self.kv_mgr.scatter_received_kv(
+                            kv_indices=self._triton_kv_indices,
+                            head_start=0,
+                            num_heads_received=None,  # Use all heads in the buffer
+                        )
+                        self._triton_scatter_done = True
+                        logger.debug(
+                            f"[TRITON-KV] Scatter complete: room={self.bootstrap_room}, "
+                            f"tokens={len(self._triton_kv_indices)}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[TRITON-KV] Scatter failed: room={self.bootstrap_room}, error={e}"
+                        )
+                        self.conclude_state = KVPoll.Failed
+                        del self.kv_mgr.transfer_statuses[self.bootstrap_room]
+                        return KVPoll.Failed
+
                 self.conclude_state = KVPoll.Success
                 logger.debug(
                     f"NixlKVReceiver.transfer_done: room={self.bootstrap_room} SUCCESS "
@@ -909,6 +1272,16 @@ class NixlKVReceiver(CommonKVReceiver):
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
 
+            # Get pinned buffer info for Triton KV transfer
+            pinned_ptr = 0
+            pinned_size = 0
+            if (
+                self.kv_mgr.kv_transfer_method == "triton"
+                and self.kv_mgr.triton_pinned_buffer is not None
+            ):
+                pinned_ptr = self.kv_mgr.triton_pinned_buffer.data_ptr()
+                pinned_size = self.kv_mgr.triton_pinned_buffer.nbytes
+
             with lock:
                 sock.send_multipart(
                     [
@@ -924,6 +1297,8 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.kv_mgr.kv_args.decode_tp_size).encode("ascii"),
                         str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
+                        str(pinned_ptr).encode("ascii"),
+                        str(pinned_size).encode("ascii"),
                     ]
                 )
             logger.debug(f"Sent KV args to sender at {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')}")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -9,6 +9,8 @@ import numpy.typing as npt
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.disaggregation.utils import DisaggregationMode
 
 
@@ -37,6 +39,13 @@ class KVArgs:
     prefill_start_layer: int
     # for system dp
     system_dp_rank: int
+
+    # Optional tensor buffer references for Triton KV transfer
+    # These are lists of torch.Tensor, one per layer, each shaped [total_slots, num_heads, head_dim]
+    # Used when kv_transfer_method == "triton"
+    k_buffers: Optional[List[Any]] = None  # List[torch.Tensor]
+    v_buffers: Optional[List[Any]] = None  # List[torch.Tensor]
+    head_dim: Optional[int] = None  # head dimension for Triton kernels
 
 
 class KVPoll:

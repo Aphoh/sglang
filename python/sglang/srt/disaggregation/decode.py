@@ -322,6 +322,23 @@ class DecodePreallocQueue:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
         kv_args.page_size = self.token_to_kv_pool.page_size
 
+        # Add tensor buffer references for Triton KV transfer
+        if getattr(self.scheduler.server_args, "kv_transfer_method", "legacy") == "triton":
+            if hasattr(self.token_to_kv_pool, "k_buffer") and hasattr(
+                self.token_to_kv_pool, "v_buffer"
+            ):
+                kv_args.k_buffers = self.token_to_kv_pool.k_buffer
+                kv_args.v_buffers = self.token_to_kv_pool.v_buffer
+                kv_args.head_dim = self.token_to_kv_pool.head_dim
+                logger.debug(
+                    f"[TRITON-KV] Populated tensor buffers for Triton transfer: "
+                    f"{len(kv_args.k_buffers)} layers, head_dim={kv_args.head_dim}"
+                )
+            else:
+                logger.warning(
+                    "[TRITON-KV] Cannot enable Triton transfer: KV pool does not have k_buffer/v_buffer"
+                )
+
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class: Type[BaseKVManager] = get_kv_class(
@@ -364,7 +381,7 @@ class DecodePreallocQueue:
                 prefill_dp_rank=req.data_parallel_rank,
             )
 
-            logger.info(
+            logger.debug(
                 "[disagg-bootstrap] decode enqueue rid=%s room=%s host=%s port=%s "
                 "tp=%s dp=%s",
                 req.rid,
@@ -488,7 +505,7 @@ class DecodePreallocQueue:
                             decode_req.bootstrap_ready_time
                             - decode_req.req.time_stats.decode_prealloc_queue_entry_time
                         )
-                        logger.info(
+                        logger.debug(
                             "[disagg-bootstrap] decode bootstrap ready rid=%s room=%s "
                             "host=%s port=%s elapsed_s=%.3f",
                             decode_req.req.rid,
@@ -670,7 +687,7 @@ class DecodePreallocQueue:
             decode_req.req.kv_transfer_bytes = self.scheduler.estimate_kv_transfer_bytes(
                 page_count=len(page_indices)
             )
-            logger.info(
+            logger.debug(
                 "[disagg-transfer] decode init kv rid=%s room=%s pages=%s aux_index=%s",
                 decode_req.req.rid,
                 decode_req.req.bootstrap_room,
@@ -927,7 +944,7 @@ class DecodeTransferQueue:
                         bootstrap_seconds=decode_req.req.time_stats.bootstrap_duration,
                         alloc_seconds=decode_req.req.time_stats.alloc_waiting_duration,
                     )
-                logger.info(
+                logger.debug(
                     "[disagg-transfer] decode transfer done rid=%s room=%s "
                     "latency_s=%.3f",
                     decode_req.req.rid,

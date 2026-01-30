@@ -153,7 +153,7 @@ class CommonKVManager(BaseKVManager):
         try:
             response = requests.put(url, json=payload, timeout=5)
             if response.status_code == 200:
-                logger.info(
+                logger.debug(
                     "[disagg-bootstrap] registered %s sender to %s "
                     "rank=%s dp=%s/%s tp=%s/%s pp=%s/%s port=%s",
                     role,
@@ -316,7 +316,7 @@ class CommonKVReceiver(BaseKVReceiver):
             logger.debug(
                 f"Fetch prefill parallel info from [{self.bootstrap_addr}]: DP size:{self.prefill_dp_size}, TP size:{self.prefill_attn_tp_size} PP size:{self.prefill_pp_size} Page size:{self.prefill_page_size}"
             )
-            logger.info(
+            logger.debug(
                 "[disagg-bootstrap] prefill parallel info from %s: dp=%s tp=%s pp=%s page=%s",
                 self.bootstrap_addr,
                 self.prefill_dp_size,

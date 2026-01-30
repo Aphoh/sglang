@@ -302,9 +302,53 @@ If KV transfer fails:
 
 | File | Status | Description |
 |------|--------|-------------|
-| `kv_transfer.py` | ✅ Done | Triton gather/scatter kernels |
+| `kv_transfer.py` | ✅ Done | Triton gather/scatter kernels + logging |
 | `test_kv_transfer.py` | ✅ Done | Unit tests for kernels |
 | `bench_kv_transfer.py` | ✅ Done | Bandwidth benchmarks |
-| `nixl/conn.py` | ⬜ TODO | Integrate gather/scatter into disagg path |
-| `test_mixed_tp_disagg.py` | ⬜ TODO | Dynamo integration test |
-| Logging | ⬜ TODO | Add [TRITON-KV] logging for verification |
+| `server_args.py` | ✅ Done | Added `--kv-transfer-method` flag |
+| `base/conn.py` | ✅ Done | Added k_buffers/v_buffers/head_dim to KVArgs |
+| `prefill.py` | ✅ Done | Populate tensor buffer refs when triton enabled |
+| `decode.py` | ✅ Done | Populate tensor buffer refs when triton enabled |
+| `nixl/conn.py` | ✅ Done | Full Triton transfer integration |
+| `test_mixed_tp_disagg.py` | ✅ Done | Dynamo integration test |
+
+### Implementation Summary
+
+**Completed:**
+1. **Logging**: Added `[TRITON-KV]` log messages to `gather_kv` and `scatter_kv` functions
+2. **Configuration**: Added `--kv-transfer-method` CLI flag with choices `legacy` or `triton`
+3. **KVArgs extension**: Added optional `k_buffers`, `v_buffers`, and `head_dim` fields
+4. **Buffer allocation**: `NixlKVManager._init_triton_transfer_buffers()` allocates:
+   - GPU staging buffer (256MB, configurable)
+   - Pinned CPU buffer (up to 1GB, registered with NIXL)
+5. **Sender method**: `NixlKVManager.send_kvcache_triton()` - uses gather_kv + single NIXL transfer
+6. **Receiver method**: `NixlKVManager.scatter_received_kv()` - scatters from pinned buffer to KV cache
+7. **Protocol extension**: Added `dst_pinned_ptr` and `dst_pinned_size` to `KVArgsRegisterInfo`
+8. **Transfer wiring**: Modified `add_transfer_request` to use Triton path when enabled
+9. **Receiver integration**: Modified `NixlKVReceiver.poll()` to call scatter after transfer completes
+
+**End-to-End Test Results (2026-01-30):**
+- Setup: Prefill TP=2 (GPU 0,1) → Decode TP=1 (GPU 2) with qwen3-4b model
+- `--method triton`: ✅ 2/2 requests succeeded
+- `--method legacy`: ✅ 3/3 requests succeeded
+- Log verification: `[TRITON-KV]` messages confirmed gather/scatter path is active
+
+### Usage
+
+```bash
+# Enable Triton KV transfer (experimental)
+python -m sglang.launch_server \
+    --model-path ~/proj/models/qwen3-4b \
+    --disaggregation-mode prefill \
+    --disaggregation-transfer-backend nixl \
+    --kv-transfer-method triton  # <-- New flag
+```
+
+### Code Locations
+
+| Component | File | Key Functions/Classes |
+|-----------|------|----------------------|
+| Triton kernels | `python/sglang/srt/layers/attention/triton_ops/kv_transfer.py` | `gather_kv`, `scatter_kv` |
+| NIXL integration | `python/sglang/srt/disaggregation/nixl/conn.py` | `NixlKVManager`, `send_kvcache_triton`, `scatter_received_kv` |
+| Config flag | `python/sglang/srt/server_args.py` | `kv_transfer_method` |
+| KVArgs extension | `python/sglang/srt/disaggregation/base/conn.py` | `k_buffers`, `v_buffers`, `head_dim` |
