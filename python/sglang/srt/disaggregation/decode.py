@@ -61,7 +61,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice_end
-from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils import get_float_env_var, get_int_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,17 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 CLIP_MAX_NEW_TOKEN = get_int_env_var("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", 4096)
+SCHED_LOG_SLOW_MS = get_int_env_var("SGLANG_SCHED_LOG_SLOW_MS", 200)
+DISAGG_LONG_WAIT_LOG_S = get_float_env_var("SGLANG_DISAGG_LONG_WAIT_LOG_S", 5.0)
+DISAGG_WAITING_LOG_S = get_float_env_var("SGLANG_DISAGG_WAITING_LOG_S", 1.0)
+
+KV_POLL_NAME = {
+    KVPoll.Failed: "Failed",
+    KVPoll.Bootstrapping: "Bootstrapping",
+    KVPoll.WaitingForInput: "WaitingForInput",
+    KVPoll.Transferring: "Transferring",
+    KVPoll.Success: "Success",
+}
 
 
 class DecodeReqToTokenPool:
@@ -180,6 +191,9 @@ class DecodeRequest:
     kv_receiver: BaseKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    bootstrap_ready_time: Optional[float] = None
+    last_bootstrap_log_time: float = 0.0
+    last_transfer_log_time: float = 0.0
 
     @property
     def seqlen(self) -> int:
@@ -292,11 +306,6 @@ class DecodePreallocQueue:
                 kv_args.state_type = "swa"
             elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 kv_args.state_type = "mamba"
-                # Get state dimension info for cross-TP slice transfer
-                if hasattr(self.token_to_kv_pool, "get_state_dim_per_tensor"):
-                    kv_args.state_dim_per_tensor = (
-                        self.token_to_kv_pool.get_state_dim_per_tensor()
-                    )
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 kv_args.state_type = "nsa"
             else:
@@ -306,6 +315,29 @@ class DecodePreallocQueue:
             kv_args.state_data_lens = []
             kv_args.state_item_lens = []
             kv_args.state_type = "none"
+
+        # Add sender-specific fields needed for decode->decode migration
+        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        if not self.is_mla_backend:
+            kv_args.kv_head_num = self.token_to_kv_pool.head_num
+        kv_args.page_size = self.token_to_kv_pool.page_size
+
+        # Add tensor buffer references for Triton KV transfer
+        if getattr(self.scheduler.server_args, "kv_transfer_method", "legacy") == "triton":
+            if hasattr(self.token_to_kv_pool, "k_buffer") and hasattr(
+                self.token_to_kv_pool, "v_buffer"
+            ):
+                kv_args.k_buffers = self.token_to_kv_pool.k_buffer
+                kv_args.v_buffers = self.token_to_kv_pool.v_buffer
+                kv_args.head_dim = self.token_to_kv_pool.head_dim
+                logger.debug(
+                    f"[TRITON-KV] Populated tensor buffers for Triton transfer: "
+                    f"{len(kv_args.k_buffers)} layers, head_dim={kv_args.head_dim}"
+                )
+            else:
+                logger.warning(
+                    "[TRITON-KV] Cannot enable Triton transfer: KV pool does not have k_buffer/v_buffer"
+                )
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
@@ -347,6 +379,17 @@ class DecodePreallocQueue:
                 bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
                 bootstrap_room=req.bootstrap_room,
                 prefill_dp_rank=req.data_parallel_rank,
+            )
+
+            logger.debug(
+                "[disagg-bootstrap] decode enqueue rid=%s room=%s host=%s port=%s "
+                "tp=%s dp=%s",
+                req.rid,
+                req.bootstrap_room,
+                req.bootstrap_host,
+                req.bootstrap_port,
+                self.tp_rank,
+                self.scheduler.dp_rank,
             )
 
             req.add_latency(RequestStage.DECODE_PREPARE)
@@ -423,15 +466,81 @@ class DecodePreallocQueue:
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
+        now = time.perf_counter()
+        long_wait_s = DISAGG_LONG_WAIT_LOG_S
 
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
             if poll == KVPoll.Bootstrapping:
-                pass
+                if (
+                    long_wait_s > 0
+                    and decode_req.req.time_stats.decode_prealloc_queue_entry_time > 0
+                ):
+                    elapsed = (
+                        now - decode_req.req.time_stats.decode_prealloc_queue_entry_time
+                    )
+                    if (
+                        elapsed >= long_wait_s
+                        and (now - decode_req.last_bootstrap_log_time) >= long_wait_s
+                    ):
+                        decode_req.last_bootstrap_log_time = now
+                        logger.warning(
+                            "[disagg-bootstrap] decode waiting for bootstrap rid=%s "
+                            "room=%s host=%s port=%s poll=%s elapsed_s=%.1f",
+                            decode_req.req.rid,
+                            decode_req.req.bootstrap_room,
+                            decode_req.req.bootstrap_host,
+                            decode_req.req.bootstrap_port,
+                            KV_POLL_NAME.get(poll, poll),
+                            elapsed,
+                        )
             elif poll == KVPoll.WaitingForInput:
-                decode_req.waiting_for_input = True
+                if not decode_req.waiting_for_input:
+                    decode_req.waiting_for_input = True
+                    decode_req.bootstrap_ready_time = time.perf_counter()
+                    if decode_req.req.time_stats.decode_prealloc_queue_entry_time > 0:
+                        elapsed = (
+                            decode_req.bootstrap_ready_time
+                            - decode_req.req.time_stats.decode_prealloc_queue_entry_time
+                        )
+                        logger.debug(
+                            "[disagg-bootstrap] decode bootstrap ready rid=%s room=%s "
+                            "host=%s port=%s elapsed_s=%.3f",
+                            decode_req.req.rid,
+                            decode_req.req.bootstrap_room,
+                            decode_req.req.bootstrap_host,
+                            decode_req.req.bootstrap_port,
+                            elapsed,
+                        )
+                    if decode_req.req.time_stats.decode_prealloc_queue_entry_time > 0:
+                        decode_req.req.time_stats.bootstrap_duration = (
+                            decode_req.bootstrap_ready_time
+                            - decode_req.req.time_stats.decode_prealloc_queue_entry_time
+                        )
+                elif (
+                    long_wait_s > 0
+                    and decode_req.req.time_stats.decode_prealloc_queue_entry_time > 0
+                ):
+                    elapsed = (
+                        now - decode_req.req.time_stats.decode_prealloc_queue_entry_time
+                    )
+                    if (
+                        elapsed >= long_wait_s
+                        and (now - decode_req.last_bootstrap_log_time) >= long_wait_s
+                    ):
+                        decode_req.last_bootstrap_log_time = now
+                        logger.warning(
+                            "[disagg-bootstrap] decode waiting for input rid=%s "
+                            "room=%s host=%s port=%s poll=%s elapsed_s=%.1f",
+                            decode_req.req.rid,
+                            decode_req.req.bootstrap_room,
+                            decode_req.req.bootstrap_host,
+                            decode_req.req.bootstrap_port,
+                            KV_POLL_NAME.get(poll, poll),
+                            elapsed,
+                        )
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -575,11 +684,25 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
+            decode_req.req.kv_transfer_bytes = self.scheduler.estimate_kv_transfer_bytes(
+                page_count=len(page_indices)
+            )
+            logger.debug(
+                "[disagg-transfer] decode init kv rid=%s room=%s pages=%s aux_index=%s",
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+                len(page_indices),
+                decode_req.metadata_buffer_index,
+            )
             decode_req.kv_receiver.init(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
+            if decode_req.bootstrap_ready_time is not None:
+                decode_req.req.time_stats.alloc_waiting_duration = (
+                    time.perf_counter() - decode_req.bootstrap_ready_time
+                )
             decode_req.req.time_stats.decode_transfer_queue_entry_time = (
                 time.perf_counter()
             )
@@ -616,7 +739,15 @@ class DecodePreallocQueue:
             and len(self.scheduler.running_batch.reqs) > 0
             else 0
         )
-        available_size = self.token_to_kv_pool_allocator.available_size()
+
+        if self.scheduler.model_config.is_hybrid_swa:
+            available_size = min(
+                self.token_to_kv_pool_allocator.full_available_size(),
+                self.token_to_kv_pool_allocator.swa_available_size(),
+            )
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
+
         allocatable_tokens = available_size - max(
             # preserve some space for future decode
             self.num_reserved_decode_tokens
@@ -769,9 +900,12 @@ class DecodeTransferQueue:
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
+
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
+        now = time.perf_counter()
+        long_wait_s = DISAGG_LONG_WAIT_LOG_S
 
         transferred_reqs = []
         indices_to_remove = set()
@@ -801,6 +935,22 @@ class DecodeTransferQueue:
                 continue
             elif poll == KVPoll.Success:
                 self._commit_transfer_to_req(decode_req)
+                transfer_start = decode_req.req.time_stats.decode_transfer_queue_entry_time
+                transfer_end = decode_req.req.time_stats.wait_queue_entry_time
+                if transfer_start > 0 and transfer_end >= transfer_start:
+                    self.scheduler.record_kv_transfer_metrics(
+                        bytes_transferred=decode_req.req.kv_transfer_bytes,
+                        latency_seconds=transfer_end - transfer_start,
+                        bootstrap_seconds=decode_req.req.time_stats.bootstrap_duration,
+                        alloc_seconds=decode_req.req.time_stats.alloc_waiting_duration,
+                    )
+                logger.debug(
+                    "[disagg-transfer] decode transfer done rid=%s room=%s "
+                    "latency_s=%.3f",
+                    decode_req.req.rid,
+                    decode_req.req.bootstrap_room,
+                    transfer_end - transfer_start if transfer_start > 0 else -1.0,
+                )
                 indices_to_remove.add(i)
                 transferred_reqs.append(decode_req.req)
             elif poll in [
@@ -808,7 +958,18 @@ class DecodeTransferQueue:
                 KVPoll.WaitingForInput,
                 KVPoll.Transferring,
             ]:
-                pass
+                if (
+                    long_wait_s > 0
+                    and decode_req.req.time_stats.decode_transfer_queue_entry_time > 0
+                ):
+                    elapsed = (
+                        now - decode_req.req.time_stats.decode_transfer_queue_entry_time
+                    )
+                    if (
+                        elapsed >= long_wait_s
+                        and (now - decode_req.last_transfer_log_time) >= long_wait_s
+                    ):
+                        decode_req.last_transfer_log_time = now
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
@@ -837,8 +998,8 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
             self.process_decode_queue()
-
-            # Get the next batch to run
+            # Process any in-flight migration transfers (decode->decode)
+            self.process_migration_inflight_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
@@ -850,7 +1011,6 @@ class SchedulerDisaggregationDecodeMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
-            # Update last_batch
             self.last_batch = batch
 
     @torch.no_grad()
@@ -865,7 +1025,8 @@ class SchedulerDisaggregationDecodeMixin:
             # polling and allocating kv cache
             self.process_decode_queue()
 
-            # Get the next batch to run
+            # Process any in-flight migration transfers (decode->decode)
+            self.process_migration_inflight_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
