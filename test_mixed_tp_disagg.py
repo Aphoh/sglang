@@ -2,9 +2,13 @@
 """
 Test script for mixed-TP disaggregated prefill/decode with Triton KV transfer.
 
-Setup (3x A100 GPUs):
+Default Setup (3x GPUs):
 - Prefill worker: TP=2 (GPU 0,1)
 - Decode worker: TP=1 (GPU 2)
+
+Reverse Setup (--reverse-tp):
+- Prefill worker: TP=1 (GPU 0)
+- Decode worker: TP=2 (GPU 1,2)
 
 This tests the new Triton-based KV transfer method which:
 1. Uses gather_kv to consolidate scattered KV data into a pinned CPU buffer
@@ -14,6 +18,7 @@ This tests the new Triton-based KV transfer method which:
 Usage:
     python test_mixed_tp_disagg.py --method triton
     python test_mixed_tp_disagg.py --method legacy
+    python test_mixed_tp_disagg.py --method triton --reverse-tp
 """
 
 import argparse
@@ -237,16 +242,35 @@ def main():
         default=5,
         help="Number of test requests",
     )
+    parser.add_argument(
+        "--reverse-tp",
+        action="store_true",
+        help="Reverse TP: Prefill TP=1 (GPU 0) -> Decode TP=2 (GPU 1,2)",
+    )
     args = parser.parse_args()
 
     model_path = Path(args.model_path)
+    
+    # TP configuration
+    if args.reverse_tp:
+        prefill_tp = 1
+        decode_tp = 2
+        prefill_gpus = "0"
+        decode_gpus = "1,2"
+        setup_desc = "Prefill TP=1 (GPU 0) -> Decode TP=2 (GPU 1,2)"
+    else:
+        prefill_tp = 2
+        decode_tp = 1
+        prefill_gpus = "0,1"
+        decode_gpus = "2"
+        setup_desc = "Prefill TP=2 (GPU 0,1) -> Decode TP=1 (GPU 2)"
     
     print("=" * 60)
     print("Mixed-TP Disaggregation Test")
     print("=" * 60)
     print(f"Model: {model_path}")
     print(f"KV Transfer Method: {args.method}")
-    print(f"Setup: Prefill TP=2 (GPU 0,1) -> Decode TP=1 (GPU 2)")
+    print(f"Setup: {setup_desc}")
     print(f"Python: {PYTHON_EXE}")
     print("=" * 60)
 
@@ -261,12 +285,12 @@ def main():
     decode_nccl_port = 29600
 
     try:
-        # Start prefill worker (TP=2 on GPU 0,1)
-        print("\n🚀 Starting prefill worker (TP=2, GPU 0,1)...")
+        # Start prefill worker
+        print(f"\n🚀 Starting prefill worker (TP={prefill_tp}, GPU {prefill_gpus})...")
         prefill_args = [
             PYTHON_EXE, "-m", "dynamo.sglang",
             *common_args,
-            "--tp", "2",
+            "--tp", str(prefill_tp),
             "--load-balance-method", "round_robin",
             "--disaggregation-mode", "prefill",
             "--disaggregation-bootstrap-port", str(prefill_bootstrap_port),
@@ -277,16 +301,16 @@ def main():
             "--nccl-port", str(prefill_nccl_port),
         ]
         start_worker("prefill", prefill_args, env={
-            "CUDA_VISIBLE_DEVICES": "0,1",
+            "CUDA_VISIBLE_DEVICES": prefill_gpus,
             "DYN_SYSTEM_PORT": "8081",
         })
 
-        # Start decode worker (TP=1 on GPU 2)
-        print("🚀 Starting decode worker (TP=1, GPU 2)...")
+        # Start decode worker
+        print(f"🚀 Starting decode worker (TP={decode_tp}, GPU {decode_gpus})...")
         decode_args = [
             PYTHON_EXE, "-m", "dynamo.sglang",
             *common_args,
-            # No --tp flag means TP=1
+            "--tp", str(decode_tp),
             "--prefill-round-robin-balance",
             "--disaggregation-mode", "decode",
             "--disaggregation-bootstrap-port", str(decode_bootstrap_port),
@@ -297,7 +321,7 @@ def main():
             "--nccl-port", str(decode_nccl_port),
         ]
         start_worker("decode", decode_args, env={
-            "CUDA_VISIBLE_DEVICES": "2",
+            "CUDA_VISIBLE_DEVICES": decode_gpus,
             "DYN_SYSTEM_PORT": "8082",
         })
 
