@@ -56,7 +56,7 @@ COLORS = {
 PYTHON_EXE = str(Path.home() / "proj/dynamo/.venv/bin/python")
 
 
-def get_common_args(model_path: Path) -> list[str]:
+def get_common_args(model_path: Path, debug: bool = False) -> list[str]:
     """Get common arguments for sglang workers."""
     return [
         "--model-path", str(model_path),
@@ -66,7 +66,7 @@ def get_common_args(model_path: Path) -> list[str]:
         "--page-size", "16",
         "--disable-cuda-graph",
         "--stream-interval", "100",
-        "--log-level", "info",
+        "--log-level", "debug" if debug else "info",
     ]
 
 
@@ -247,6 +247,11 @@ def main():
         action="store_true",
         help="Reverse TP: Prefill TP=1 (GPU 0) -> Decode TP=2 (GPU 1,2)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging for workers",
+    )
     args = parser.parse_args()
 
     model_path = Path(args.model_path)
@@ -271,10 +276,11 @@ def main():
     print(f"Model: {model_path}")
     print(f"KV Transfer Method: {args.method}")
     print(f"Setup: {setup_desc}")
+    print(f"Debug logging: {args.debug}")
     print(f"Python: {PYTHON_EXE}")
     print("=" * 60)
 
-    common_args = get_common_args(model_path)
+    common_args = get_common_args(model_path, debug=args.debug)
     
     # Port configuration (spread apart to avoid conflicts)
     prefill_port = 10000
