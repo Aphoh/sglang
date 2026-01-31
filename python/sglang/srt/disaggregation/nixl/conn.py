@@ -372,13 +372,16 @@ class NixlKVManager(CommonKVManager):
         )
 
         # Allocate pinned CPU buffer for KV transfer
-        # Size should accommodate the maximum possible transfer (all KV data)
-        # For now, allocate 1GB as a reasonable default that can hold most transfers
-        # In practice, transfers are typically smaller as we only transfer for specific requests
-        pinned_size_bytes = min(total_kv_bytes, 1024 * 1024 * 1024)  # Cap at 1GB
+        # Size matches KV pool to accommodate any transfer size and multi-rank offsets
+        # For prefill_tp > decode_tp, multiple prefill ranks write at different offsets
+        pinned_size_bytes = total_kv_bytes
         pinned_elements = pinned_size_bytes // 2  # Assuming bfloat16/float16
         self.triton_pinned_buffer = torch.empty(
             pinned_elements, dtype=torch.bfloat16, pin_memory=True
+        )
+        logger.info(
+            f"[TRITON-KV] Pinned buffer allocated: {pinned_size_bytes / 1e9:.2f}GB "
+            f"(matches KV pool size)"
         )
 
         logger.debug(
@@ -754,6 +757,20 @@ class NixlKVManager(CommonKVManager):
         head_stride_bytes = num_layers * 2 * num_tokens * head_dim * bytes_per_element
         dst_offset = dst_head_offset * head_stride_bytes
 
+        # Debug: Check if transfer would exceed destination buffer
+        required_end = dst_offset + transfer_bytes
+        logger.info(
+            f"[TRITON-KV] Transfer check: dst_pinned_ptr=0x{dst_pinned_ptr:x}, "
+            f"dst_pinned_size={dst_pinned_size}, dst_offset={dst_offset}, "
+            f"transfer_bytes={transfer_bytes}, required_end={required_end}, "
+            f"head_stride_bytes={head_stride_bytes}, dst_head_offset={dst_head_offset}"
+        )
+        if required_end > dst_pinned_size:
+            logger.error(
+                f"[TRITON-KV] BUFFER OVERFLOW! Need {required_end} bytes but dst buffer is only {dst_pinned_size} bytes. "
+                f"Overflow by {required_end - dst_pinned_size} bytes ({(required_end - dst_pinned_size) / 1e6:.2f} MB)"
+            )
+
         src_addrs = [
             (self.triton_pinned_buffer.data_ptr(), transfer_bytes, 0)
         ]
@@ -980,12 +997,18 @@ class NixlKVManager(CommonKVManager):
                 num_kv_heads = self.kv_args.kv_head_num
                 local_tp_rank = self.kv_args.engine_rank % prefill_tp_size
 
-                if prefill_tp_size >= decode_tp_size:
-                    # Prefill TP >= Decode TP: each prefill rank sends all its local heads
-                    # to different offsets in decode's buffer (offset=0 when TPs match)
+                if prefill_tp_size > decode_tp_size:
+                    # Prefill TP > Decode TP: multiple prefill ranks send to one decode rank
+                    # Each prefill rank writes at a different offset in decode's buffer
                     head_start = 0
                     num_heads_to_send = num_kv_heads
                     dst_head_offset = local_tp_rank * num_kv_heads
+                elif prefill_tp_size == decode_tp_size:
+                    # Equal TP: 1:1 mapping, each prefill rank sends to its corresponding decode rank
+                    # No offset needed since each decode rank has its own buffer
+                    head_start = 0
+                    num_heads_to_send = num_kv_heads
+                    dst_head_offset = 0
                 else:
                     # Prefill TP < Decode TP: prefill sends head slices to different decode ranks
                     decode_tp_rank = decode_info.decode_tp_rank % decode_tp_size
