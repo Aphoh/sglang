@@ -521,6 +521,41 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        # Triton KV transfer metrics
+        self.kv_triton_gather_latency_ms = Histogram(
+            name="sglang:kv_triton_gather_latency_ms",
+            documentation="Histogram of Triton gather_kv (Device->Host) latency in ms.",
+            labelnames=labels.keys(),
+            buckets=KV_TRANSFER_TIME_MS_BUCKETS,
+        )
+        self.kv_triton_scatter_latency_ms = Histogram(
+            name="sglang:kv_triton_scatter_latency_ms",
+            documentation="Histogram of Triton scatter_kv (Host->Device) latency in ms.",
+            labelnames=labels.keys(),
+            buckets=KV_TRANSFER_TIME_MS_BUCKETS,
+        )
+        # Buckets for Triton transfer speed up to ~50 GB/s (observed max ~34 GB/s)
+        triton_speed_buckets = [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 15, 20, 25, 30, 35, 40, 50]
+        self.kv_triton_gather_speed_gb_s = Histogram(
+            name="sglang:kv_triton_gather_speed_gb_s",
+            documentation="Histogram of Triton gather_kv transfer speed in GB/s.",
+            labelnames=labels.keys(),
+            buckets=triton_speed_buckets,
+        )
+        self.kv_triton_scatter_speed_gb_s = Histogram(
+            name="sglang:kv_triton_scatter_speed_gb_s",
+            documentation="Histogram of Triton scatter_kv transfer speed in GB/s.",
+            labelnames=labels.keys(),
+            buckets=triton_speed_buckets,
+        )
+        # Transfer size buckets up to 32 GB (32000 MB)
+        self.kv_triton_transfer_size_mb = Histogram(
+            name="sglang:kv_triton_transfer_size_mb",
+            documentation="Histogram of Triton KV transfer size in MB.",
+            labelnames=labels.keys(),
+            buckets=[0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 32000],
+        )
+
         # Utilization
         self.utilization = Gauge(
             name="sglang:utilization",

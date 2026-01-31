@@ -165,8 +165,9 @@ class NixlKVManager(CommonKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        metrics_collector=None,
     ):
-        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        super().__init__(args, disaggregation_mode, server_args, is_mla_backend, metrics_collector)
         try:
             from nixl._api import nixl_agent
         except ImportError as e:
@@ -687,12 +688,19 @@ class NixlKVManager(CommonKVManager):
         # Ensure pinned buffer is large enough
         if self.triton_pinned_buffer is None or self.triton_pinned_buffer.nbytes < transfer_bytes:
             # Reallocate pinned buffer if needed
-            logger.debug(
+            logger.info(
                 f"[TRITON-KV] Reallocating pinned buffer: "
                 f"{transfer_bytes / 1e6:.2f}MB needed"
             )
+            t0_alloc = time.perf_counter()
             self.triton_pinned_buffer = torch.empty(
                 transfer_elements, dtype=dtype, pin_memory=True
+            )
+            t1_alloc = time.perf_counter()
+            alloc_ms = (t1_alloc - t0_alloc) * 1000
+            logger.info(
+                f"[TRITON-KV] CPU pinned buffer allocation took {alloc_ms:.2f}ms "
+                f"({transfer_bytes / 1e6:.2f}MB)"
             )
             # Re-register with NIXL
             pinned_addr = [
@@ -708,7 +716,8 @@ class NixlKVManager(CommonKVManager):
             f"transfer_size={transfer_bytes / 1e6:.2f}MB"
         )
 
-        # Step 1: Gather KV data to pinned buffer using Triton kernel
+        # Step 1: Gather KV data to pinned buffer using Triton kernel (device->host)
+        t0_gather = time.perf_counter()
         gather_kv(
             k_buffers=k_buffers,
             v_buffers=v_buffers,
@@ -718,6 +727,27 @@ class NixlKVManager(CommonKVManager):
             num_heads_to_gather=num_heads_to_send,
             staging_buffer=self.triton_staging_buffer,
         )
+        torch.cuda.synchronize()  # Ensure gather is complete
+        t1_gather = time.perf_counter()
+        gather_ms = (t1_gather - t0_gather) * 1000
+        transfer_mb = transfer_bytes / 1e6
+        gather_speed_gb_s = transfer_bytes / gather_ms / 1e6
+        logger.info(
+            f"[TRITON-KV] Device->Host transfer (gather_kv) took {gather_ms:.2f}ms "
+            f"({transfer_mb:.2f}MB, {gather_speed_gb_s:.2f} GB/s)"
+        )
+
+        # Record metrics if metrics collector is available
+        if self.metrics_collector is not None:
+            self.metrics_collector._log_histogram(
+                self.metrics_collector.kv_triton_gather_latency_ms, gather_ms
+            )
+            self.metrics_collector._log_histogram(
+                self.metrics_collector.kv_triton_gather_speed_gb_s, gather_speed_gb_s
+            )
+            self.metrics_collector._log_histogram(
+                self.metrics_collector.kv_triton_transfer_size_mb, transfer_mb
+            )
 
         # Step 2: Transfer pinned buffer to destination via NIXL (single transfer)
         # Calculate destination offset based on dst_head_offset for mixed-TP transfers
@@ -810,7 +840,15 @@ class NixlKVManager(CommonKVManager):
             f"heads [{head_start}:{head_start + num_heads_received}]"
         )
 
-        # Scatter from pinned buffer to KV cache
+        # Calculate transfer size for bandwidth measurement
+        dtype = k_buffers[0].dtype
+        bytes_per_element = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+        head_dim = k_buffers[0].shape[2]
+        transfer_elements = num_layers * 2 * num_tokens * num_heads_received * head_dim
+        transfer_bytes = transfer_elements * bytes_per_element
+
+        # Scatter from pinned buffer to KV cache (host->device)
+        t0_scatter = time.perf_counter()
         scatter_kv(
             pinned_input=self.triton_pinned_buffer,
             k_buffers=k_buffers,
@@ -819,6 +857,27 @@ class NixlKVManager(CommonKVManager):
             head_start=head_start,
             num_heads_to_scatter=num_heads_received,
         )
+        torch.cuda.synchronize()  # Ensure scatter is complete
+        t1_scatter = time.perf_counter()
+        scatter_ms = (t1_scatter - t0_scatter) * 1000
+        transfer_mb = transfer_bytes / 1e6
+        scatter_speed_gb_s = transfer_bytes / scatter_ms / 1e6
+        logger.info(
+            f"[TRITON-KV] Host->Device transfer (scatter_kv) took {scatter_ms:.2f}ms "
+            f"({transfer_mb:.2f}MB, {scatter_speed_gb_s:.2f} GB/s)"
+        )
+
+        # Record metrics if metrics collector is available
+        if self.metrics_collector is not None:
+            self.metrics_collector._log_histogram(
+                self.metrics_collector.kv_triton_scatter_latency_ms, scatter_ms
+            )
+            self.metrics_collector._log_histogram(
+                self.metrics_collector.kv_triton_scatter_speed_gb_s, scatter_speed_gb_s
+            )
+            self.metrics_collector._log_histogram(
+                self.metrics_collector.kv_triton_transfer_size_mb, transfer_mb
+            )
 
         logger.debug(
             f"[TRITON-KV] Scatter complete: {num_tokens} tokens × {num_layers} layers"

@@ -48,8 +48,10 @@ class CommonKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        metrics_collector=None,
     ):
         self.kv_args = args
+        self.metrics_collector = metrics_collector
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         # for p/d multi node infer

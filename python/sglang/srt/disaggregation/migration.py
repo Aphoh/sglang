@@ -180,6 +180,7 @@ class SchedulerMigrationMixin:
             DisaggregationMode.PREFILL,
             self.server_args,
             is_mla_backend(token_to_kv_pool),
+            metrics_collector=getattr(self, "metrics_collector", None),
         )
         return self._migration_kv_manager
 

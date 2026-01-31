@@ -349,6 +349,7 @@ class DecodePreallocQueue:
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
             self.is_mla_backend,
+            metrics_collector=getattr(self.scheduler, "metrics_collector", None),
         )
         return kv_manager
 
