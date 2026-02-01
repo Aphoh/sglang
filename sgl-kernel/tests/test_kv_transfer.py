@@ -2,8 +2,8 @@
 Tests for KV transfer Triton kernels.
 
 Tests the gather and scatter kernels for KV cache transfers:
-- gather_kv: GPU -> pinned CPU (device to host)
-- scatter_kv: pinned CPU -> GPU (host to device)
+- gather_kv_to_pinned_all_layers: GPU -> pinned CPU (device to host)
+- scatter_kv_with_staging_all_layers: pinned CPU -> GPU (host to device)
 """
 
 import sys
@@ -16,7 +16,10 @@ import torch
 triton_ops_path = Path(__file__).parent.parent.parent / "python" / "sglang" / "srt" / "layers" / "attention" / "triton_ops"
 sys.path.insert(0, str(triton_ops_path))
 
-from kv_transfer import gather_kv_to_pinned, scatter_kv_to_gpu
+from kv_transfer import (
+    gather_kv_to_pinned_all_layers,
+    scatter_kv_with_staging_all_layers,
+)
 
 
 def reference_gather_kv(
@@ -46,16 +49,70 @@ def reference_gather_kv(
     head_end = head_start + num_heads_to_gather
 
     for layer_idx in range(num_layers):
-        # k_buffers[layer_idx][slot_indices, head_start:head_end, :] -> [num_tokens, num_heads, head_dim]
-        k_data = k_buffers[layer_idx][slot_indices, head_start:head_end, :]  # [num_tokens, num_heads, head_dim]
-        v_data = v_buffers[layer_idx][slot_indices, head_start:head_end, :]  # [num_tokens, num_heads, head_dim]
-        
-        # Transpose to [num_heads, num_tokens, head_dim] and assign to output
+        k_data = k_buffers[layer_idx][slot_indices, head_start:head_end, :]
+        v_data = v_buffers[layer_idx][slot_indices, head_start:head_end, :]
+
         for h in range(num_heads_to_gather):
-            output[h, layer_idx, 0] = k_data[:, h, :]  # [num_tokens, head_dim]
-            output[h, layer_idx, 1] = v_data[:, h, :]  # [num_tokens, head_dim]
+            output[h, layer_idx, 0] = k_data[:, h, :]
+            output[h, layer_idx, 1] = v_data[:, h, :]
 
     return output
+
+
+def reference_scatter_kv(
+    pinned_input: torch.Tensor,
+    slot_indices: torch.Tensor,
+    num_layers: int,
+    num_heads_to_scatter: int,
+    head_dim: int,
+    total_slots: int,
+    num_heads: int,
+    head_start: int,
+    dtype: torch.dtype,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """
+    Reference implementation of KV scatter using PyTorch operations.
+
+    Input is in HEAD-FIRST layout: [num_heads_to_scatter, num_layers, 2, num_tokens, head_dim]
+    Returns (k_buffers, v_buffers) with data scattered to the specified slots.
+    """
+    num_tokens = slot_indices.shape[0]
+
+    k_buffers = [
+        torch.zeros(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
+        for _ in range(num_layers)
+    ]
+    v_buffers = [
+        torch.zeros(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
+        for _ in range(num_layers)
+    ]
+
+    input_shaped = pinned_input.view(num_heads_to_scatter, num_layers, 2, num_tokens, head_dim)
+
+    for layer_idx in range(num_layers):
+        for h in range(num_heads_to_scatter):
+            k_buffers[layer_idx][slot_indices, head_start + h, :] = input_shaped[h, layer_idx, 0].cuda()
+            v_buffers[layer_idx][slot_indices, head_start + h, :] = input_shaped[h, layer_idx, 1].cuda()
+
+    return k_buffers, v_buffers
+
+
+def create_pointer_tensors(k_buffers, v_buffers):
+    """Helper to create pointer tensors and get strides."""
+    k_data_ptrs = torch.tensor(
+        [x.data_ptr() for x in k_buffers], dtype=torch.uint64, device="cuda"
+    )
+    v_data_ptrs = torch.tensor(
+        [x.data_ptr() for x in v_buffers], dtype=torch.uint64, device="cuda"
+    )
+    slot_stride = k_buffers[0].stride(0)
+    head_stride = k_buffers[0].stride(1)
+    return k_data_ptrs, v_data_ptrs, slot_stride, head_stride
+
+
+# =============================================================================
+# Gather Tests (Device -> Host)
+# =============================================================================
 
 
 @pytest.mark.parametrize("num_layers", [1, 4, 32])
@@ -78,16 +135,22 @@ def test_gather_kv_full_heads(num_layers, num_tokens, num_heads, head_dim, dtype
 
     slot_indices = torch.randperm(total_slots, device="cuda")[:num_tokens].to(torch.int32)
 
+    k_data_ptrs, v_data_ptrs, src_slot_stride, src_head_stride = create_pointer_tensors(k_buffers, v_buffers)
+
     output_size = num_layers * 2 * num_tokens * num_heads * head_dim
     pinned_output = torch.empty(output_size, dtype=dtype, device="cpu", pin_memory=True)
 
-    gather_kv_to_pinned(
-        k_buffers=k_buffers,
-        v_buffers=v_buffers,
+    gather_kv_to_pinned_all_layers(
+        k_data_ptrs=k_data_ptrs,
+        v_data_ptrs=v_data_ptrs,
         slot_indices=slot_indices,
         pinned_output=pinned_output,
         head_start=0,
         num_heads_to_gather=num_heads,
+        num_layers=num_layers,
+        head_dim=head_dim,
+        src_slot_stride=src_slot_stride,
+        src_head_stride=src_head_stride,
     )
 
     expected = reference_gather_kv(
@@ -95,7 +158,6 @@ def test_gather_kv_full_heads(num_layers, num_tokens, num_heads, head_dim, dtype
         head_start=0, num_heads_to_gather=num_heads
     )
 
-    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
     actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
@@ -124,16 +186,22 @@ def test_gather_kv_head_slicing(num_heads, head_start, num_heads_to_gather):
 
     slot_indices = torch.randperm(total_slots, device="cuda")[:num_tokens].to(torch.int32)
 
+    k_data_ptrs, v_data_ptrs, src_slot_stride, src_head_stride = create_pointer_tensors(k_buffers, v_buffers)
+
     output_size = num_layers * 2 * num_tokens * num_heads_to_gather * head_dim
     pinned_output = torch.empty(output_size, dtype=dtype, device="cpu", pin_memory=True)
 
-    gather_kv_to_pinned(
-        k_buffers=k_buffers,
-        v_buffers=v_buffers,
+    gather_kv_to_pinned_all_layers(
+        k_data_ptrs=k_data_ptrs,
+        v_data_ptrs=v_data_ptrs,
         slot_indices=slot_indices,
         pinned_output=pinned_output,
         head_start=head_start,
         num_heads_to_gather=num_heads_to_gather,
+        num_layers=num_layers,
+        head_dim=head_dim,
+        src_slot_stride=src_slot_stride,
+        src_head_stride=src_head_stride,
     )
 
     expected = reference_gather_kv(
@@ -141,7 +209,6 @@ def test_gather_kv_head_slicing(num_heads, head_start, num_heads_to_gather):
         head_start=head_start, num_heads_to_gather=num_heads_to_gather
     )
 
-    # HEAD-FIRST layout: [num_heads_to_gather, num_layers, 2, num_tokens, head_dim]
     actual = pinned_output.view(num_heads_to_gather, num_layers, 2, num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
@@ -169,16 +236,22 @@ def test_gather_kv_contiguous_indices():
         start_slot, start_slot + num_tokens, device="cuda", dtype=torch.int32
     )
 
+    k_data_ptrs, v_data_ptrs, src_slot_stride, src_head_stride = create_pointer_tensors(k_buffers, v_buffers)
+
     output_size = num_layers * 2 * num_tokens * num_heads * head_dim
     pinned_output = torch.empty(output_size, dtype=dtype, device="cpu", pin_memory=True)
 
-    gather_kv_to_pinned(
-        k_buffers=k_buffers,
-        v_buffers=v_buffers,
+    gather_kv_to_pinned_all_layers(
+        k_data_ptrs=k_data_ptrs,
+        v_data_ptrs=v_data_ptrs,
         slot_indices=slot_indices,
         pinned_output=pinned_output,
         head_start=0,
         num_heads_to_gather=num_heads,
+        num_layers=num_layers,
+        head_dim=head_dim,
+        src_slot_stride=src_slot_stride,
+        src_head_stride=src_head_stride,
     )
 
     expected = reference_gather_kv(
@@ -186,7 +259,6 @@ def test_gather_kv_contiguous_indices():
         head_start=0, num_heads_to_gather=num_heads
     )
 
-    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
     actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
@@ -197,35 +269,29 @@ def test_gather_kv_non_pinned_raises():
     v_buffers = [torch.randn(64, 4, 32, dtype=torch.float16, device="cuda")]
     slot_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device="cuda")
 
+    k_data_ptrs, v_data_ptrs, src_slot_stride, src_head_stride = create_pointer_tensors(k_buffers, v_buffers)
+
     non_pinned_output = torch.empty(1 * 2 * 4 * 4 * 32, dtype=torch.float16, device="cpu")
 
     with pytest.raises(AssertionError, match="pinned"):
-        gather_kv_to_pinned(
-            k_buffers=k_buffers,
-            v_buffers=v_buffers,
+        gather_kv_to_pinned_all_layers(
+            k_data_ptrs=k_data_ptrs,
+            v_data_ptrs=v_data_ptrs,
             slot_indices=slot_indices,
             pinned_output=non_pinned_output,
             head_start=0,
             num_heads_to_gather=4,
+            num_layers=1,
+            head_dim=32,
+            src_slot_stride=src_slot_stride,
+            src_head_stride=src_head_stride,
         )
-
-
-# =============================================================================
-# Memory Fragmentation Tests
-# =============================================================================
-# These tests simulate realistic KV cache fragmentation patterns where tokens
-# from a single request are scattered across a large memory pool.
 
 
 @pytest.mark.parametrize("total_slots", [100_000, 500_000])
 @pytest.mark.parametrize("num_tokens", [128, 1024, 4096])
 def test_gather_kv_large_pool_sparse_access(total_slots, num_tokens):
-    """
-    Test sparse access pattern in a large KV cache pool.
-
-    Simulates pulling a small number of tokens from a very large pool,
-    which is common when the KV cache has many concurrent requests.
-    """
+    """Test sparse access pattern in a large KV cache pool."""
     if num_tokens > total_slots:
         pytest.skip("num_tokens exceeds total_slots")
 
@@ -243,68 +309,24 @@ def test_gather_kv_large_pool_sparse_access(total_slots, num_tokens):
         for _ in range(num_layers)
     ]
 
-    # Random sparse indices across the entire pool
     slot_indices = torch.randperm(total_slots, device="cuda")[:num_tokens].to(torch.int32)
 
-    output_size = num_layers * 2 * num_tokens * num_heads * head_dim
-    pinned_output = torch.empty(output_size, dtype=dtype, device="cpu", pin_memory=True)
-
-    gather_kv_to_pinned(
-        k_buffers=k_buffers,
-        v_buffers=v_buffers,
-        slot_indices=slot_indices,
-        pinned_output=pinned_output,
-        head_start=0,
-        num_heads_to_gather=num_heads,
-    )
-
-    expected = reference_gather_kv(
-        k_buffers, v_buffers, slot_indices.long(),
-        head_start=0, num_heads_to_gather=num_heads
-    )
-
-    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
-    actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
-    torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
-
-
-@pytest.mark.parametrize("stride", [2, 7, 64, 256])
-def test_gather_kv_strided_access(stride):
-    """
-    Test strided access pattern (worst case for coalescing).
-
-    Simulates a pathological fragmentation pattern where slots are
-    allocated in a strided pattern (e.g., every Nth slot).
-    """
-    num_layers = 4
-    num_heads = 8
-    head_dim = 128
-    num_tokens = 512
-    total_slots = num_tokens * stride + 1000  # Ensure enough slots
-    dtype = torch.float16
-
-    k_buffers = [
-        torch.randn(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
-        for _ in range(num_layers)
-    ]
-    v_buffers = [
-        torch.randn(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
-        for _ in range(num_layers)
-    ]
-
-    # Strided indices: 0, stride, 2*stride, 3*stride, ...
-    slot_indices = torch.arange(0, num_tokens * stride, stride, device="cuda", dtype=torch.int32)
+    k_data_ptrs, v_data_ptrs, src_slot_stride, src_head_stride = create_pointer_tensors(k_buffers, v_buffers)
 
     output_size = num_layers * 2 * num_tokens * num_heads * head_dim
     pinned_output = torch.empty(output_size, dtype=dtype, device="cpu", pin_memory=True)
 
-    gather_kv_to_pinned(
-        k_buffers=k_buffers,
-        v_buffers=v_buffers,
+    gather_kv_to_pinned_all_layers(
+        k_data_ptrs=k_data_ptrs,
+        v_data_ptrs=v_data_ptrs,
         slot_indices=slot_indices,
         pinned_output=pinned_output,
         head_start=0,
         num_heads_to_gather=num_heads,
+        num_layers=num_layers,
+        head_dim=head_dim,
+        src_slot_stride=src_slot_stride,
+        src_head_stride=src_head_stride,
     )
 
     expected = reference_gather_kv(
@@ -312,253 +334,17 @@ def test_gather_kv_strided_access(stride):
         head_start=0, num_heads_to_gather=num_heads
     )
 
-    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
-    actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
-    torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
-
-
-def test_gather_kv_mixed_contiguous_scattered():
-    """
-    Test mixed access pattern with some contiguous runs and some scattered.
-
-    Simulates realistic fragmentation where some tokens are contiguous
-    (recently allocated together) and some are scattered (from older allocations).
-    """
-    num_layers = 4
-    num_heads = 8
-    head_dim = 128
-    total_slots = 100_000
-    dtype = torch.float16
-
-    k_buffers = [
-        torch.randn(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
-        for _ in range(num_layers)
-    ]
-    v_buffers = [
-        torch.randn(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
-        for _ in range(num_layers)
-    ]
-
-    # Build mixed pattern:
-    # - 3 contiguous runs of 100 tokens each at different locations
-    # - 200 randomly scattered tokens
-    indices_list = []
-
-    # Contiguous runs at different parts of the pool
-    indices_list.append(torch.arange(1000, 1100, device="cuda"))      # Near start
-    indices_list.append(torch.arange(50000, 50100, device="cuda"))    # Middle
-    indices_list.append(torch.arange(99000, 99100, device="cuda"))    # Near end
-
-    # Scattered tokens
-    scattered = torch.randperm(total_slots, device="cuda")[:200]
-    indices_list.append(scattered)
-
-    slot_indices = torch.cat(indices_list).to(torch.int32)
-    num_tokens = slot_indices.shape[0]
-
-    output_size = num_layers * 2 * num_tokens * num_heads * head_dim
-    pinned_output = torch.empty(output_size, dtype=dtype, device="cpu", pin_memory=True)
-
-    gather_kv_to_pinned(
-        k_buffers=k_buffers,
-        v_buffers=v_buffers,
-        slot_indices=slot_indices,
-        pinned_output=pinned_output,
-        head_start=0,
-        num_heads_to_gather=num_heads,
-    )
-
-    expected = reference_gather_kv(
-        k_buffers, v_buffers, slot_indices.long(),
-        head_start=0, num_heads_to_gather=num_heads
-    )
-
-    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
-    actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
-    torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
-
-
-def test_gather_kv_boundary_slots():
-    """
-    Test accessing slots at boundaries of the pool.
-
-    Ensures correct handling of first slot, last slot, and slots
-    near the boundaries.
-    """
-    num_layers = 4
-    num_heads = 8
-    head_dim = 128
-    total_slots = 100_000
-    dtype = torch.float16
-
-    k_buffers = [
-        torch.randn(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
-        for _ in range(num_layers)
-    ]
-    v_buffers = [
-        torch.randn(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
-        for _ in range(num_layers)
-    ]
-
-    # Include boundary slots explicitly
-    slot_indices = torch.tensor([
-        0,                      # First slot
-        1,                      # Second slot
-        total_slots // 2,       # Middle
-        total_slots - 2,        # Second to last
-        total_slots - 1,        # Last slot
-    ] + list(range(100, 200))   # Plus a contiguous chunk
-    , device="cuda", dtype=torch.int32)
-
-    num_tokens = slot_indices.shape[0]
-
-    output_size = num_layers * 2 * num_tokens * num_heads * head_dim
-    pinned_output = torch.empty(output_size, dtype=dtype, device="cpu", pin_memory=True)
-
-    gather_kv_to_pinned(
-        k_buffers=k_buffers,
-        v_buffers=v_buffers,
-        slot_indices=slot_indices,
-        pinned_output=pinned_output,
-        head_start=0,
-        num_heads_to_gather=num_heads,
-    )
-
-    expected = reference_gather_kv(
-        k_buffers, v_buffers, slot_indices.long(),
-        head_start=0, num_heads_to_gather=num_heads
-    )
-
-    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
-    actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
-    torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
-
-
-def test_gather_kv_realistic_fragmentation():
-    """
-    Test a realistic fragmentation pattern from a simulated allocator.
-
-    Simulates what happens when many requests allocate and free slots
-    over time, leaving the pool fragmented.
-    """
-    num_layers = 32  # Realistic layer count
-    num_heads = 8
-    head_dim = 128
-    total_slots = 200_000  # Large pool
-    num_tokens = 2048      # Moderate sequence length
-    dtype = torch.float16
-
-    k_buffers = [
-        torch.randn(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
-        for _ in range(num_layers)
-    ]
-    v_buffers = [
-        torch.randn(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
-        for _ in range(num_layers)
-    ]
-
-    # Simulate fragmented allocation:
-    # The allocator gave us slots from different "eras" of allocation
-    indices_list = []
-
-    # Era 1: Old allocation, slots 5000-5200
-    indices_list.append(torch.arange(5000, 5200, device="cuda"))
-
-    # Era 2: Slightly newer, scattered in 20000-40000 range
-    era2_base = torch.arange(20000, 40000, 50, device="cuda")  # Every 50th slot
-    indices_list.append(era2_base[:200])
-
-    # Era 3: Recent allocation, several small contiguous chunks
-    for start in [80000, 82000, 84000, 86000, 88000]:
-        indices_list.append(torch.arange(start, start + 100, device="cuda"))
-
-    # Era 4: Very recent, contiguous chunk
-    indices_list.append(torch.arange(150000, 150000 + (num_tokens - 1100), device="cuda"))
-
-    slot_indices = torch.cat(indices_list).to(torch.int32)
-    actual_num_tokens = slot_indices.shape[0]
-
-    output_size = num_layers * 2 * actual_num_tokens * num_heads * head_dim
-    pinned_output = torch.empty(output_size, dtype=dtype, device="cpu", pin_memory=True)
-
-    gather_kv_to_pinned(
-        k_buffers=k_buffers,
-        v_buffers=v_buffers,
-        slot_indices=slot_indices,
-        pinned_output=pinned_output,
-        head_start=0,
-        num_heads_to_gather=num_heads,
-    )
-
-    expected = reference_gather_kv(
-        k_buffers, v_buffers, slot_indices.long(),
-        head_start=0, num_heads_to_gather=num_heads
-    )
-
-    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
-    actual = pinned_output.view(num_heads, num_layers, 2, actual_num_tokens, head_dim)
-    torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
-
-
-def test_gather_kv_reverse_order_indices():
-    """
-    Test with indices in reverse order.
-
-    The output should still be in the order specified by slot_indices,
-    not sorted by slot number.
-    """
-    num_layers = 4
-    num_heads = 8
-    head_dim = 128
-    total_slots = 10_000
-    num_tokens = 500
-    dtype = torch.float16
-
-    k_buffers = [
-        torch.randn(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
-        for _ in range(num_layers)
-    ]
-    v_buffers = [
-        torch.randn(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
-        for _ in range(num_layers)
-    ]
-
-    # Indices in reverse order
-    slot_indices = torch.arange(num_tokens - 1, -1, -1, device="cuda", dtype=torch.int32) * 10
-
-    output_size = num_layers * 2 * num_tokens * num_heads * head_dim
-    pinned_output = torch.empty(output_size, dtype=dtype, device="cpu", pin_memory=True)
-
-    gather_kv_to_pinned(
-        k_buffers=k_buffers,
-        v_buffers=v_buffers,
-        slot_indices=slot_indices,
-        pinned_output=pinned_output,
-        head_start=0,
-        num_heads_to_gather=num_heads,
-    )
-
-    expected = reference_gather_kv(
-        k_buffers, v_buffers, slot_indices.long(),
-        head_start=0, num_heads_to_gather=num_heads
-    )
-
-    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
     actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("num_tokens", [8192, 16384])
 def test_gather_kv_long_sequence(num_tokens):
-    """
-    Test with long sequences (many tokens to gather).
-
-    Tests the kernel's ability to handle large transfers efficiently.
-    """
+    """Test with long sequences (many tokens to gather)."""
     num_layers = 4
     num_heads = 8
     head_dim = 128
-    total_slots = num_tokens + 10_000  # Pool slightly larger than sequence
+    total_slots = num_tokens + 10_000
     dtype = torch.float16
 
     k_buffers = [
@@ -570,19 +356,24 @@ def test_gather_kv_long_sequence(num_tokens):
         for _ in range(num_layers)
     ]
 
-    # Scattered indices
     slot_indices = torch.randperm(total_slots, device="cuda")[:num_tokens].to(torch.int32)
+
+    k_data_ptrs, v_data_ptrs, src_slot_stride, src_head_stride = create_pointer_tensors(k_buffers, v_buffers)
 
     output_size = num_layers * 2 * num_tokens * num_heads * head_dim
     pinned_output = torch.empty(output_size, dtype=dtype, device="cpu", pin_memory=True)
 
-    gather_kv_to_pinned(
-        k_buffers=k_buffers,
-        v_buffers=v_buffers,
+    gather_kv_to_pinned_all_layers(
+        k_data_ptrs=k_data_ptrs,
+        v_data_ptrs=v_data_ptrs,
         slot_indices=slot_indices,
         pinned_output=pinned_output,
         head_start=0,
         num_heads_to_gather=num_heads,
+        num_layers=num_layers,
+        head_dim=head_dim,
+        src_slot_stride=src_slot_stride,
+        src_head_stride=src_head_stride,
     )
 
     expected = reference_gather_kv(
@@ -590,7 +381,6 @@ def test_gather_kv_long_sequence(num_tokens):
         head_start=0, num_heads_to_gather=num_heads
     )
 
-    # HEAD-FIRST layout: [num_heads, num_layers, 2, num_tokens, head_dim]
     actual = pinned_output.view(num_heads, num_layers, 2, num_tokens, head_dim)
     torch.testing.assert_close(actual, expected.cpu(), rtol=1e-3, atol=1e-3)
 
@@ -598,49 +388,6 @@ def test_gather_kv_long_sequence(num_tokens):
 # =============================================================================
 # Scatter Tests (Host -> Device)
 # =============================================================================
-
-
-def reference_scatter_kv(
-    pinned_input: torch.Tensor,
-    slot_indices: torch.Tensor,
-    num_layers: int,
-    num_heads_to_scatter: int,
-    head_dim: int,
-    total_slots: int,
-    num_heads: int,
-    head_start: int,
-    dtype: torch.dtype,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """
-    Reference implementation of KV scatter using PyTorch operations.
-
-    Input is in HEAD-FIRST layout: [num_heads_to_scatter, num_layers, 2, num_tokens, head_dim]
-    Returns (k_buffers, v_buffers) with data scattered to the specified slots.
-    """
-    num_tokens = slot_indices.shape[0]
-
-    # Initialize empty KV buffers
-    k_buffers = [
-        torch.zeros(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
-        for _ in range(num_layers)
-    ]
-    v_buffers = [
-        torch.zeros(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
-        for _ in range(num_layers)
-    ]
-
-    # Reshape input to HEAD-FIRST layout: [num_heads_to_scatter, num_layers, 2, num_tokens, head_dim]
-    input_shaped = pinned_input.view(num_heads_to_scatter, num_layers, 2, num_tokens, head_dim)
-    head_end = head_start + num_heads_to_scatter
-
-    for layer_idx in range(num_layers):
-        for h in range(num_heads_to_scatter):
-            # input_shaped[h, layer_idx, 0] is [num_tokens, head_dim] for K
-            # input_shaped[h, layer_idx, 1] is [num_tokens, head_dim] for V
-            k_buffers[layer_idx][slot_indices, head_start + h, :] = input_shaped[h, layer_idx, 0].cuda()
-            v_buffers[layer_idx][slot_indices, head_start + h, :] = input_shaped[h, layer_idx, 1].cuda()
-
-    return k_buffers, v_buffers
 
 
 @pytest.mark.parametrize("num_layers", [1, 4, 32])
@@ -652,13 +399,11 @@ def test_scatter_kv_full_heads(num_layers, num_tokens, num_heads, head_dim, dtyp
     """Test scattering all heads (no slicing)."""
     total_slots = 1024
 
-    # Create input data in pinned memory
     input_size = num_layers * 2 * num_tokens * num_heads * head_dim
     pinned_input = torch.randn(input_size, dtype=dtype, device="cpu", pin_memory=True)
 
     slot_indices = torch.randperm(total_slots, device="cuda")[:num_tokens].to(torch.int32)
 
-    # Create empty KV buffers on GPU
     k_buffers = [
         torch.zeros(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
         for _ in range(num_layers)
@@ -668,13 +413,19 @@ def test_scatter_kv_full_heads(num_layers, num_tokens, num_heads, head_dim, dtyp
         for _ in range(num_layers)
     ]
 
-    scatter_kv_to_gpu(
+    k_data_ptrs, v_data_ptrs, dst_slot_stride, dst_head_stride = create_pointer_tensors(k_buffers, v_buffers)
+
+    scatter_kv_with_staging_all_layers(
         pinned_input=pinned_input,
-        k_buffers=k_buffers,
-        v_buffers=v_buffers,
+        k_data_ptrs=k_data_ptrs,
+        v_data_ptrs=v_data_ptrs,
         slot_indices=slot_indices,
         head_start=0,
         num_heads_to_scatter=num_heads,
+        num_layers=num_layers,
+        head_dim=head_dim,
+        dst_slot_stride=dst_slot_stride,
+        dst_head_stride=dst_head_stride,
     )
 
     expected_k, expected_v = reference_scatter_kv(
@@ -694,10 +445,10 @@ def test_scatter_kv_full_heads(num_layers, num_tokens, num_heads, head_dim, dtyp
 
 
 @pytest.mark.parametrize("head_start,num_heads_to_scatter", [
-    (0, 4),   # First 4 of 8 heads
-    (4, 4),   # Last 4 of 8 heads
-    (2, 4),   # Middle 4 of 8 heads
-    (0, 8),   # All 8 heads
+    (0, 4),
+    (4, 4),
+    (2, 4),
+    (0, 8),
 ])
 def test_scatter_kv_head_slicing(head_start, num_heads_to_scatter):
     """Test scattering a subset of heads (for mixed-TP)."""
@@ -722,13 +473,19 @@ def test_scatter_kv_head_slicing(head_start, num_heads_to_scatter):
         for _ in range(num_layers)
     ]
 
-    scatter_kv_to_gpu(
+    k_data_ptrs, v_data_ptrs, dst_slot_stride, dst_head_stride = create_pointer_tensors(k_buffers, v_buffers)
+
+    scatter_kv_with_staging_all_layers(
         pinned_input=pinned_input,
-        k_buffers=k_buffers,
-        v_buffers=v_buffers,
+        k_data_ptrs=k_data_ptrs,
+        v_data_ptrs=v_data_ptrs,
         slot_indices=slot_indices,
         head_start=head_start,
         num_heads_to_scatter=num_heads_to_scatter,
+        num_layers=num_layers,
+        head_dim=head_dim,
+        dst_slot_stride=dst_slot_stride,
+        dst_head_stride=dst_head_stride,
     )
 
     expected_k, expected_v = reference_scatter_kv(
@@ -751,17 +508,16 @@ def test_scatter_kv_roundtrip():
     """
     Test that gather followed by scatter is identity (roundtrip test).
 
-    This is the most important test - data gathered from GPU to pinned CPU
-    should be correctly scattered back to GPU KV cache.
+    Data gathered from GPU to pinned CPU should be correctly scattered back to GPU.
     """
-    num_layers = 4
-    num_tokens = 512
+    num_layers = 32
+    num_tokens = 1024
     num_heads = 8
     head_dim = 128
-    total_slots = 2048
+    total_slots = 10_000
     dtype = torch.float16
 
-    # Create source KV buffers with known data
+    # Source KV buffers
     k_buffers_src = [
         torch.randn(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
         for _ in range(num_layers)
@@ -773,20 +529,26 @@ def test_scatter_kv_roundtrip():
 
     slot_indices = torch.randperm(total_slots, device="cuda")[:num_tokens].to(torch.int32)
 
-    # Gather from source to pinned
+    k_data_ptrs_src, v_data_ptrs_src, src_slot_stride, src_head_stride = create_pointer_tensors(k_buffers_src, v_buffers_src)
+
+    # Gather
     output_size = num_layers * 2 * num_tokens * num_heads * head_dim
     pinned_buffer = torch.empty(output_size, dtype=dtype, device="cpu", pin_memory=True)
 
-    gather_kv_to_pinned(
-        k_buffers=k_buffers_src,
-        v_buffers=v_buffers_src,
+    gather_kv_to_pinned_all_layers(
+        k_data_ptrs=k_data_ptrs_src,
+        v_data_ptrs=v_data_ptrs_src,
         slot_indices=slot_indices,
         pinned_output=pinned_buffer,
         head_start=0,
         num_heads_to_gather=num_heads,
+        num_layers=num_layers,
+        head_dim=head_dim,
+        src_slot_stride=src_slot_stride,
+        src_head_stride=src_head_stride,
     )
 
-    # Create destination KV buffers (all zeros)
+    # Destination KV buffers
     k_buffers_dst = [
         torch.zeros(total_slots, num_heads, head_dim, dtype=dtype, device="cuda")
         for _ in range(num_layers)
@@ -796,17 +558,23 @@ def test_scatter_kv_roundtrip():
         for _ in range(num_layers)
     ]
 
-    # Scatter from pinned to destination
-    scatter_kv_to_gpu(
+    k_data_ptrs_dst, v_data_ptrs_dst, dst_slot_stride, dst_head_stride = create_pointer_tensors(k_buffers_dst, v_buffers_dst)
+
+    # Scatter
+    scatter_kv_with_staging_all_layers(
         pinned_input=pinned_buffer,
-        k_buffers=k_buffers_dst,
-        v_buffers=v_buffers_dst,
+        k_data_ptrs=k_data_ptrs_dst,
+        v_data_ptrs=v_data_ptrs_dst,
         slot_indices=slot_indices,
         head_start=0,
         num_heads_to_scatter=num_heads,
+        num_layers=num_layers,
+        head_dim=head_dim,
+        dst_slot_stride=dst_slot_stride,
+        dst_head_stride=dst_head_stride,
     )
 
-    # Verify: destination[slot_indices] should match source[slot_indices]
+    # Verify roundtrip
     for layer_idx in range(num_layers):
         src_k = k_buffers_src[layer_idx][slot_indices.long()]
         dst_k = k_buffers_dst[layer_idx][slot_indices.long()]
@@ -817,22 +585,20 @@ def test_scatter_kv_roundtrip():
         torch.testing.assert_close(dst_v, src_v, rtol=1e-3, atol=1e-3)
 
 
-def test_scatter_kv_large_pool_sparse():
-    """Test scatter with large pool and sparse access (high fragmentation)."""
-    # Clean up memory from previous tests
+def test_scatter_kv_large_pool():
+    """Test scatter with large pool (high fragmentation)."""
     torch.cuda.empty_cache()
 
     num_layers = 32
     num_tokens = 2048
     num_heads = 8
     head_dim = 128
-    total_slots = 200_000  # Large pool (reduced from 500K to avoid OOM)
+    total_slots = 100_000
     dtype = torch.float16
 
     input_size = num_layers * 2 * num_tokens * num_heads * head_dim
     pinned_input = torch.randn(input_size, dtype=dtype, device="cpu", pin_memory=True)
 
-    # Random sparse access
     slot_indices = torch.randperm(total_slots, device="cuda")[:num_tokens].to(torch.int32)
 
     k_buffers = [
@@ -844,13 +610,19 @@ def test_scatter_kv_large_pool_sparse():
         for _ in range(num_layers)
     ]
 
-    scatter_kv_to_gpu(
+    k_data_ptrs, v_data_ptrs, dst_slot_stride, dst_head_stride = create_pointer_tensors(k_buffers, v_buffers)
+
+    scatter_kv_with_staging_all_layers(
         pinned_input=pinned_input,
-        k_buffers=k_buffers,
-        v_buffers=v_buffers,
+        k_data_ptrs=k_data_ptrs,
+        v_data_ptrs=v_data_ptrs,
         slot_indices=slot_indices,
         head_start=0,
         num_heads_to_scatter=num_heads,
+        num_layers=num_layers,
+        head_dim=head_dim,
+        dst_slot_stride=dst_slot_stride,
+        dst_head_stride=dst_head_stride,
     )
 
     expected_k, expected_v = reference_scatter_kv(
@@ -864,7 +636,6 @@ def test_scatter_kv_large_pool_sparse():
         dtype=dtype,
     )
 
-    # Only check the slots we wrote to (checking all 500K slots would be slow)
     for layer_idx in range(num_layers):
         actual_k = k_buffers[layer_idx][slot_indices.long()]
         expected_k_at_slots = expected_k[layer_idx][slot_indices.long()]

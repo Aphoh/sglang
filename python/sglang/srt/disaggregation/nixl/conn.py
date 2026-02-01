@@ -36,11 +36,11 @@ def _import_triton_kv_transfer():
     """Lazily import Triton KV transfer functions to avoid import errors when not used."""
     try:
         from sglang.srt.layers.attention.triton_ops.kv_transfer import (
-            gather_kv,
-            scatter_kv,
+            gather_kv_to_pinned_all_layers,
+            scatter_kv_with_staging_all_layers,
         )
 
-        return gather_kv, scatter_kv
+        return gather_kv_to_pinned_all_layers, scatter_kv_with_staging_all_layers
     except ImportError as e:
         logger.warning(f"[TRITON-KV] Failed to import Triton KV transfer: {e}")
         return None, None
@@ -636,7 +636,8 @@ class NixlKVManager(CommonKVManager):
         Send KV cache using Triton gather kernel + single NIXL transfer.
 
         This method:
-        1. Uses gather_kv to collect scattered KV data into local pinned buffer
+        1. Uses gather_kv_to_pinned_all_layers to collect scattered KV data into local pinned buffer
+           (single kernel launch for all layers)
         2. Transfers the contiguous pinned buffer to destination pinned buffer via NIXL
         3. Destination will use scatter_kv to distribute to its KV cache
 
@@ -651,8 +652,8 @@ class NixlKVManager(CommonKVManager):
             head_start: First head index to gather (for head slicing)
             num_heads_to_send: Number of heads to gather
         """
-        gather_kv, _ = _import_triton_kv_transfer()
-        if gather_kv is None:
+        gather_kv_all_layers, _ = _import_triton_kv_transfer()
+        if gather_kv_all_layers is None:
             raise RuntimeError(
                 "[TRITON-KV] Triton KV transfer not available. "
                 "Make sure triton is installed."
@@ -672,6 +673,7 @@ class NixlKVManager(CommonKVManager):
         num_heads = k_buffers[0].shape[1]
         head_dim = k_buffers[0].shape[2]
         dtype = k_buffers[0].dtype
+        device = k_buffers[0].device
 
         if num_heads_to_send is None:
             num_heads_to_send = num_heads - head_start
@@ -679,8 +681,8 @@ class NixlKVManager(CommonKVManager):
         # Convert page indices to slot indices (each page has page_size slots)
         page_size = self.kv_args.page_size
         slot_indices_tensor = self._expand_pages_to_slots(
-            prefill_kv_indices, page_size, k_buffers[0].device
-        )
+            prefill_kv_indices, page_size, device
+        ).to(torch.int32)
         num_tokens = len(slot_indices_tensor)
 
         # Calculate transfer size AFTER page-to-slot expansion
@@ -719,16 +721,30 @@ class NixlKVManager(CommonKVManager):
             f"transfer_size={transfer_bytes / 1e6:.2f}MB"
         )
 
-        # Step 1: Gather KV data to pinned buffer using Triton kernel (device->host)
+        # Create pointer tensors for single-kernel gather (cached for reuse)
+        if not hasattr(self, '_k_data_ptrs') or self._k_data_ptrs is None:
+            self._k_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in k_buffers], dtype=torch.uint64, device=device
+            )
+            self._v_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in v_buffers], dtype=torch.uint64, device=device
+            )
+            self._src_slot_stride = k_buffers[0].stride(0)
+            self._src_head_stride = k_buffers[0].stride(1)
+
+        # Step 1: Gather KV data to pinned buffer using single-kernel Triton (device->host)
         t0_gather = time.perf_counter()
-        gather_kv(
-            k_buffers=k_buffers,
-            v_buffers=v_buffers,
+        gather_kv_all_layers(
+            k_data_ptrs=self._k_data_ptrs,
+            v_data_ptrs=self._v_data_ptrs,
             slot_indices=slot_indices_tensor,
             pinned_output=self.triton_pinned_buffer,
             head_start=head_start,
             num_heads_to_gather=num_heads_to_send,
-            staging_buffer=self.triton_staging_buffer,
+            num_layers=num_layers,
+            head_dim=head_dim,
+            src_slot_stride=self._src_slot_stride,
+            src_head_stride=self._src_head_stride,
         )
         torch.cuda.synchronize()  # Ensure gather is complete
         t1_gather = time.perf_counter()
@@ -736,7 +752,7 @@ class NixlKVManager(CommonKVManager):
         transfer_mb = transfer_bytes / 1e6
         gather_speed_gb_s = transfer_bytes / gather_ms / 1e6
         logger.info(
-            f"[TRITON-KV] Device->Host transfer (gather_kv) took {gather_ms:.2f}ms "
+            f"[TRITON-KV] Device->Host transfer (gather_kv_all_layers) took {gather_ms:.2f}ms "
             f"({transfer_mb:.2f}MB, {gather_speed_gb_s:.2f} GB/s)"
         )
 
@@ -815,8 +831,8 @@ class NixlKVManager(CommonKVManager):
             head_start: First head index to scatter to (for head slicing)
             num_heads_received: Number of heads received
         """
-        _, scatter_kv = _import_triton_kv_transfer()
-        if scatter_kv is None:
+        _, scatter_kv_all_layers = _import_triton_kv_transfer()
+        if scatter_kv_all_layers is None:
             raise RuntimeError(
                 "[TRITON-KV] Triton KV transfer not available. "
                 "Make sure triton is installed."
@@ -841,6 +857,8 @@ class NixlKVManager(CommonKVManager):
         num_layers = len(k_buffers)
         num_heads = k_buffers[0].shape[1]
         head_dim = k_buffers[0].shape[2]
+        dtype = k_buffers[0].dtype
+        device = k_buffers[0].device
 
         if num_heads_received is None:
             num_heads_received = num_heads - head_start
@@ -848,8 +866,8 @@ class NixlKVManager(CommonKVManager):
         # Convert page indices to slot indices (each page has page_size slots)
         page_size = self.kv_args.page_size
         slot_indices_tensor = self._expand_pages_to_slots(
-            kv_indices, page_size, k_buffers[0].device
-        )
+            kv_indices, page_size, device
+        ).to(torch.int32)
         num_tokens = len(slot_indices_tensor)
 
         logger.debug(
@@ -858,21 +876,34 @@ class NixlKVManager(CommonKVManager):
         )
 
         # Calculate transfer size for bandwidth measurement
-        dtype = k_buffers[0].dtype
         bytes_per_element = 2 if dtype in (torch.float16, torch.bfloat16) else 4
-        head_dim = k_buffers[0].shape[2]
         transfer_elements = num_layers * 2 * num_tokens * num_heads_received * head_dim
         transfer_bytes = transfer_elements * bytes_per_element
 
-        # Scatter from pinned buffer to KV cache (host->device)
+        # Create pointer tensors for single-kernel scatter (cached for reuse)
+        if not hasattr(self, '_k_data_ptrs') or self._k_data_ptrs is None:
+            self._k_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in k_buffers], dtype=torch.uint64, device=device
+            )
+            self._v_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in v_buffers], dtype=torch.uint64, device=device
+            )
+            self._dst_slot_stride = k_buffers[0].stride(0)
+            self._dst_head_stride = k_buffers[0].stride(1)
+
+        # Scatter from pinned buffer to KV cache using single-kernel (host->device)
         t0_scatter = time.perf_counter()
-        scatter_kv(
+        scatter_kv_all_layers(
             pinned_input=self.triton_pinned_buffer,
-            k_buffers=k_buffers,
-            v_buffers=v_buffers,
+            k_data_ptrs=self._k_data_ptrs,
+            v_data_ptrs=self._v_data_ptrs,
             slot_indices=slot_indices_tensor,
             head_start=head_start,
             num_heads_to_scatter=num_heads_received,
+            num_layers=num_layers,
+            head_dim=head_dim,
+            dst_slot_stride=self._dst_slot_stride,
+            dst_head_stride=self._dst_head_stride,
         )
         torch.cuda.synchronize()  # Ensure scatter is complete
         t1_scatter = time.perf_counter()
@@ -880,7 +911,7 @@ class NixlKVManager(CommonKVManager):
         transfer_mb = transfer_bytes / 1e6
         scatter_speed_gb_s = transfer_bytes / scatter_ms / 1e6
         logger.info(
-            f"[TRITON-KV] Host->Device transfer (scatter_kv) took {scatter_ms:.2f}ms "
+            f"[TRITON-KV] Host->Device transfer (scatter_kv_all_layers) took {scatter_ms:.2f}ms "
             f"({transfer_mb:.2f}MB, {scatter_speed_gb_s:.2f} GB/s)"
         )
 
