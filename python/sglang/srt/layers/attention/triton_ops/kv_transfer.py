@@ -174,6 +174,7 @@ def gather_kv_to_pinned_all_layers(
     head_dim: int,
     src_slot_stride: int,  # stride between slots in source (num_heads * head_dim)
     src_head_stride: int,  # stride between heads in source (head_dim)
+    kv_elem_bytes: int = None,  # element size of KV cache (1 for fp8, 2 for fp16/bf16)
 ) -> None:
     """
     Gather KV data from ALL layers using a SINGLE kernel launch.
@@ -191,6 +192,7 @@ def gather_kv_to_pinned_all_layers(
         head_dim: Dimension of each head
         src_slot_stride: Stride between slots in source buffers (num_heads * head_dim)
         src_head_stride: Stride between heads in source buffers (head_dim)
+        kv_elem_bytes: Element size of KV cache in bytes. Must match pinned_output.element_size().
 
     Output layout: [num_heads_to_gather, num_layers, 2, num_tokens, head_dim] (HEAD-FIRST)
     """
@@ -198,6 +200,15 @@ def gather_kv_to_pinned_all_layers(
     assert slot_indices.is_cuda, "slot_indices must be on GPU"
     assert k_data_ptrs.dtype == torch.uint64, "k_data_ptrs must be uint64"
     assert v_data_ptrs.dtype == torch.uint64, "v_data_ptrs must be uint64"
+
+    # Validate element size consistency between KV cache and pinned buffer
+    pinned_elem_bytes = pinned_output.element_size()
+    if kv_elem_bytes is not None:
+        assert pinned_elem_bytes == kv_elem_bytes, (
+            f"KV cache element size ({kv_elem_bytes} bytes) does not match "
+            f"pinned buffer element size ({pinned_elem_bytes} bytes). "
+            f"The pinned buffer dtype must match the KV cache dtype."
+        )
 
     num_tokens = slot_indices.shape[0]
 
@@ -388,6 +399,7 @@ def scatter_kv_with_staging_all_layers(
     head_dim: int,
     dst_slot_stride: int,  # stride between slots in dest (num_heads * head_dim)
     dst_head_stride: int,  # stride between heads in dest (head_dim)
+    kv_elem_bytes: int = None,  # element size of KV cache (1 for fp8, 2 for fp16/bf16)
 ) -> None:
     """
     Scatter KV data to ALL layers using a SINGLE kernel launch.
@@ -405,6 +417,7 @@ def scatter_kv_with_staging_all_layers(
         head_dim: Dimension of each head
         dst_slot_stride: Stride between slots in dest buffers
         dst_head_stride: Stride between heads in dest buffers
+        kv_elem_bytes: Element size of KV cache in bytes. Must match pinned_input.element_size().
 
     Input layout: [num_heads_to_scatter, num_layers, 2, num_tokens, head_dim] (HEAD-FIRST)
     """
@@ -412,6 +425,15 @@ def scatter_kv_with_staging_all_layers(
     assert slot_indices.is_cuda, "slot_indices must be on GPU"
     assert k_data_ptrs.dtype == torch.uint64, "k_data_ptrs must be uint64"
     assert v_data_ptrs.dtype == torch.uint64, "v_data_ptrs must be uint64"
+
+    # Validate element size consistency between KV cache and pinned buffer
+    pinned_elem_bytes = pinned_input.element_size()
+    if kv_elem_bytes is not None:
+        assert pinned_elem_bytes == kv_elem_bytes, (
+            f"KV cache element size ({kv_elem_bytes} bytes) does not match "
+            f"pinned buffer element size ({pinned_elem_bytes} bytes). "
+            f"The pinned buffer dtype must match the KV cache dtype."
+        )
 
     num_tokens = slot_indices.shape[0]
 

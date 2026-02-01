@@ -364,24 +364,38 @@ class NixlKVManager(CommonKVManager):
         # kv_data_lens contains the total bytes for each KV buffer (K and V for each layer)
         total_kv_bytes = sum(self.kv_args.kv_data_lens)
 
+        # Get dtype from KV cache buffers (supports fp8, fp16, bf16)
+        k_buffers = self.kv_args.k_buffers
+        if k_buffers is not None and len(k_buffers) > 0:
+            kv_dtype = k_buffers[0].dtype
+            kv_elem_bytes = k_buffers[0].element_size()
+        else:
+            # Fallback to bfloat16 if k_buffers not available yet
+            kv_dtype = torch.bfloat16
+            kv_elem_bytes = 2
+            logger.warning(
+                "[TRITON-KV] k_buffers not available, falling back to bfloat16. "
+                "This may cause issues if KV cache uses a different dtype (e.g., fp8)."
+            )
+
         # Allocate GPU staging buffer (fixed size, 256MB by default)
         staging_size_bytes = int(DEFAULT_TRITON_STAGING_BUFFER_SIZE_MB * 1e6)
-        staging_elements = staging_size_bytes // 2  # Assuming bfloat16/float16
+        staging_elements = staging_size_bytes // kv_elem_bytes
         self.triton_staging_buffer = torch.empty(
-            staging_elements, dtype=torch.bfloat16, device=f"cuda:{self.kv_args.gpu_id}"
+            staging_elements, dtype=kv_dtype, device=f"cuda:{self.kv_args.gpu_id}"
         )
 
         # Allocate pinned CPU buffer for KV transfer
         # Size matches KV pool to accommodate any transfer size and multi-rank offsets
         # For prefill_tp > decode_tp, multiple prefill ranks write at different offsets
         pinned_size_bytes = total_kv_bytes
-        pinned_elements = pinned_size_bytes // 2  # Assuming bfloat16/float16
+        pinned_elements = pinned_size_bytes // kv_elem_bytes
         self.triton_pinned_buffer = torch.empty(
-            pinned_elements, dtype=torch.bfloat16, pin_memory=True
+            pinned_elements, dtype=kv_dtype, pin_memory=True
         )
         logger.info(
             f"[TRITON-KV] Pinned buffer allocated: {pinned_size_bytes / 1e9:.2f}GB "
-            f"(matches KV pool size)"
+            f"(matches KV pool size, dtype={kv_dtype})"
         )
 
         logger.debug(
@@ -686,7 +700,7 @@ class NixlKVManager(CommonKVManager):
         num_tokens = len(slot_indices_tensor)
 
         # Calculate transfer size AFTER page-to-slot expansion
-        bytes_per_element = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+        bytes_per_element = k_buffers[0].element_size()
         transfer_elements = num_layers * 2 * num_tokens * num_heads_to_send * head_dim
         transfer_bytes = transfer_elements * bytes_per_element
 
@@ -745,6 +759,7 @@ class NixlKVManager(CommonKVManager):
             head_dim=head_dim,
             src_slot_stride=self._src_slot_stride,
             src_head_stride=self._src_head_stride,
+            kv_elem_bytes=bytes_per_element,
         )
         torch.cuda.synchronize()  # Ensure gather is complete
         t1_gather = time.perf_counter()
@@ -876,7 +891,7 @@ class NixlKVManager(CommonKVManager):
         )
 
         # Calculate transfer size for bandwidth measurement
-        bytes_per_element = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+        bytes_per_element = k_buffers[0].element_size()
         transfer_elements = num_layers * 2 * num_tokens * num_heads_received * head_dim
         transfer_bytes = transfer_elements * bytes_per_element
 
@@ -904,6 +919,7 @@ class NixlKVManager(CommonKVManager):
             head_dim=head_dim,
             dst_slot_stride=self._dst_slot_stride,
             dst_head_stride=self._dst_head_stride,
+            kv_elem_bytes=bytes_per_element,
         )
         torch.cuda.synchronize()  # Ensure scatter is complete
         t1_scatter = time.perf_counter()
