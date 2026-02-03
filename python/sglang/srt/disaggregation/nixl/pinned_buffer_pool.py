@@ -75,19 +75,27 @@ class PinnedBufferPool:
         self._warned_full = False
 
     def allocate(
-        self, size_bytes: int, timeout: float = 30.0
+        self, size_bytes: int, timeout: Optional[float] = None
     ) -> Tuple[int, torch.Tensor]:
         """
         Allocate a contiguous region of the given size.
-        Blocks if no space available.
+        Blocks if no space available until space is released.
+
+        Args:
+            size_bytes: Number of bytes to allocate
+            timeout: Optional timeout in seconds. None (default) waits indefinitely.
+                     Only use finite timeout for testing.
 
         Returns: (offset_bytes, buffer_view)
         """
         # Align to 256 bytes for better memory access
         aligned_size = ((size_bytes + 255) // 256) * 256
+        log_interval = 10.0  # Log status every 10 seconds while waiting
 
         with self._range_available:
-            deadline = time.time() + timeout
+            deadline = time.time() + timeout if timeout is not None else None
+            last_log_time = 0.0
+
             while True:
                 # Try to find a free region (first-fit)
                 offset = self._find_free_region(aligned_size)
@@ -103,27 +111,35 @@ class PinnedBufferPool:
                     end_elem = start_elem + (aligned_size // elem_size)
                     return offset, self._buffer[start_elem:end_elem]
 
-                # No space - warn once and wait for release
-                if not self._warned_full:
+                # No space - log status periodically
+                now = time.time()
+                if now - last_log_time >= log_interval:
+                    allocated_bytes = sum(e - s for s, e in self._allocated_ranges)
                     logger.warning(
-                        f"[PinnedBufferPool] Buffer full (GPU {self.gpu_id}). "
-                        f"Waiting for space. Needed {size_bytes / 1e6:.2f}MB, "
-                        f"total buffer size {self.total_size_bytes / 1e9:.2f}GB. "
-                        f"Consider increasing --pinned-buffer-max-gb if this occurs frequently."
+                        f"[PinnedBufferPool] GPU {self.gpu_id}: Waiting for space. "
+                        f"Need {size_bytes / 1e6:.1f}MB, "
+                        f"buffer {allocated_bytes / 1e6:.1f}/{self.total_size_bytes / 1e6:.1f}MB used, "
+                        f"{len(self._allocated_ranges)} active allocations. "
+                        f"Consider increasing --pinned-buffer-max-gb if this persists."
                     )
-                    self._warned_full = True
+                    last_log_time = now
 
-                # No space - wait for release
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    raise RuntimeError(
-                        f"[PinnedBufferPool] Timeout waiting for pinned buffer space. "
-                        f"Needed {size_bytes} bytes ({size_bytes / 1e6:.2f}MB), "
-                        f"total buffer {self.total_size_bytes} bytes ({self.total_size_bytes / 1e9:.2f}GB), "
-                        f"allocated ranges: {len(self._allocated_ranges)}. "
-                        f"Consider increasing --pinned-buffer-max-gb."
-                    )
-                self._range_available.wait(timeout=remaining)
+                # Check timeout (only used for testing)
+                if deadline is not None:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        raise RuntimeError(
+                            f"[PinnedBufferPool] Timeout waiting for pinned buffer space. "
+                            f"Needed {size_bytes} bytes ({size_bytes / 1e6:.2f}MB), "
+                            f"total buffer {self.total_size_bytes} bytes ({self.total_size_bytes / 1e9:.2f}GB), "
+                            f"allocated ranges: {len(self._allocated_ranges)}. "
+                            f"Consider increasing --pinned-buffer-max-gb."
+                        )
+                    wait_time = min(remaining, log_interval)
+                else:
+                    wait_time = log_interval
+
+                self._range_available.wait(timeout=wait_time)
 
     def _find_free_region(self, size_bytes: int) -> Optional[int]:
         """Find first free region that can fit size_bytes. Returns offset or None."""
