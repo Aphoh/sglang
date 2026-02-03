@@ -397,6 +397,13 @@ class NixlKVManager(CommonKVManager):
         if agent_name in self.decode_kv_args_table:
             logger.info(f"Peer {agent_name} was already registered, ignoring.")
             return
+        logger.debug(
+            f"[TRITON-KV] Registering remote peer {agent_name}: "
+            f"dst_pinned_ptr=0x{decode_kv_args.dst_pinned_ptr:x}, "
+            f"dst_pinned_size={decode_kv_args.dst_pinned_size}, "
+            f"decode_tp_size={decode_kv_args.decode_tp_size}, "
+            f"decode_tp_rank={decode_kv_args.decode_tp_rank}"
+        )
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
 
@@ -774,6 +781,14 @@ class NixlKVManager(CommonKVManager):
                 f"Overflow by {required_end - dst_pinned_size} bytes ({(required_end - dst_pinned_size) / 1e6:.2f} MB)"
             )
 
+        # Check for invalid destination pointer
+        if dst_pinned_ptr == 0:
+            self._pinned_pool.release(src_offset)
+            raise RuntimeError(
+                f"[TRITON-KV] Invalid dst_pinned_ptr=0 for {peer_name}. "
+                f"The receiver may not have a pinned buffer pool configured."
+            )
+
         # Use allocated region's data pointer for source address
         src_addrs = [
             (buffer_region.data_ptr(), transfer_bytes, 0)
@@ -926,6 +941,20 @@ class NixlKVManager(CommonKVManager):
 
             src_addrs = [(src_slice_ptr, slice_bytes, 0)]
             dst_addrs = [(dst_pinned_ptr + dst_offset, slice_bytes, 0)]
+
+            logger.debug(
+                f"[TRITON-KV-BATCHED] Creating transfer to {agent_name}: "
+                f"src_ptr=0x{src_slice_ptr:x}, dst_ptr=0x{dst_pinned_ptr:x}, "
+                f"dst_size={dst_pinned_size}, slice_bytes={slice_bytes}"
+            )
+
+            # Check for invalid destination pointer
+            if dst_pinned_ptr == 0:
+                self._pinned_pool.release(src_offset)
+                raise RuntimeError(
+                    f"[TRITON-KV-BATCHED] Invalid dst_pinned_ptr=0 for {agent_name}. "
+                    f"The receiver may not have a pinned buffer pool configured."
+                )
 
             src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
             dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
@@ -1694,6 +1723,15 @@ class NixlKVReceiver(CommonKVReceiver):
                 and self.kv_mgr._pinned_pool is not None
             ):
                 pinned_ptr, pinned_size = self.kv_mgr._pinned_pool.get_buffer_info()
+                logger.debug(
+                    f"[TRITON-KV] Receiver sending pinned buffer info: "
+                    f"ptr=0x{pinned_ptr:x}, size={pinned_size / 1e9:.2f}GB"
+                )
+            elif self.kv_mgr.kv_transfer_method == "triton":
+                logger.warning(
+                    f"[TRITON-KV] Receiver has kv_transfer_method=triton but "
+                    f"_pinned_pool is None. Triton transfer will fail!"
+                )
 
             with lock:
                 sock.send_multipart(

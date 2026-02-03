@@ -71,7 +71,8 @@ class PinnedBufferPool:
         self._range_lock = threading.Lock()
         self._range_available = threading.Condition(self._range_lock)
 
-        self._nixl_descs = None
+        # Track NIXL registrations per agent (each agent needs its own registration)
+        self._nixl_descs_by_agent: Dict[str, Any] = {}
         self._warned_full = False
 
     def allocate(
@@ -186,20 +187,31 @@ class PinnedBufferPool:
         return (self._buffer.data_ptr(), self._buffer.nbytes)
 
     def register_with_nixl(self, agent) -> Any:
-        """Register full buffer with NIXL agent (only once)."""
-        if self._nixl_descs is not None:
-            return self._nixl_descs
-        addr = [(self._buffer.data_ptr(), self._buffer.nbytes, 0, "")]
-        self._nixl_descs = agent.register_memory(addr, "DRAM")
-        if not self._nixl_descs:
-            raise Exception(
-                "[PinnedBufferPool] NIXL memory registration failed for pinned buffer"
+        """Register full buffer with NIXL agent.
+
+        Each NIXL agent needs its own registration, even for the same buffer.
+        This is because NIXL descriptors are agent-specific.
+        """
+        agent_name = agent.name
+        if agent_name in self._nixl_descs_by_agent:
+            logger.debug(
+                f"[PinnedBufferPool] Buffer already registered with agent {agent_name}"
             )
+            return self._nixl_descs_by_agent[agent_name]
+
+        addr = [(self._buffer.data_ptr(), self._buffer.nbytes, 0, "")]
+        descs = agent.register_memory(addr, "DRAM")
+        if not descs:
+            raise Exception(
+                f"[PinnedBufferPool] NIXL memory registration failed for pinned buffer "
+                f"with agent {agent_name}"
+            )
+        self._nixl_descs_by_agent[agent_name] = descs
         logger.info(
-            f"[PinnedBufferPool] Registered pinned buffer with NIXL: "
+            f"[PinnedBufferPool] Registered pinned buffer with NIXL agent {agent_name}: "
             f"{self._buffer.nbytes / 1e9:.2f}GB"
         )
-        return self._nixl_descs
+        return descs
 
     @property
     def buffer(self) -> torch.Tensor:
