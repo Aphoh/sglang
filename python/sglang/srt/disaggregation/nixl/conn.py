@@ -1155,6 +1155,32 @@ class NixlKVManager(CommonKVManager):
                     and not self.is_mla_backend
                 )
 
+                # Error if sender_tp < receiver_tp but batched Triton can't be used
+                if (
+                    self.kv_transfer_method == "triton"
+                    and prefill_tp_size < decode_tp_size
+                    and not use_batched
+                ):
+                    reasons = []
+                    missing_pinned = [
+                        r.agent_name for r in active_reqs
+                        if self.decode_kv_args_table[r.agent_name].dst_pinned_ptr == 0
+                    ]
+                    if missing_pinned:
+                        reasons.append(f"receivers missing pinned buffer: {missing_pinned}")
+                    if self.kv_args.k_buffers is None:
+                        reasons.append("sender k_buffers is None")
+                    if self.kv_args.v_buffers is None:
+                        reasons.append("sender v_buffers is None")
+                    if self.is_mla_backend:
+                        reasons.append("MLA backend not supported for mixed TP Triton transfer")
+                    raise RuntimeError(
+                        f"[TRITON-KV] Mixed TP transfer (sender_tp={prefill_tp_size}, "
+                        f"receiver_tp={decode_tp_size}) requires batched Triton transfer, "
+                        f"but it could not be enabled. Reasons: {', '.join(reasons)}. "
+                        f"Legacy transfer is not supported for sender_tp < receiver_tp."
+                    )
+
                 if use_batched:
                     # Collect batch request info
                     num_kv_heads = self.kv_args.kv_head_num
@@ -1293,6 +1319,24 @@ class NixlKVManager(CommonKVManager):
                     notif,
                 )
             else:
+                # Mixed TP sizes require Triton transfer - legacy is too slow
+                if self.kv_transfer_method == "triton":
+                    # Triton was requested but couldn't be used - provide detailed error
+                    reasons = []
+                    if decode_info.dst_pinned_ptr == 0:
+                        reasons.append("receiver has no pinned buffer (dst_pinned_ptr=0)")
+                    if self.kv_args.k_buffers is None:
+                        reasons.append("sender k_buffers is None")
+                    if self.kv_args.v_buffers is None:
+                        reasons.append("sender v_buffers is None")
+                    raise RuntimeError(
+                        f"[TRITON-KV] Mixed TP transfer (sender_tp={prefill_tp_size}, "
+                        f"receiver_tp={decode_tp_size}) requires Triton transfer, but it "
+                        f"could not be enabled. Reasons: {', '.join(reasons)}. "
+                        f"Legacy send_kvcache_slice is not supported for mixed TP."
+                    )
+                # Legacy path - only allowed for same TP size (handled above)
+                # This branch should not be reachable for mixed TP when triton is requested
                 kv_xfer_handle = self.send_kvcache_slice(
                     req.agent_name,
                     kv_indices,

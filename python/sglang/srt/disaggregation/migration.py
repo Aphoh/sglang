@@ -132,6 +132,24 @@ class SchedulerMigrationMixin:
             kv_args.kv_head_num = token_to_kv_pool.head_num
         kv_args.page_size = token_to_kv_pool.page_size
 
+        # Add tensor buffer references for Triton KV transfer
+        if getattr(self.server_args, "kv_transfer_method", "legacy") == "triton":
+            if hasattr(token_to_kv_pool, "k_buffer") and hasattr(
+                token_to_kv_pool, "v_buffer"
+            ):
+                kv_args.k_buffers = token_to_kv_pool.k_buffer
+                kv_args.v_buffers = token_to_kv_pool.v_buffer
+                kv_args.head_dim = token_to_kv_pool.head_dim
+                logger.debug(
+                    f"[TRITON-KV] Migration: Populated tensor buffers for Triton transfer: "
+                    f"{len(kv_args.k_buffers)} layers, head_dim={kv_args.head_dim}"
+                )
+            else:
+                logger.warning(
+                    "[TRITON-KV] Migration: Cannot enable Triton transfer: "
+                    "KV pool does not have k_buffer/v_buffer"
+                )
+
         # Handle auxiliary metadata buffers if available
         if (
             hasattr(self, "disagg_metadata_buffers")
