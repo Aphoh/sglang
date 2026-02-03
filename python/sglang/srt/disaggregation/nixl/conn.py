@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.disaggregation.nixl.pinned_buffer_pool import PinnedBufferPool
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
@@ -181,8 +182,10 @@ class NixlKVManager(CommonKVManager):
         # Store KV transfer method configuration
         self.kv_transfer_method = getattr(server_args, "kv_transfer_method", "legacy")
         self.triton_staging_buffer: Optional[torch.Tensor] = None
-        self.triton_pinned_buffer: Optional[torch.Tensor] = None
+        self._pinned_pool: Optional[PinnedBufferPool] = None
         self.triton_pinned_descs = None
+        # Store server_args for pinned buffer configuration
+        self._server_args = server_args
 
         # Initialize Triton transfer infrastructure if enabled
         if self.kv_transfer_method == "triton":
@@ -345,25 +348,12 @@ class NixlKVManager(CommonKVManager):
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
 
-        # Register Triton pinned buffer with NIXL if enabled
-        if self.kv_transfer_method == "triton" and self.triton_pinned_buffer is not None:
-            pinned_addr = [
-                (self.triton_pinned_buffer.data_ptr(), self.triton_pinned_buffer.nbytes, 0, "")
-            ]
-            self.triton_pinned_descs = self.agent.register_memory(pinned_addr, "DRAM")
-            if not self.triton_pinned_descs:
-                raise Exception("NIXL memory registration failed for Triton pinned buffer")
-            logger.debug(
-                f"[TRITON-KV] Registered pinned buffer with NIXL: "
-                f"{self.triton_pinned_buffer.nbytes / 1e6:.2f}MB"
-            )
+        # Register shared pinned buffer pool with NIXL if enabled
+        if self.kv_transfer_method == "triton" and self._pinned_pool is not None:
+            self.triton_pinned_descs = self._pinned_pool.register_with_nixl(self.agent)
 
     def _init_triton_transfer_buffers(self):
-        """Initialize GPU staging buffer and pinned CPU buffer for Triton KV transfer."""
-        # Calculate total KV size to determine pinned buffer size
-        # kv_data_lens contains the total bytes for each KV buffer (K and V for each layer)
-        total_kv_bytes = sum(self.kv_args.kv_data_lens)
-
+        """Initialize GPU staging buffer and shared pinned buffer pool for Triton KV transfer."""
         # Get dtype from KV cache buffers (supports fp8, fp16, bf16)
         k_buffers = self.kv_args.k_buffers
         if k_buffers is not None and len(k_buffers) > 0:
@@ -385,24 +375,21 @@ class NixlKVManager(CommonKVManager):
             staging_elements, dtype=kv_dtype, device=f"cuda:{self.kv_args.gpu_id}"
         )
 
-        # Allocate pinned CPU buffer for KV transfer
-        # Size matches KV pool to accommodate any transfer size and multi-rank offsets
-        # For prefill_tp > decode_tp, multiple prefill ranks write at different offsets
-        pinned_size_bytes = total_kv_bytes
-        pinned_elements = pinned_size_bytes // kv_elem_bytes
-        self.triton_pinned_buffer = torch.empty(
-            pinned_elements, dtype=kv_dtype, pin_memory=True
+        # Get or create shared pinned buffer pool for this GPU
+        # Uses configurable size from --pinned-buffer-max-gb (default 64GB)
+        pinned_size_bytes = int(
+            getattr(self._server_args, "pinned_buffer_max_gb", 64.0) * 1e9
         )
-        logger.info(
-            f"[TRITON-KV] Pinned buffer allocated: {pinned_size_bytes / 1e9:.2f}GB "
-            f"(matches KV pool size, dtype={kv_dtype})"
+        self._pinned_pool = PinnedBufferPool.get_or_create(
+            gpu_id=self.kv_args.gpu_id,
+            dtype=kv_dtype,
+            total_size_bytes=pinned_size_bytes,
         )
 
         logger.debug(
             f"[TRITON-KV] Initialized transfer buffers: "
             f"staging={self.triton_staging_buffer.nbytes / 1e6:.2f}MB (GPU), "
-            f"pinned={self.triton_pinned_buffer.nbytes / 1e6:.2f}MB (CPU), "
-            f"total_kv_capacity={total_kv_bytes / 1e9:.2f}GB"
+            f"shared_pinned_pool={pinned_size_bytes / 1e9:.2f}GB (CPU)"
         )
 
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
@@ -650,10 +637,11 @@ class NixlKVManager(CommonKVManager):
         Send KV cache using Triton gather kernel + single NIXL transfer.
 
         This method:
-        1. Uses gather_kv_to_pinned_all_layers to collect scattered KV data into local pinned buffer
+        1. Allocates a region from the shared pinned buffer pool
+        2. Uses gather_kv_to_pinned_all_layers to collect scattered KV data into the region
            (single kernel launch for all layers)
-        2. Transfers the contiguous pinned buffer to destination pinned buffer via NIXL
-        3. Destination will use scatter_kv to distribute to its KV cache
+        3. Transfers the contiguous pinned buffer to destination pinned buffer via NIXL
+        4. Destination will use scatter_kv to distribute to its KV cache
 
         This reduces NIXL descriptor count from O(tokens × layers) to O(1).
 
@@ -680,13 +668,19 @@ class NixlKVManager(CommonKVManager):
                 "when using Triton KV transfer."
             )
 
+        # Validate we have shared pinned pool
+        if self._pinned_pool is None:
+            raise RuntimeError(
+                "[TRITON-KV] Pinned buffer pool not initialized. "
+                "Ensure Triton transfer is enabled."
+            )
+
         # Get tensor buffers (these should be the same as kv_data_ptrs)
         k_buffers = self.kv_args.k_buffers
         v_buffers = self.kv_args.v_buffers
         num_layers = len(k_buffers)
         num_heads = k_buffers[0].shape[1]
         head_dim = k_buffers[0].shape[2]
-        dtype = k_buffers[0].dtype
         device = k_buffers[0].device
 
         if num_heads_to_send is None:
@@ -704,35 +698,13 @@ class NixlKVManager(CommonKVManager):
         transfer_elements = num_layers * 2 * num_tokens * num_heads_to_send * head_dim
         transfer_bytes = transfer_elements * bytes_per_element
 
-        # Ensure pinned buffer is large enough
-        if self.triton_pinned_buffer is None or self.triton_pinned_buffer.nbytes < transfer_bytes:
-            # Reallocate pinned buffer if needed
-            logger.info(
-                f"[TRITON-KV] Reallocating pinned buffer: "
-                f"{transfer_bytes / 1e6:.2f}MB needed"
-            )
-            t0_alloc = time.perf_counter()
-            self.triton_pinned_buffer = torch.empty(
-                transfer_elements, dtype=dtype, pin_memory=True
-            )
-            t1_alloc = time.perf_counter()
-            alloc_ms = (t1_alloc - t0_alloc) * 1000
-            logger.info(
-                f"[TRITON-KV] CPU pinned buffer allocation took {alloc_ms:.2f}ms "
-                f"({transfer_bytes / 1e6:.2f}MB)"
-            )
-            # Re-register with NIXL
-            pinned_addr = [
-                (self.triton_pinned_buffer.data_ptr(), self.triton_pinned_buffer.nbytes, 0, "")
-            ]
-            self.triton_pinned_descs = self.agent.register_memory(pinned_addr, "DRAM")
-            if not self.triton_pinned_descs:
-                raise Exception("NIXL memory registration failed for Triton pinned buffer")
+        # Allocate region from shared pinned buffer pool
+        src_offset, buffer_region = self._pinned_pool.allocate(transfer_bytes)
 
         logger.debug(
             f"[TRITON-KV] send_kvcache_triton: {num_tokens} tokens, {num_layers} layers, "
             f"heads [{head_start}:{head_start + num_heads_to_send}], "
-            f"transfer_size={transfer_bytes / 1e6:.2f}MB"
+            f"transfer_size={transfer_bytes / 1e6:.2f}MB, pool_offset={src_offset}"
         )
 
         # Create pointer tensors for single-kernel gather (cached for reuse)
@@ -746,13 +718,13 @@ class NixlKVManager(CommonKVManager):
             self._src_slot_stride = k_buffers[0].stride(0)
             self._src_head_stride = k_buffers[0].stride(1)
 
-        # Step 1: Gather KV data to pinned buffer using single-kernel Triton (device->host)
+        # Step 1: Gather KV data to allocated region using single-kernel Triton (device->host)
         t0_gather = time.perf_counter()
         gather_kv_all_layers(
             k_data_ptrs=self._k_data_ptrs,
             v_data_ptrs=self._v_data_ptrs,
             slot_indices=slot_indices_tensor,
-            pinned_output=self.triton_pinned_buffer,
+            pinned_output=buffer_region,
             head_start=head_start,
             num_heads_to_gather=num_heads_to_send,
             num_layers=num_layers,
@@ -802,8 +774,9 @@ class NixlKVManager(CommonKVManager):
                 f"Overflow by {required_end - dst_pinned_size} bytes ({(required_end - dst_pinned_size) / 1e6:.2f} MB)"
             )
 
+        # Use allocated region's data pointer for source address
         src_addrs = [
-            (self.triton_pinned_buffer.data_ptr(), transfer_bytes, 0)
+            (buffer_region.data_ptr(), transfer_bytes, 0)
         ]
         dst_addrs = [
             (dst_pinned_ptr + dst_offset, transfer_bytes, 0)
@@ -816,10 +789,14 @@ class NixlKVManager(CommonKVManager):
             "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
         )
         if not xfer_handle:
+            # Release allocation on failure
+            self._pinned_pool.release(src_offset)
             raise Exception("[TRITON-KV] Failed to create Triton KV transfer")
 
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
+            # Release allocation on failure
+            self._pinned_pool.release(src_offset)
             raise Exception("[TRITON-KV] Failed to post Triton KV transfer")
 
         logger.debug(
@@ -827,7 +804,8 @@ class NixlKVManager(CommonKVManager):
             f"({num_tokens} tokens × {num_layers} layers)"
         )
 
-        return xfer_handle
+        # Return handle and pool allocation info for later release
+        return (xfer_handle, self._pinned_pool, src_offset)
 
     def scatter_received_kv(
         self,
@@ -860,9 +838,9 @@ class NixlKVManager(CommonKVManager):
                 "when using Triton KV transfer."
             )
 
-        if self.triton_pinned_buffer is None:
+        if self._pinned_pool is None:
             raise RuntimeError(
-                "[TRITON-KV] Pinned buffer not initialized. "
+                "[TRITON-KV] Pinned buffer pool not initialized. "
                 "Ensure Triton transfer is enabled."
             )
 
@@ -872,7 +850,6 @@ class NixlKVManager(CommonKVManager):
         num_layers = len(k_buffers)
         num_heads = k_buffers[0].shape[1]
         head_dim = k_buffers[0].shape[2]
-        dtype = k_buffers[0].dtype
         device = k_buffers[0].device
 
         if num_heads_received is None:
@@ -906,10 +883,10 @@ class NixlKVManager(CommonKVManager):
             self._dst_slot_stride = k_buffers[0].stride(0)
             self._dst_head_stride = k_buffers[0].stride(1)
 
-        # Scatter from pinned buffer to KV cache using single-kernel (host->device)
+        # Scatter from shared pool's buffer to KV cache using single-kernel (host->device)
         t0_scatter = time.perf_counter()
         scatter_kv_all_layers(
-            pinned_input=self.triton_pinned_buffer,
+            pinned_input=self._pinned_pool.buffer,
             k_data_ptrs=self._k_data_ptrs,
             v_data_ptrs=self._v_data_ptrs,
             slot_indices=slot_indices_tensor,
@@ -994,12 +971,21 @@ class NixlKVManager(CommonKVManager):
         chunk_id: int,
         aux_index: Optional[int] = None,
     ):
+        """
+        Add a transfer request for KV cache data.
+
+        Returns:
+            Tuple of (handles, pool_allocations) where:
+            - handles: List of NIXL transfer handles
+            - pool_allocations: List of (pool, offset) tuples for later release
+        """
         # Only require aux_index if we have aux data to send (e.g., for EAGLE speculation)
         has_aux_data = len(self.kv_args.aux_data_ptrs) > 0
         assert not is_last or not has_aux_data or aux_index is not None
 
         reqs_to_be_processed = self.transfer_infos[bootstrap_room].values()
         handles = []
+        pool_allocations = []
         for req in reqs_to_be_processed:
             assert bootstrap_room == req.room
             if req.is_dummy():
@@ -1072,7 +1058,8 @@ class NixlKVManager(CommonKVManager):
                     f"prefill_tp={prefill_tp_size}, decode_tp={decode_tp_size}"
                 )
 
-                kv_xfer_handle = self.send_kvcache_triton(
+                # send_kvcache_triton returns (handle, pool, offset)
+                kv_xfer_handle, pool, offset = self.send_kvcache_triton(
                     peer_name=req.agent_name,
                     prefill_kv_indices=kv_indices,
                     dst_pinned_ptr=decode_info.dst_pinned_ptr,
@@ -1082,6 +1069,7 @@ class NixlKVManager(CommonKVManager):
                     num_heads_to_send=num_heads_to_send,
                     dst_head_offset=dst_head_offset,
                 )
+                pool_allocations.append((pool, offset))
             elif self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
                 kv_xfer_handle = self.send_kvcache(
                     req.agent_name,
@@ -1119,7 +1107,7 @@ class NixlKVManager(CommonKVManager):
                 handles.append(aux_xfer_handle)
         if is_last:
             del self.transfer_infos[bootstrap_room]
-        return handles
+        return handles, pool_allocations
 
     def update_transfer_status(self):
         # Process notifications from received transfers.
@@ -1224,6 +1212,9 @@ class NixlKVSender(CommonKVSender):
     ):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
         self.xfer_handles = []
+        # Track pool allocations for release when transfer completes
+        # List of (pool, offset) tuples
+        self._pool_allocations: List[tuple] = []
         self.has_sent = False
         self.chunk_id = 0
 
@@ -1243,7 +1234,7 @@ class NixlKVSender(CommonKVSender):
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
 
-        new_xfer_handles = self.kv_mgr.add_transfer_request(
+        new_xfer_handles, new_pool_allocations = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
             index_slice,
@@ -1252,6 +1243,7 @@ class NixlKVSender(CommonKVSender):
             self.aux_index,
         )
         self.xfer_handles.extend(new_xfer_handles)
+        self._pool_allocations.extend(new_pool_allocations)
         self.chunk_id += 1
         if is_last:
             self.has_sent = True
@@ -1262,8 +1254,16 @@ class NixlKVSender(CommonKVSender):
             return self.kv_mgr.check_status(self.bootstrap_room)
         states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
         if all([x == "DONE" for x in states]):
+            # Release pool allocations now that all transfers are complete
+            for pool, offset in self._pool_allocations:
+                pool.release(offset)
+            self._pool_allocations.clear()
             return KVPoll.Success  # type: ignore
         if any([x == "ERR" for x in states]):
+            # Release pool allocations on error too
+            for pool, offset in self._pool_allocations:
+                pool.release(offset)
+            self._pool_allocations.clear()
             raise Exception("KVSender transfer encountered an error.")
         return KVPoll.WaitingForInput  # type: ignore
 
@@ -1428,15 +1428,14 @@ class NixlKVReceiver(CommonKVReceiver):
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
 
-            # Get pinned buffer info for Triton KV transfer
+            # Get pinned buffer info for Triton KV transfer (from shared pool)
             pinned_ptr = 0
             pinned_size = 0
             if (
                 self.kv_mgr.kv_transfer_method == "triton"
-                and self.kv_mgr.triton_pinned_buffer is not None
+                and self.kv_mgr._pinned_pool is not None
             ):
-                pinned_ptr = self.kv_mgr.triton_pinned_buffer.data_ptr()
-                pinned_size = self.kv_mgr.triton_pinned_buffer.nbytes
+                pinned_ptr, pinned_size = self.kv_mgr._pinned_pool.get_buffer_info()
 
             with lock:
                 sock.send_multipart(

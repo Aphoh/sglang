@@ -645,6 +645,8 @@ class ServerArgs:
     disaggregation_decode_polling_interval: int = 1
     # KV transfer method: "legacy" (per-slot RDMA) or "triton" (Triton gather/scatter + single transfer)
     kv_transfer_method: Literal["legacy", "triton"] = "legacy"
+    # Total size of pinned CPU buffer for triton KV transfers (GB)
+    pinned_buffer_max_gb: float = 64.0
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -4595,6 +4597,14 @@ class ServerArgs:
             help="KV transfer method. 'legacy' uses per-slot RDMA descriptors. "
             "'triton' uses Triton gather/scatter kernels with a single NIXL transfer, "
             "reducing descriptor count from O(tokens × layers) to O(1). Default is 'legacy'.",
+        )
+        parser.add_argument(
+            "--pinned-buffer-max-gb",
+            type=float,
+            default=ServerArgs.pinned_buffer_max_gb,
+            help="Total size of pinned CPU buffer for triton KV transfers (GB). "
+            "Used by range allocator for variable-sized concurrent transfers. "
+            "Should be sized for sum of max concurrent transfers. Default is 64.0.",
         )
 
         # Encode prefill disaggregation
