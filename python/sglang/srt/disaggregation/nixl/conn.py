@@ -807,6 +807,151 @@ class NixlKVManager(CommonKVManager):
         # Return handle and pool allocation info for later release
         return (xfer_handle, self._pinned_pool, src_offset)
 
+    def _send_kvcache_triton_batched(
+        self,
+        requests: List[tuple],  # List of (agent_name, dst_pinned_ptr, dst_pinned_size, notif, head_start, num_heads)
+        prefill_kv_indices: npt.NDArray[np.int32],
+        total_heads: int,
+    ):
+        """
+        Batched KV transfer: ONE gather of ALL heads, then slice buffer for parallel NIXL transfers.
+
+        This eliminates the performance bottleneck of doing N serial gathers when
+        sender_tp < receiver_tp (e.g., prefill TP=1 sending to decode TP=8).
+
+        Args:
+            requests: List of (agent_name, dst_pinned_ptr, dst_pinned_size, notif, head_start, num_heads)
+            prefill_kv_indices: Page indices to transfer
+            total_heads: Total number of KV heads on this prefill rank
+
+        Returns:
+            Tuple of (handles, pool_allocations)
+        """
+        gather_kv_all_layers, _ = _import_triton_kv_transfer()
+        if gather_kv_all_layers is None:
+            raise RuntimeError("[TRITON-KV] Triton KV transfer not available.")
+
+        if self.kv_args.k_buffers is None or self.kv_args.v_buffers is None:
+            raise RuntimeError("[TRITON-KV] k_buffers and v_buffers must be set.")
+
+        if self._pinned_pool is None:
+            raise RuntimeError("[TRITON-KV] Pinned buffer pool not initialized.")
+
+        # Get tensor buffers
+        k_buffers = self.kv_args.k_buffers
+        v_buffers = self.kv_args.v_buffers
+        num_layers = len(k_buffers)
+        head_dim = k_buffers[0].shape[2]
+        device = k_buffers[0].device
+
+        # Convert page indices to slot indices
+        page_size = self.kv_args.page_size
+        slot_indices_tensor = self._expand_pages_to_slots(
+            prefill_kv_indices, page_size, device
+        ).to(torch.int32)
+        num_tokens = len(slot_indices_tensor)
+
+        # Calculate total buffer size for ALL heads
+        bytes_per_element = k_buffers[0].element_size()
+        total_transfer_bytes = num_layers * 2 * num_tokens * total_heads * head_dim * bytes_per_element
+
+        # Allocate ONE buffer from pool for all heads
+        src_offset, buffer_region = self._pinned_pool.allocate(total_transfer_bytes)
+
+        logger.debug(
+            f"[TRITON-KV-BATCHED] Batched gather: {len(requests)} destinations, "
+            f"{num_tokens} tokens, {total_heads} heads, "
+            f"total_size={total_transfer_bytes / 1e6:.2f}MB"
+        )
+
+        # Create pointer tensors (cached for reuse)
+        if not hasattr(self, '_k_data_ptrs') or self._k_data_ptrs is None:
+            self._k_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in k_buffers], dtype=torch.uint64, device=device
+            )
+            self._v_data_ptrs = torch.tensor(
+                [x.data_ptr() for x in v_buffers], dtype=torch.uint64, device=device
+            )
+            self._src_slot_stride = k_buffers[0].stride(0)
+            self._src_head_stride = k_buffers[0].stride(1)
+
+        # Step 1: ONE gather of ALL heads
+        t0_gather = time.perf_counter()
+        gather_kv_all_layers(
+            k_data_ptrs=self._k_data_ptrs,
+            v_data_ptrs=self._v_data_ptrs,
+            slot_indices=slot_indices_tensor,
+            pinned_output=buffer_region,
+            head_start=0,  # Gather all heads starting from 0
+            num_heads_to_gather=total_heads,
+            num_layers=num_layers,
+            head_dim=head_dim,
+            src_slot_stride=self._src_slot_stride,
+            src_head_stride=self._src_head_stride,
+            kv_elem_bytes=bytes_per_element,
+        )
+        torch.cuda.synchronize()  # ONE synchronize for all destinations
+        t1_gather = time.perf_counter()
+        gather_ms = (t1_gather - t0_gather) * 1000
+        gather_speed_gb_s = total_transfer_bytes / gather_ms / 1e6
+
+        logger.debug(
+            f"[TRITON-KV-BATCHED] Single gather took {gather_ms:.2f}ms "
+            f"({total_transfer_bytes / 1e6:.2f}MB, {gather_speed_gb_s:.2f} GB/s) "
+            f"for {len(requests)} destinations"
+        )
+
+        # Step 2: Calculate head stride for slicing
+        # Buffer layout: [head, layer, kv, token, head_dim]
+        head_stride_bytes = num_layers * 2 * num_tokens * head_dim * bytes_per_element
+
+        # Step 3: Loop over requests, calculate slice offsets, initiate NIXL transfers
+        handles = []
+        for agent_name, dst_pinned_ptr, dst_pinned_size, notif, head_start, num_heads in requests:
+            # Calculate source slice pointer within our gathered buffer
+            src_slice_ptr = buffer_region.data_ptr() + head_start * head_stride_bytes
+            slice_bytes = num_heads * head_stride_bytes
+
+            # Destination offset is 0 since each decode rank has its own buffer
+            # and expects the data starting from the beginning
+            dst_offset = 0
+
+            # Debug check
+            if dst_offset + slice_bytes > dst_pinned_size:
+                logger.error(
+                    f"[TRITON-KV-BATCHED] BUFFER OVERFLOW! "
+                    f"dst_offset={dst_offset}, slice_bytes={slice_bytes}, "
+                    f"dst_pinned_size={dst_pinned_size}"
+                )
+
+            src_addrs = [(src_slice_ptr, slice_bytes, 0)]
+            dst_addrs = [(dst_pinned_ptr + dst_offset, slice_bytes, 0)]
+
+            src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
+            dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
+
+            xfer_handle = self.agent.initialize_xfer(
+                "WRITE", src_descs, dst_descs, agent_name, notif.encode("ascii")
+            )
+            if not xfer_handle:
+                self._pinned_pool.release(src_offset)
+                raise Exception(f"[TRITON-KV-BATCHED] Failed to create transfer to {agent_name}")
+
+            state = self.agent.transfer(xfer_handle)
+            if state == "ERR":
+                self._pinned_pool.release(src_offset)
+                raise Exception(f"[TRITON-KV-BATCHED] Failed to post transfer to {agent_name}")
+
+            handles.append(xfer_handle)
+            logger.debug(
+                f"[TRITON-KV-BATCHED] Transfer {agent_name}: "
+                f"heads=[{head_start}:{head_start + num_heads}], "
+                f"slice_bytes={slice_bytes / 1e6:.2f}MB"
+            )
+
+        # Return (handles, [(pool, offset)]) - single allocation for all transfers
+        return handles, [(self._pinned_pool, src_offset)]
+
     def scatter_received_kv(
         self,
         kv_indices: npt.NDArray[np.int32],
@@ -986,6 +1131,84 @@ class NixlKVManager(CommonKVManager):
         reqs_to_be_processed = self.transfer_infos[bootstrap_room].values()
         handles = []
         pool_allocations = []
+
+        # Filter out dummy requests
+        active_reqs = [req for req in reqs_to_be_processed if not req.is_dummy()]
+
+        # Detect batched Triton case: sender_tp < receiver_tp with multiple destinations
+        # This is the optimization that avoids N serial gathers + synchronizes
+        if active_reqs:
+            first_decode_info = self.decode_kv_args_table.get(active_reqs[0].agent_name)
+            if first_decode_info:
+                prefill_tp_size = self.attn_tp_size
+                decode_tp_size = first_decode_info.decode_tp_size
+
+                use_batched = (
+                    self.kv_transfer_method == "triton"
+                    and prefill_tp_size < decode_tp_size
+                    and all(
+                        self.decode_kv_args_table[r.agent_name].dst_pinned_ptr != 0
+                        for r in active_reqs
+                    )
+                    and self.kv_args.k_buffers is not None
+                    and self.kv_args.v_buffers is not None
+                    and not self.is_mla_backend
+                )
+
+                if use_batched:
+                    # Collect batch request info
+                    num_kv_heads = self.kv_args.kv_head_num
+                    total_prefill_heads = num_kv_heads * prefill_tp_size
+                    heads_per_decode_rank = total_prefill_heads // decode_tp_size
+
+                    batch_requests = []
+                    for req in active_reqs:
+                        decode_info = self.decode_kv_args_table[req.agent_name]
+                        decode_tp_rank = decode_info.decode_tp_rank % decode_tp_size
+                        head_start = decode_tp_rank * heads_per_decode_rank
+                        notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.pp_rank}"
+                        batch_requests.append((
+                            req.agent_name,
+                            decode_info.dst_pinned_ptr,
+                            decode_info.dst_pinned_size,
+                            notif,
+                            head_start,
+                            heads_per_decode_rank,
+                        ))
+
+                    logger.debug(
+                        f"[TRITON-KV-BATCHED] Using batched path: room={bootstrap_room}, "
+                        f"num_destinations={len(batch_requests)}, "
+                        f"prefill_tp={prefill_tp_size}, decode_tp={decode_tp_size}, "
+                        f"total_heads={num_kv_heads}"
+                    )
+
+                    # Single batched call for all destinations
+                    batch_handles, batch_allocs = self._send_kvcache_triton_batched(
+                        batch_requests, kv_indices, num_kv_heads
+                    )
+                    handles.extend(batch_handles)
+                    pool_allocations.extend(batch_allocs)
+
+                    # Handle aux data separately (unchanged from original logic)
+                    if is_last and self.pp_group.is_last_rank and has_aux_data:
+                        for req in active_reqs:
+                            assert aux_index is not None
+                            decode_info = self.decode_kv_args_table[req.agent_name]
+                            aux_xfer_handle = self.send_aux(
+                                req.agent_name,
+                                aux_index,
+                                decode_info.dst_aux_ptrs,
+                                req.dst_aux_index,
+                                str(req.room) + "_aux",
+                            )
+                            handles.append(aux_xfer_handle)
+
+                    if is_last:
+                        del self.transfer_infos[bootstrap_room]
+
+                    return handles, pool_allocations
+
         for req in reqs_to_be_processed:
             assert bootstrap_room == req.room
             if req.is_dummy():
@@ -1023,10 +1246,9 @@ class NixlKVManager(CommonKVManager):
                 and not self.is_mla_backend  # MLA backend not supported yet
             )
 
-            if use_triton:
-                # Calculate head slicing and destination offset for mixed-TP
-                # The pinned buffer uses HEAD-FIRST layout: [head, layer, kv, token, head_dim]
-                # This allows easy head slicing via dst_head_offset.
+            # Triton path: only handles prefill_tp >= decode_tp cases here
+            # (prefill_tp < decode_tp is handled by the batched path above)
+            if use_triton and prefill_tp_size >= decode_tp_size:
                 num_kv_heads = self.kv_args.kv_head_num
                 local_tp_rank = self.kv_args.engine_rank % prefill_tp_size
 
@@ -1036,19 +1258,10 @@ class NixlKVManager(CommonKVManager):
                     head_start = 0
                     num_heads_to_send = num_kv_heads
                     dst_head_offset = local_tp_rank * num_kv_heads
-                elif prefill_tp_size == decode_tp_size:
+                else:
                     # Equal TP: 1:1 mapping, each prefill rank sends to its corresponding decode rank
-                    # No offset needed since each decode rank has its own buffer
                     head_start = 0
                     num_heads_to_send = num_kv_heads
-                    dst_head_offset = 0
-                else:
-                    # Prefill TP < Decode TP: prefill sends head slices to different decode ranks
-                    decode_tp_rank = decode_info.decode_tp_rank % decode_tp_size
-                    total_prefill_heads = num_kv_heads * prefill_tp_size
-                    heads_per_decode_rank = total_prefill_heads // decode_tp_size
-                    head_start = decode_tp_rank * heads_per_decode_rank
-                    num_heads_to_send = heads_per_decode_rank
                     dst_head_offset = 0
 
                 logger.debug(
@@ -1107,6 +1320,7 @@ class NixlKVManager(CommonKVManager):
                 handles.append(aux_xfer_handle)
         if is_last:
             del self.transfer_infos[bootstrap_room]
+
         return handles, pool_allocations
 
     def update_transfer_status(self):
