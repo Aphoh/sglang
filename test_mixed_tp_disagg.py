@@ -10,6 +10,11 @@ Reverse Setup (--reverse-tp):
 - Prefill worker: TP=1 (GPU 0)
 - Decode worker: TP=2 (GPU 1,2)
 
+Decode Disagg Setup (--decode-disagg):
+- Prefill worker: TP=2 (GPU 0,1)
+- Decode Short worker: TP=4 (GPU 0,1,2,3) - handles short sequences
+- Decode Long worker: TP=4 (GPU 4,5,6,7) - handles long sequences via migration
+
 This tests the new Triton-based KV transfer method which:
 1. Uses gather_kv to consolidate scattered KV data into a pinned CPU buffer
 2. Transfers the contiguous buffer via NIXL (O(1) descriptors vs O(tokens × layers))
@@ -19,6 +24,7 @@ Usage:
     python test_mixed_tp_disagg.py --method triton
     python test_mixed_tp_disagg.py --method legacy
     python test_mixed_tp_disagg.py --method triton --reverse-tp
+    python test_mixed_tp_disagg.py --method triton --decode-disagg
 """
 
 import argparse
@@ -38,6 +44,9 @@ DEFAULT_MODEL_PATH = Path.home() / "proj/models/qwen3-4b"
 HEALTH_URL = "http://localhost:8080/health"
 CHAT_URL = "http://localhost:8080/v1/chat/completions"
 
+# Decode disagg tier boundaries (token count thresholds)
+DECODE_DISAGG_TIERS = [512, 4096]  # Short tier <= 512, Long tier <= 4096
+
 # Event to signal all processes should stop
 stop_event = threading.Event()
 
@@ -46,9 +55,11 @@ processes: dict[str, subprocess.Popen] = {}
 
 # ANSI colors for log prefixes
 COLORS = {
-    "prefill": "\033[32m",  # green
-    "decode": "\033[36m",   # cyan
-    "frontend": "\033[33m", # yellow
+    "prefill": "\033[32m",       # green
+    "decode": "\033[36m",        # cyan
+    "decode_short": "\033[36m",  # cyan
+    "decode_long": "\033[35m",   # magenta
+    "frontend": "\033[33m",      # yellow
     "reset": "\033[0m",
 }
 
@@ -108,13 +119,13 @@ def cleanup_stale_processes():
     print("   Done!")
 
 
-def get_common_args(model_path: Path, debug: bool = False) -> list[str]:
+def get_common_args(model_path: Path, debug: bool = False, mem_fraction: float = 0.4) -> list[str]:
     """Get common arguments for sglang workers."""
     return [
         "--model-path", str(model_path),
         "--served-model-name", "model",
         "--context-length", "4096",
-        "--mem-fraction-static", "0.4",
+        "--mem-fraction-static", str(mem_fraction),
         "--page-size", "16",
         "--disable-cuda-graph",
         "--stream-interval", "100",
@@ -301,6 +312,17 @@ def main():
         action="store_true",
         help="Enable debug logging for workers",
     )
+    parser.add_argument(
+        "--decode-disagg",
+        action="store_true",
+        help="Enable decode disaggregation (short->long migration). Uses 8 GPUs.",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=50,
+        help="Max tokens per request (use >512 to trigger migration in decode-disagg mode)",
+    )
     args = parser.parse_args()
 
     # Clean up any stale processes from previous runs
@@ -308,39 +330,72 @@ def main():
 
     model_path = Path(args.model_path)
 
-    # TP configuration
-    if args.reverse_tp:
+    # Decode disagg mode configuration (3 GPUs, no sharing)
+    if args.decode_disagg:
+        prefill_tp = 1
+        decode_short_tp = 1
+        decode_long_tp = 1
+        prefill_gpus = "0"
+        decode_short_gpus = "1"
+        decode_long_gpus = "2"  # Each worker on separate GPU
+        setup_desc = f"Prefill TP={prefill_tp} -> Decode Short TP={decode_short_tp} -> Decode Long TP={decode_long_tp} (separate GPUs)"
+        num_workers = 3
+    elif args.reverse_tp:
         prefill_tp = 1
         decode_tp = 2
         prefill_gpus = "0"
         decode_gpus = "1,2"
         setup_desc = "Prefill TP=1 (GPU 0) -> Decode TP=2 (GPU 1,2)"
+        num_workers = 2
     else:
         prefill_tp = 2
         decode_tp = 1
         prefill_gpus = "0,1"
         decode_gpus = "2"
         setup_desc = "Prefill TP=2 (GPU 0,1) -> Decode TP=1 (GPU 2)"
-    
+        num_workers = 2
+
     print("=" * 60)
     print("Mixed-TP Disaggregation Test")
     print("=" * 60)
     print(f"Model: {model_path}")
     print(f"KV Transfer Method: {args.method}")
     print(f"Setup: {setup_desc}")
+    print(f"Decode Disagg: {args.decode_disagg}")
+    if args.decode_disagg:
+        print(f"Tier Boundaries: {DECODE_DISAGG_TIERS}")
     print(f"Debug logging: {args.debug}")
     print(f"Python: {PYTHON_EXE}")
     print("=" * 60)
 
-    common_args = get_common_args(model_path, debug=args.debug)
-    
+    # Memory fractions depend on whether workers share GPUs
+    if args.decode_disagg:
+        # Each worker on separate GPU - can use more memory
+        prefill_mem_frac = 0.7
+        decode_mem_frac = 0.7
+    else:
+        prefill_mem_frac = 0.4
+        decode_mem_frac = 0.4
+
+    common_args = get_common_args(model_path, debug=args.debug, mem_fraction=prefill_mem_frac)
+    decode_common_args = get_common_args(model_path, debug=args.debug, mem_fraction=decode_mem_frac)
+
+    # UCX environment to force network transfers (skip shared memory)
+    ucx_env = {"UCX_TLS": "^shm"}
+
     # Port configuration (spread apart to avoid conflicts)
     prefill_port = 10000
     decode_port = 11500
+    decode_short_port = 11500
+    decode_long_port = 13000
     prefill_bootstrap_port = 12345
     decode_bootstrap_port = 12346
+    decode_short_bootstrap_port = 12346
+    decode_long_bootstrap_port = 12347
     prefill_nccl_port = 29500
     decode_nccl_port = 29600
+    decode_short_nccl_port = 29600
+    decode_long_nccl_port = 29700
 
     try:
         # Start prefill worker
@@ -354,7 +409,7 @@ def main():
             "--disaggregation-bootstrap-port", str(prefill_bootstrap_port),
             "--disaggregation-transfer-backend", "nixl",
             "--kv-transfer-method", args.method,
-            "--pinned-buffer-max-gb", "4.0",
+            "--pinned-buffer-max-gb", "2.0",
             "--host", "0.0.0.0",
             "--port", str(prefill_port),
             "--nccl-port", str(prefill_nccl_port),
@@ -364,26 +419,72 @@ def main():
             "DYN_SYSTEM_PORT": "8081",
         })
 
-        # Start decode worker
-        print(f"🚀 Starting decode worker (TP={decode_tp}, GPU {decode_gpus})...")
-        decode_args = [
-            PYTHON_EXE, "-m", "dynamo.sglang",
-            *common_args,
-            "--tp", str(decode_tp),
-            "--prefill-round-robin-balance",
-            "--disaggregation-mode", "decode",
-            "--disaggregation-bootstrap-port", str(decode_bootstrap_port),
-            "--disaggregation-transfer-backend", "nixl",
-            "--kv-transfer-method", args.method,
-            "--pinned-buffer-max-gb", "4.0",
-            "--host", "0.0.0.0",
-            "--port", str(decode_port),
-            "--nccl-port", str(decode_nccl_port),
-        ]
-        start_worker("decode", decode_args, env={
-            "CUDA_VISIBLE_DEVICES": decode_gpus,
-            "DYN_SYSTEM_PORT": "8082",
-        })
+        if args.decode_disagg:
+            # Decode disagg mode: start two decode workers with tier boundaries
+            print(f"🚀 Starting decode_short worker (TP={decode_short_tp}, GPU {decode_short_gpus}, tier <= {DECODE_DISAGG_TIERS[0]})...")
+            decode_short_args = [
+                PYTHON_EXE, "-m", "dynamo.sglang",
+                *decode_common_args,
+                "--tp", str(decode_short_tp),
+                "--prefill-round-robin-balance",
+                "--disaggregation-mode", "decode",
+                "--disaggregation-bootstrap-port", str(decode_short_bootstrap_port),
+                "--disaggregation-transfer-backend", "nixl",
+                "--kv-transfer-method", args.method,
+                "--pinned-buffer-max-gb", "2.0",
+                "--host", "0.0.0.0",
+                "--port", str(decode_short_port),
+                "--nccl-port", str(decode_short_nccl_port),
+                "--this-seqlen", str(DECODE_DISAGG_TIERS[0]),
+            ]
+            start_worker("decode_short", decode_short_args, env={
+                "CUDA_VISIBLE_DEVICES": decode_short_gpus,
+                "DYN_SYSTEM_PORT": "8082",
+                **ucx_env,
+            })
+
+            print(f"🚀 Starting decode_long worker (TP={decode_long_tp}, GPU {decode_long_gpus}, tier <= {DECODE_DISAGG_TIERS[1]})...")
+            decode_long_args = [
+                PYTHON_EXE, "-m", "dynamo.sglang",
+                *decode_common_args,
+                "--tp", str(decode_long_tp),
+                "--prefill-round-robin-balance",
+                "--disaggregation-mode", "decode",
+                "--disaggregation-bootstrap-port", str(decode_long_bootstrap_port),
+                "--disaggregation-transfer-backend", "nixl",
+                "--kv-transfer-method", args.method,
+                "--pinned-buffer-max-gb", "2.0",
+                "--host", "0.0.0.0",
+                "--port", str(decode_long_port),
+                "--nccl-port", str(decode_long_nccl_port),
+                "--this-seqlen", str(DECODE_DISAGG_TIERS[1]),
+            ]
+            start_worker("decode_long", decode_long_args, env={
+                "CUDA_VISIBLE_DEVICES": decode_long_gpus,
+                "DYN_SYSTEM_PORT": "8083",
+                **ucx_env,
+            })
+        else:
+            # Standard mode: single decode worker
+            print(f"🚀 Starting decode worker (TP={decode_tp}, GPU {decode_gpus})...")
+            decode_args = [
+                PYTHON_EXE, "-m", "dynamo.sglang",
+                *decode_common_args,
+                "--tp", str(decode_tp),
+                "--prefill-round-robin-balance",
+                "--disaggregation-mode", "decode",
+                "--disaggregation-bootstrap-port", str(decode_bootstrap_port),
+                "--disaggregation-transfer-backend", "nixl",
+                "--kv-transfer-method", args.method,
+                "--pinned-buffer-max-gb", "2.0",
+                "--host", "0.0.0.0",
+                "--port", str(decode_port),
+                "--nccl-port", str(decode_nccl_port),
+            ]
+            start_worker("decode", decode_args, env={
+                "CUDA_VISIBLE_DEVICES": decode_gpus,
+                "DYN_SYSTEM_PORT": "8082",
+            })
 
         # Start frontend
         print("🚀 Starting frontend...")
@@ -392,6 +493,8 @@ def main():
             "--http-port", "8080",
             "--namespace", "dynamo",
         ]
+        if args.decode_disagg:
+            frontend_args.extend(["--enable-decode-disagg", "--enforce-disagg"])
         start_worker("frontend", frontend_args)
 
         # Start process monitor
@@ -399,22 +502,24 @@ def main():
         monitor_thread.start()
 
         # Wait for health
-        if not wait_for_health(2):  # 1 prefill + 1 decode
+        if not wait_for_health(num_workers):
             print("Failed to start workers")
             return 1
 
         print("\n" + "=" * 60)
-        print(f"Running {args.num_requests} test requests...")
+        print(f"Running {args.num_requests} test requests (max_tokens={args.max_tokens})...")
+        if args.decode_disagg:
+            print(f"Note: Use --max-tokens > {DECODE_DISAGG_TIERS[0]} to trigger migration")
         print("=" * 60)
 
         # Run test requests
         successes = 0
         for i in range(args.num_requests):
             print(f"\n--- Request {i+1}/{args.num_requests} ---")
-            if run_request(max_tokens=50):
+            if run_request(max_tokens=args.max_tokens):
                 successes += 1
             time.sleep(1)
-            
+
             if stop_event.is_set():
                 print("\n⚠️ Process failure detected, stopping test")
                 break
