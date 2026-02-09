@@ -1,5 +1,4 @@
 import logging
-import os
 import time
 from typing import List, Optional, Tuple
 
@@ -542,23 +541,15 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
-
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
-        ) and not os.environ.get("SGLANG_DISABLE_DRAFT_CUDA_GRAPH")
+        )
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
             )
         else:
             forward_batch.can_run_dp_cuda_graph = False
-            # Pad the batch for MLP sync BEFORE initializing attention metadata,
-            # so attention metadata is computed against the padded batch size.
-            # Otherwise DP ranks with fewer tokens get padded inside forward()
-            # but attention metadata still reflects the unpadded size, causing
-            # FMHA illegal address errors on the padded entries.
-            if forward_batch.global_num_tokens_cpu is not None:
-                forward_batch.prepare_mlp_sync_batch(self.draft_model_runner)
             if (
                 not forward_batch.forward_mode.is_idle()
                 and self.speculative_num_steps > 1
@@ -950,7 +941,7 @@ class EAGLEWorker(TpModelWorker):
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
-        ) and not os.environ.get("SGLANG_DISABLE_DRAFT_CUDA_GRAPH")
+        )
         if can_cuda_graph:
             logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                 forward_batch
@@ -962,10 +953,6 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.spec_info.hidden_states = logits_output.hidden_states
         else:
             forward_batch.can_run_dp_cuda_graph = False
-            # Pad the batch for MLP sync BEFORE initializing attention metadata
-            # (same fix as draft decode path above).
-            if forward_batch.global_num_tokens_cpu is not None:
-                forward_batch.prepare_mlp_sync_batch(self.draft_model_runner)
             if not forward_batch.forward_mode.is_idle():
                 self.draft_model_runner.attn_backend.init_forward_metadata(
                     forward_batch

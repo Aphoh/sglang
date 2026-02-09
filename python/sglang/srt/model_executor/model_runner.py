@@ -2304,6 +2304,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
+            # If the batch was padded and attention metadata was already
+            # initialized (skip_attn_backend_init=True, e.g. EAGLE draft),
+            # we must re-init so metadata matches the padded batch size.
+            # Without this, the attention kernel sees q with padded tokens
+            # but page_table/cache_seqlens sized for the original batch.
+            if skip_attn_backend_init and getattr(
+                forward_batch, "_original_batch_size", None
+            ) is not None:
+                forward_batch.attn_backend.init_forward_metadata(forward_batch)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
 

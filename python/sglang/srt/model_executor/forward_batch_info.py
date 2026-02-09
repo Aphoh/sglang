@@ -844,10 +844,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.seq_lens_cpu, bs, value=seq_len_fill_value
             )
 
-        # For EAGLE draft decode, out_cache_loc has num_seqs * spec_steps * topk
-        # elements which can be larger than num_tokens. Only pad if needed.
-        if self.out_cache_loc.shape[0] <= num_tokens:
-            self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
