@@ -886,11 +886,13 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
 
-        if output_mode == "file":
-            if self._rank == 0:
-                _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
-        elif output_mode == "object":
+        if self._rank == 0:
+            _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
+
+        if output_mode == "object":
             return output
+        elif output_mode == "file":
+            pass
         else:
             raise NotImplementedError
 

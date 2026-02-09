@@ -93,6 +93,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
+from sglang.srt.utils.common import LazyValue
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -371,7 +372,9 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self.gate = Glm4MoeGate(config=config, prefix=add_prefix("gate", prefix))
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.n_routed_experts + self.num_fused_shared_experts,
+            num_experts=config.n_routed_experts
+            + self.num_fused_shared_experts
+            + get_global_server_args().ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=self.top_k + self.num_fused_shared_experts,
             layer_id=self.layer_id,
@@ -1024,8 +1027,20 @@ class Glm4MoeForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
 
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, Glm4MoeSparseMoeBlock)
+            }
+        )
+
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens

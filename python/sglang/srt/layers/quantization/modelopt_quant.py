@@ -739,18 +739,37 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             use_routing_scales_on_input = True
             routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
 
-            # Enforce Llama4 routing for ModelOpt FP8 MoE for now.
-            # TODO(brayden): support other routing methods
-            assert topk_config.top_k == 1, "ModelOpt FP8 MoE requires top_k==1"
-            assert (
-                not topk_config.num_expert_group
-            ), "ModelOpt FP8 MoE does not support expert grouping"
-            assert (
-                not topk_config.topk_group
-            ), "ModelOpt FP8 MoE does not support grouped top-k"
-            routing_method_type = RoutingMethodType.Llama4
+            # Determine routing method from the layer (set by the model definition).
+            # Fall back to Llama4 for top_k==1 (original behavior), otherwise
+            # use DeepSeekV3 which supports top_k>1 and grouped routing.
+            routing_method_type = getattr(
+                layer, "routing_method_type", None
+            )
+            if routing_method_type is None:
+                if topk_config.top_k == 1:
+                    routing_method_type = RoutingMethodType.Llama4
+                else:
+                    routing_method_type = RoutingMethodType.DeepSeekV3
 
-            # FlashInfer TRTLLM requires routing_logits (and bias) to be bfloat16
+            if routing_method_type == RoutingMethodType.Llama4:
+                assert topk_config.top_k == 1, (
+                    "Llama4 routing requires top_k==1"
+                )
+
+            n_group = topk_config.num_expert_group or 0
+            topk_group = topk_config.topk_group or 0
+
+            logger.warning(
+                "ModelOpt FP8 MoE: routing_method_type=%s, top_k=%d, "
+                "n_group=%d, topk_group=%d (patched to support top_k>1)",
+                routing_method_type,
+                topk_config.top_k,
+                n_group,
+                topk_group,
+            )
+
+            # FlashInfer trtllm_fp8_per_tensor_scale_moe kernel requires
+            # routing_logits and bias to be bfloat16.
             routing_logits_cast = router_logits.to(torch.bfloat16)
             routing_bias_cast = (
                 None if correction_bias is None else correction_bias.to(torch.bfloat16)
@@ -774,8 +793,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     output2_scales_scalar=layer.output2_scales_scalar,
                     num_experts=layer.num_experts,
                     top_k=topk_config.top_k,
-                    n_group=0,
-                    topk_group=0,
+                    n_group=n_group,
+                    topk_group=topk_group,
                     intermediate_size=layer.w2_weight.shape[2],
                     local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
                     local_num_experts=layer.num_local_experts,
@@ -1164,6 +1183,60 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             weight = layer.weight
             scale = layer.weight_scale
             epilogue_tile_m = 128
+
+            # Pad dimensions if needed:
+            # - shuffle_matrix_sf_a requires M % 128 == 0 and K % 4 == 0
+            # - TRTLLM GEMM selectHeuristic requires K_actual >= 128
+            #   (K_actual = input_size_per_partition, K_packed = K_actual / 2)
+            M = weight.shape[0]
+            K_packed = weight.shape[1]  # FP4 packed: 2 values per byte
+            K_actual = K_packed * 2
+            scale_K = scale.shape[1]  # K_actual / group_size
+            group_size = K_actual // scale_K if scale_K > 0 else 16
+
+            M_padded = (M + 127) // 128 * 128
+            K_actual_padded = (K_actual + 127) // 128 * 128
+            K_packed_padded = K_actual_padded // 2
+            K_scale_padded = K_actual_padded // group_size
+            # Also ensure scale K % 4 == 0 (for shuffle_matrix_sf_a)
+            K_scale_padded = max(K_scale_padded, (scale_K + 3) // 4 * 4)
+
+            needs_m_pad = M != M_padded
+            needs_k_pad = K_packed != K_packed_padded
+
+            if needs_m_pad or needs_k_pad:
+                # Pad weight
+                padded_weight = torch.zeros(
+                    (M_padded, K_packed_padded),
+                    dtype=weight.dtype,
+                    device=weight.device,
+                )
+                padded_weight[:M, :K_packed] = weight
+                weight = padded_weight
+                if needs_m_pad:
+                    layer._unpadded_output_size = M
+                if needs_k_pad:
+                    layer._unpadded_input_size = K_actual
+
+                # Pad scale to match
+                padded_scale = torch.zeros(
+                    (M_padded, K_scale_padded),
+                    dtype=scale.dtype,
+                    device=scale.device,
+                )
+                padded_scale[:M, :scale_K] = scale
+                scale = padded_scale
+            elif scale_K % 4 != 0:
+                # Only scale K needs padding (no weight changes)
+                K_scale_padded = (scale_K + 3) // 4 * 4
+                padded_scale = torch.zeros(
+                    (M_padded, K_scale_padded),
+                    dtype=scale.dtype,
+                    device=scale.device,
+                )
+                padded_scale[:M, :scale_K] = scale
+                scale = padded_scale
+
             weight = shuffle_matrix_a(weight.view(torch.uint8), epilogue_tile_m)
             scale = (
                 shuffle_matrix_sf_a(scale.view(torch.uint8), epilogue_tile_m)
@@ -1208,7 +1281,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         output_dtype = x.dtype
         x_m, _ = x.shape
         w_n, _ = layer.weight.shape
-        output_shape = [x_m, w_n]
+        # Use unpadded size if weight was padded during process_weights_after_loading
+        unpadded_w_n = getattr(layer, "_unpadded_output_size", w_n)
+        output_shape = [x_m, unpadded_w_n]
+
+        # Pad input K dimension if weight K was padded
+        unpadded_input_size = getattr(layer, "_unpadded_input_size", None)
+        if unpadded_input_size is not None:
+            padded_k = layer.weight.shape[1] * 2  # packed -> actual
+            x = torch.nn.functional.pad(x, (0, padded_k - unpadded_input_size))
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
@@ -1232,6 +1313,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             output_dtype,
             w_n,
         )
+        if unpadded_w_n != w_n:
+            out = out[:, :unpadded_w_n]
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)
