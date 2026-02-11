@@ -338,9 +338,14 @@ class EAGLEDraftCudaGraphRunner:
 
         bs = self.capture_bs[index]
         if bs != raw_bs:
-            self.seq_lens.fill_(self.seq_len_fill_value)
-            self.out_cache_loc.zero_()
-            self.positions.zero_()
+            padded_num_tokens = bs * self.num_tokens_per_bs
+            self.seq_lens[raw_bs:bs].fill_(self.seq_len_fill_value)
+            self.out_cache_loc[
+                raw_num_token
+                * self.speculative_num_steps : padded_num_tokens
+                * self.speculative_num_steps
+            ].zero_()
+            self.positions[raw_num_token:padded_num_tokens].zero_()
             self.req_pool_indices[raw_bs:bs].zero_()
             self.topk_p[raw_bs:bs].zero_()
             self.topk_index[raw_bs:bs].zero_()
