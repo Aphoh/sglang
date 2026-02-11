@@ -398,11 +398,16 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         bs = self.capture_bs[index]
         if bs * self.num_tokens_per_bs != num_tokens:
+            padded_num_tokens = bs * self.num_tokens_per_bs
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
             self.positions.zero_()
             self.accept_length.fill_(self.num_tokens_per_bs)
             self.extend_seq_lens.fill_(self.num_tokens_per_bs)
+            self.input_ids[num_tokens:padded_num_tokens].zero_()
+            self.mrope_positions[:, num_tokens:padded_num_tokens].zero_()
+            self.req_pool_indices[raw_bs:bs].zero_()
+            self.hidden_states[num_tokens:padded_num_tokens].zero_()
 
         # Common inputs
         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
