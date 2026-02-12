@@ -39,7 +39,7 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import (
@@ -49,6 +49,71 @@ if is_cuda():
     )
 
 logger = logging.getLogger(__name__)
+_EAGLE_CG_DBG_MAX_LOGS = 1200
+_eagle_cg_dbg_count = 0
+
+
+def _is_eagle_cg_dbg_enabled() -> bool:
+    return get_bool_env_var("EAGLE_CG_DBG")
+
+
+def _is_eagle_force_root_only_enabled() -> bool:
+    return get_bool_env_var("EAGLE_FORCE_ROOT_ONLY")
+
+
+def _is_stream_capturing() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def _eagle_cg_dbg_log(msg: str):
+    global _eagle_cg_dbg_count
+    if not _is_eagle_cg_dbg_enabled():
+        return
+    if _is_stream_capturing():
+        return
+    if _eagle_cg_dbg_count >= _EAGLE_CG_DBG_MAX_LOGS:
+        return
+    _eagle_cg_dbg_count += 1
+    logger.info(f"EAGLE_CG_DBG verify: {msg}")
+
+
+def _tensor_sig(tensor: Optional[torch.Tensor], max_sample: int = 256) -> str:
+    if tensor is None:
+        return "None"
+    numel = int(tensor.numel())
+    if numel == 0:
+        return f"shape={tuple(tensor.shape)},n=0"
+    if tensor.is_cuda and _is_stream_capturing():
+        return f"shape={tuple(tensor.shape)},n={numel},capture=1"
+
+    flat = tensor.reshape(-1)
+    if numel > max_sample:
+        step = max(1, numel // max_sample)
+        sample = flat[::step][:max_sample]
+    else:
+        sample = flat
+    sample_f = sample.float()
+    nan_count = int(torch.isnan(sample_f).sum().item())
+    inf_count = int(torch.isinf(sample_f).sum().item())
+    min_v = float(sample_f.min().item())
+    max_v = float(sample_f.max().item())
+    sum_v = float(sample_f.sum().item())
+    l2_v = float((sample_f * sample_f).sum().item())
+    head = sample[: min(4, int(sample.numel()))].tolist()
+    return (
+        f"shape={tuple(tensor.shape)},n={numel},sample={int(sample.numel())},"
+        f"nan={nan_count},inf={inf_count},sum={sum_v:.4e},l2={l2_v:.4e},"
+        f"min={min_v:.4e},max={max_v:.4e},head={head}"
+    )
+
+
+def _ptr_sig(tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return "None"
+    return (
+        f"ptr=0x{tensor.data_ptr():x},dtype={tensor.dtype},shape={tuple(tensor.shape)},"
+        f"stride={tuple(tensor.stride())},contig={tensor.is_contiguous()}"
+    )
 
 
 @dataclass
@@ -254,14 +319,41 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
+        _eagle_cg_dbg_log(
+            "verify_begin: "
+            f"bs={bs}, draft_token_num={self.draft_token_num}, topk={self.topk}, spec_steps={self.spec_steps}, "
+            f"logits={_tensor_sig(logits_output.next_token_logits)}, "
+            f"candidates={_tensor_sig(candidates)}, "
+            f"retrive_index={_tensor_sig(self.retrive_index)}, "
+            f"retrive_next_token={_tensor_sig(self.retrive_next_token)}, "
+            f"retrive_next_sibling={_tensor_sig(self.retrive_next_sibling)}, "
+            f"positions={_tensor_sig(self.positions)}, "
+            f"seq_lens={_tensor_sig(batch.seq_lens)}"
+        )
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         predict = torch.empty(predict_shape, dtype=torch.int32, device=batch.device)
+        # verify_tree_greedy writes only accepted path slots. Seed with a sentinel in debug mode
+        # so we can detect accidental reads from unwritten slots deterministically.
+        if _is_eagle_cg_dbg_enabled():
+            predict.fill_(-2147483648)
         accept_index = torch.full(
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=batch.device
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device=batch.device)
+        _eagle_cg_dbg_log(
+            "verify_ptrs_pre: "
+            f"logits={_ptr_sig(logits_output.next_token_logits)}, "
+            f"predict={_ptr_sig(predict)}, "
+            f"accept_index={_ptr_sig(accept_index)}, "
+            f"accept_length={_ptr_sig(accept_length)}, "
+            f"candidates={_ptr_sig(candidates)}, "
+            f"retrive_index={_ptr_sig(self.retrive_index)}, "
+            f"retrive_next_token={_ptr_sig(self.retrive_next_token)}, "
+            f"retrive_next_sibling={_ptr_sig(self.retrive_next_sibling)}, "
+            f"positions={_ptr_sig(self.positions)}"
+        )
 
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
@@ -310,16 +402,81 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
-            predict, accept_index, accept_length = verify_tree_greedy_func(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=accept_length,  # mutable
-                candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
-                target_predict=target_predict,
-                topk=self.topk,
+            _eagle_cg_dbg_log(
+                "verify_ptrs_greedy: "
+                f"target_predict={_ptr_sig(target_predict)}, "
+                f"predict={_ptr_sig(predict)}"
+            )
+            if _is_eagle_force_root_only_enabled():
+                # Debug mode for isolating tree-verify issues:
+                # consume only root target token and skip tree matching.
+                accept_index.fill_(-1)
+                accept_length.zero_()
+                root_indices = self.retrive_index[:, 0].to(torch.long)
+                predict[root_indices] = target_predict[:, 0].to(torch.int32)
+                accept_index[:, 0] = root_indices.to(torch.int32)
+                _eagle_cg_dbg_log(
+                    "verify_force_root_only: enabled, "
+                    f"root_indices={_tensor_sig(root_indices)}, "
+                    f"root_target={_tensor_sig(target_predict[:, 0])}"
+                )
+            else:
+                predict, accept_index, accept_length = verify_tree_greedy_func(
+                    predicts=predict,  # mutable
+                    accept_index=accept_index,  # mutable
+                    accept_token_num=accept_length,  # mutable
+                    candidates=candidates,
+                    retrive_index=self.retrive_index,
+                    retrive_next_token=self.retrive_next_token,
+                    retrive_next_sibling=self.retrive_next_sibling,
+                    target_predict=target_predict,
+                    topk=self.topk,
+                )
+                # Diagnostic: verify accepted positions map to matching candidate/target ids.
+                if _is_eagle_cg_dbg_enabled() and not _is_stream_capturing():
+                    for i in range(bs):
+                        for j in range(self.spec_steps + 1):
+                            idx = int(accept_index[i, j].item())
+                            if idx == -1:
+                                break
+                            tree_pos = idx - i * self.draft_token_num
+                            if tree_pos < 0 or tree_pos >= self.draft_token_num:
+                                logger.warning(
+                                    "EAGLE_VERIFY_INDEX_OOB: "
+                                    f"req={i} depth={j} idx={idx} tree_pos={tree_pos} "
+                                    f"draft_token_num={self.draft_token_num}"
+                                )
+                                continue
+                            cand = int(candidates[i, tree_pos].item())
+                            tgt = int(target_predict[i, tree_pos].item())
+                            pred = int(predict[idx].item())
+                            if j > 0 and cand != tgt:
+                                logger.warning(
+                                    "EAGLE_VERIFY_MISMATCH: "
+                                    f"req={i} depth={j} tree_pos={tree_pos} "
+                                    f"candidate={cand} target={tgt} predict={pred}"
+                                )
+            consumed_index = accept_index[accept_index != -1]
+            consumed_predict = (
+                predict[consumed_index]
+                if consumed_index.numel() > 0
+                else predict[:0]
+            )
+            vocab_size = logits_output.next_token_logits.shape[-1]
+            invalid_consumed = (
+                (consumed_predict < 0) | (consumed_predict >= vocab_size)
+                if consumed_predict.numel() > 0
+                else consumed_predict.bool()
+            )
+            _eagle_cg_dbg_log(
+                "verify_after_greedy: "
+                f"target_predict={_tensor_sig(target_predict)}, "
+                f"predict={_tensor_sig(predict)}, "
+                f"accept_index={_tensor_sig(accept_index)}, "
+                f"accept_length={_tensor_sig(accept_length)}, "
+                f"consumed_index={_tensor_sig(consumed_index)}, "
+                f"consumed_predict={_tensor_sig(consumed_predict)}, "
+                f"invalid_consumed={int(invalid_consumed.sum().item())}"
             )
 
         else:
@@ -373,6 +530,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 threshold_single=get_global_server_args().speculative_accept_threshold_single,
                 threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
                 deterministic=True,
+            )
+            _eagle_cg_dbg_log(
+                "verify_after_sampling: "
+                f"target_probs={_tensor_sig(target_probs)}, "
+                f"draft_probs={_tensor_sig(draft_probs)}, "
+                f"predict={_tensor_sig(predict)}, "
+                f"accept_index={_tensor_sig(accept_index)}, "
+                f"accept_length={_tensor_sig(accept_length)}"
             )
 
         if SIMULATE_ACC_LEN > 0.0:
@@ -443,6 +608,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # FIXME: this `tolist()` fixes the numerical calculation consistency
         # try to unify the tensor representation and list representation
         accept_length_list = accept_length_cpu.tolist()
+        _eagle_cg_dbg_log(
+            "verify_final: "
+            f"accept_index_flat={_tensor_sig(accept_index)}, "
+            f"verified_id={_tensor_sig(verified_id)}, "
+            f"evict_mask={_tensor_sig(evict_mask)}, "
+            f"accept_length={_tensor_sig(accept_length)}"
+        )
 
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.

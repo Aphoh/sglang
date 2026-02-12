@@ -144,6 +144,7 @@ from sglang.srt.utils import (
     dynamic_import,
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_bool_env_var,
     get_cpu_ids_by_node,
     get_local_ip_auto,
     init_custom_process_group,
@@ -2287,11 +2288,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.device == "cpu"
             else forward_batch.forward_mode.is_cuda_graph
         )
-        can_run_graph = bool(
-            mode_check()
-            and self.graph_runner
-            and self.graph_runner.can_run(forward_batch)
-        )
+        _mode_ok = mode_check()
+        _has_runner = bool(self.graph_runner)
+        _can_run = self.graph_runner.can_run(forward_batch) if _has_runner else False
+        can_run_graph = bool(_mode_ok and _has_runner and _can_run)
+
+        if get_bool_env_var("EAGLE_CG_DBG") and not torch.cuda.is_current_stream_capturing():
+            logger.info(
+                f"EAGLE_CG_DBG _forward_raw: "
+                f"can_run_graph={can_run_graph} (mode_ok={_mode_ok}, has_runner={_has_runner}, can_run={_can_run}), "
+                f"skip_attn_backend_init={skip_attn_backend_init}, "
+                f"forward_mode={forward_batch.forward_mode}, "
+                f"batch_size={forward_batch.batch_size}, "
+                f"global_num_tokens_cpu={forward_batch.global_num_tokens_cpu}, "
+                f"input_ids.shape={forward_batch.input_ids.shape if forward_batch.input_ids is not None else None}, "
+                f"spec_info={type(forward_batch.spec_info).__name__ if forward_batch.spec_info else None}"
+            )
 
         if can_run_graph:
             ret = self.graph_runner.replay(

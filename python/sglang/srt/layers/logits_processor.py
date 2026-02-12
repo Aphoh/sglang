@@ -55,11 +55,73 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_npu, use_intel_amx_backend
+from sglang.srt.utils import get_bool_env_var, is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_EAGLE_CG_DBG_MAX_LOGS = 800
+_eagle_cg_dbg_count = 0
+
+
+def _is_eagle_cg_dbg_enabled() -> bool:
+    return get_bool_env_var("EAGLE_CG_DBG")
+
+
+def _is_stream_capturing() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def _tensor_sig(tensor: Optional[torch.Tensor], max_sample: int = 256) -> str:
+    if tensor is None:
+        return "None"
+    numel = int(tensor.numel())
+    if numel == 0:
+        return f"shape={tuple(tensor.shape)},n=0"
+    if tensor.is_cuda and _is_stream_capturing():
+        return f"shape={tuple(tensor.shape)},n={numel},capture=1"
+
+    flat = tensor.reshape(-1)
+    if numel > max_sample:
+        step = max(1, numel // max_sample)
+        sample = flat[::step][:max_sample]
+    else:
+        sample = flat
+    sample_f = sample.float()
+    # Use sampled stats to keep debug overhead low.
+    nan_count = int(torch.isnan(sample_f).sum().item())
+    inf_count = int(torch.isinf(sample_f).sum().item())
+    sum_v = float(sample_f.sum().item())
+    l2_v = float((sample_f * sample_f).sum().item())
+    min_v = float(sample_f.min().item())
+    max_v = float(sample_f.max().item())
+    head = sample[: min(4, int(sample.numel()))].tolist()
+    return (
+        f"shape={tuple(tensor.shape)},n={numel},sample={int(sample.numel())},"
+        f"nan={nan_count},inf={inf_count},sum={sum_v:.4e},l2={l2_v:.4e},"
+        f"min={min_v:.4e},max={max_v:.4e},head={head}"
+    )
+
+
+def _eagle_cg_dbg_log(msg: str):
+    global _eagle_cg_dbg_count
+    if not _is_eagle_cg_dbg_enabled():
+        return
+    if _is_stream_capturing():
+        return
+    if _eagle_cg_dbg_count >= _EAGLE_CG_DBG_MAX_LOGS:
+        return
+    _eagle_cg_dbg_count += 1
+    logger.info(f"EAGLE_CG_DBG logits: {msg}")
+
+
+def _should_log_verify(logits_metadata: "LogitsMetadata") -> bool:
+    return (
+        _is_eagle_cg_dbg_enabled()
+        and not _is_stream_capturing()
+        and logits_metadata is not None
+        and logits_metadata.forward_mode.is_target_verify()
+    )
 
 
 @dataclasses.dataclass
@@ -861,7 +923,20 @@ class LogitsProcessor(nn.Module):
                 logits_metadata.gathered_buffer,
                 hidden_states,
             )
+            if _should_log_verify(logits_metadata):
+                _eagle_cg_dbg_log(
+                    "pre_dp_gather_replicate: "
+                    f"local_hidden={_tensor_sig(local_hidden_states)}, "
+                    f"gathered_hidden={_tensor_sig(hidden_states)}, "
+                    f"global_tokens_for_logprob={logits_metadata.global_num_tokens_for_logprob_cpu}, "
+                    f"dp_mode={logits_metadata.dp_padding_mode}"
+                )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+            if _should_log_verify(logits_metadata):
+                _eagle_cg_dbg_log(
+                    "post_dp_gather_replicate: "
+                    f"gathered_hidden={_tensor_sig(hidden_states)}"
+                )
 
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
@@ -943,7 +1018,18 @@ class LogitsProcessor(nn.Module):
                 ),
                 logits,
             )
+            if _should_log_verify(logits_metadata):
+                _eagle_cg_dbg_log(
+                    "pre_dp_scatter_logits: "
+                    f"global_logits={_tensor_sig(global_logits)}, "
+                    f"local_logits={_tensor_sig(logits)}"
+                )
             dp_scatter(logits, global_logits, logits_metadata)
+            if _should_log_verify(logits_metadata):
+                _eagle_cg_dbg_log(
+                    "post_dp_scatter_logits: "
+                    f"local_logits={_tensor_sig(logits)}"
+                )
 
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer

@@ -4,7 +4,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -169,6 +169,46 @@ def verify_tree_greedy_func(
     target_predict: torch.Tensor,
     topk: int = -1,
 ):
+    if get_bool_env_var("EAGLE_FORCE_PY_VERIFY_GREEDY"):
+        # Debug-only CPU-style reference implementation.
+        # This helps isolate bugs in the custom kernel path.
+        bs, num_draft_tokens = candidates.shape
+        num_speculative_tokens = accept_index.shape[1]
+        target_predict_flat = target_predict.reshape(-1)
+
+        for b in range(bs):
+            last_accepted_retrive_idx = int(retrive_index[b, 0].item())
+            accept_index[b, 0] = last_accepted_retrive_idx
+            num_accepted_tokens = 0
+            cur_index = 0
+
+            for _ in range(1, num_speculative_tokens):
+                cur_index = int(retrive_next_token[b, cur_index].item())
+                while cur_index != -1:
+                    draft_index = int(retrive_index[b, cur_index].item())
+                    draft_token_id = int(candidates[b, cur_index].item())
+                    target_token_id = int(
+                        target_predict_flat[last_accepted_retrive_idx].item()
+                    )
+
+                    if draft_token_id == target_token_id:
+                        predicts[last_accepted_retrive_idx] = target_token_id
+                        num_accepted_tokens += 1
+                        accept_index[b, num_accepted_tokens] = draft_index
+                        last_accepted_retrive_idx = draft_index
+                        break
+
+                    cur_index = int(retrive_next_sibling[b, cur_index].item())
+
+                if cur_index == -1:
+                    break
+
+            accept_token_num[b] = num_accepted_tokens
+            predicts[last_accepted_retrive_idx] = target_predict_flat[
+                last_accepted_retrive_idx
+            ]
+        return predicts, accept_index, accept_token_num
+
     if _is_cuda or _is_hip:
         from sgl_kernel import verify_tree_greedy
 

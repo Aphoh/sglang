@@ -169,12 +169,80 @@ class _DpGatheredBufferWrapper:
         return cls._dp_max_padding
 
 
+_eagle_cg_dbg_count = 0
+_EAGLE_CG_DBG_MAX_LOGS = 800
+
+
+def _is_eagle_cg_dbg_enabled() -> bool:
+    return get_bool_env_var("EAGLE_CG_DBG")
+
+
+def _is_stream_capturing() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def _eagle_cg_dbg_log(msg: str):
+    global _eagle_cg_dbg_count
+    if not _is_eagle_cg_dbg_enabled():
+        return
+    if _is_stream_capturing():
+        return
+    if _eagle_cg_dbg_count >= _EAGLE_CG_DBG_MAX_LOGS:
+        return
+    _eagle_cg_dbg_count += 1
+    logger.info(f"EAGLE_CG_DBG dp_attention: {msg}")
+
+
+def _tensor_sig(tensor: Optional[torch.Tensor], max_sample: int = 128) -> str:
+    if tensor is None:
+        return "None"
+    numel = int(tensor.numel())
+    if numel == 0:
+        return f"shape={tuple(tensor.shape)},n=0"
+    if tensor.is_cuda and _is_stream_capturing():
+        return f"shape={tuple(tensor.shape)},n={numel},capture=1"
+
+    flat = tensor.reshape(-1)
+    if numel > max_sample:
+        step = max(1, numel // max_sample)
+        sample = flat[::step][:max_sample]
+    else:
+        sample = flat
+    sample_f = sample.float()
+    nan_count = int(torch.isnan(sample_f).sum().item())
+    inf_count = int(torch.isinf(sample_f).sum().item())
+    min_v = float(sample_f.min().item())
+    max_v = float(sample_f.max().item())
+    sum_v = float(sample_f.sum().item())
+    l2_v = float((sample_f * sample_f).sum().item())
+    head = sample[: min(4, int(sample.numel()))].tolist()
+    return (
+        f"shape={tuple(tensor.shape)},n={numel},sample={int(sample.numel())},"
+        f"nan={nan_count},inf={inf_count},sum={sum_v:.4e},l2={l2_v:.4e},"
+        f"min={min_v:.4e},max={max_v:.4e},head={head}"
+    )
+
+
+def _should_log_dp_debug(forward_batch: ForwardBatch) -> bool:
+    return (
+        _is_eagle_cg_dbg_enabled()
+        and not _is_stream_capturing()
+        and forward_batch is not None
+        and getattr(forward_batch, "forward_mode", None) is not None
+        and forward_batch.forward_mode.is_target_verify()
+    )
+
 def set_dp_buffer_len(
     global_dp_buffer_len: int,
     local_dp_buffer_len: int,
     dp_max_padding: bool,
     global_num_tokens: Optional[List[int]] = None,
 ):
+    _eagle_cg_dbg_log(
+        "set_dp_buffer_len: "
+        f"global={global_dp_buffer_len}, local={local_dp_buffer_len}, "
+        f"max_padding={dp_max_padding}, global_num_tokens={global_num_tokens}"
+    )
     _DpGatheredBufferWrapper.set_dp_buffer_len(
         global_dp_buffer_len, local_dp_buffer_len, dp_max_padding, global_num_tokens
     )
@@ -447,6 +515,14 @@ def _dp_gather_via_all_reduce(
     is_partial: bool,
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+    if _should_log_dp_debug(forward_batch):
+        _eagle_cg_dbg_log(
+            "pre_gather_all_reduce: "
+            f"is_partial={is_partial}, dp_rank={get_attention_dp_rank()}, tp_rank={get_attention_tp_rank()}, "
+            f"local_start={int(local_start_pos.item())}, local_n={int(local_num_tokens.item())}, "
+            f"global_num_tokens={forward_batch.global_num_tokens_for_logprob_cpu}, "
+            f"local={_tensor_sig(local_tokens)}, global={_tensor_sig(global_tokens)}"
+        )
 
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
@@ -473,6 +549,12 @@ def _dp_gather_via_all_reduce(
 
     else:
         global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+    if _should_log_dp_debug(forward_batch):
+        _eagle_cg_dbg_log(
+            "post_gather_all_reduce: "
+            f"dp_rank={get_attention_dp_rank()}, tp_rank={get_attention_tp_rank()}, "
+            f"global={_tensor_sig(global_tokens)}"
+        )
 
 
 def _dp_gather_via_all_gather(
@@ -481,8 +563,20 @@ def _dp_gather_via_all_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    if _should_log_dp_debug(forward_batch):
+        _eagle_cg_dbg_log(
+            "pre_gather_all_gather: "
+            f"is_partial={is_partial}, dp_rank={get_attention_dp_rank()}, tp_rank={get_attention_tp_rank()}, "
+            f"global_num_tokens={forward_batch.global_num_tokens_for_logprob_cpu}, "
+            f"local={_tensor_sig(local_tokens)}, global={_tensor_sig(global_tokens)}"
+        )
     if get_attention_tp_size() == 1:
         get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
+        if _should_log_dp_debug(forward_batch):
+            _eagle_cg_dbg_log(
+                "post_gather_all_gather(tp=1): "
+                f"dp_rank={get_attention_dp_rank()}, global={_tensor_sig(global_tokens)}"
+            )
         return
 
     if not is_partial:
@@ -493,6 +587,13 @@ def _dp_gather_via_all_gather(
     ]
     get_attention_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
     get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
+    if _should_log_dp_debug(forward_batch):
+        _eagle_cg_dbg_log(
+            "post_gather_all_gather: "
+            f"dp_rank={get_attention_dp_rank()}, tp_rank={get_attention_tp_rank()}, "
+            f"scattered_local={_tensor_sig(scattered_local_tokens)}, "
+            f"global={_tensor_sig(global_tokens)}"
+        )
 
 
 def _dp_gather(
@@ -535,6 +636,13 @@ def dp_scatter(
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+    if _should_log_dp_debug(forward_batch):
+        _eagle_cg_dbg_log(
+            "pre_scatter: "
+            f"dp_rank={get_attention_dp_rank()}, tp_rank={get_attention_tp_rank()}, "
+            f"local_start={int(local_start_pos.item())}, local_n={int(local_num_tokens.item())}, "
+            f"global={_tensor_sig(global_tokens)}, local={_tensor_sig(local_tokens)}"
+        )
 
     local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
@@ -546,6 +654,12 @@ def dp_scatter(
 
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
+        )
+    if _should_log_dp_debug(forward_batch):
+        _eagle_cg_dbg_log(
+            "post_scatter: "
+            f"dp_rank={get_attention_dp_rank()}, tp_rank={get_attention_tp_rank()}, "
+            f"local={_tensor_sig(local_tokens)}"
         )
 
 

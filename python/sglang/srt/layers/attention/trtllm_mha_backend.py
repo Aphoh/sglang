@@ -20,7 +20,7 @@ from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import get_bool_env_var, is_flashinfer_available
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,8 @@ DEFAULT_WORKSPACE_SIZE_MB = 512
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
 global_zero_init_workspace_buffer = None
+_eagle_cg_dbg_count = 0
+_EAGLE_CG_DBG_MAX_LOGS = 2000
 
 
 @dataclass
@@ -121,6 +123,129 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
+
+    @staticmethod
+    def _is_eagle_cg_dbg_enabled() -> bool:
+        return get_bool_env_var("EAGLE_CG_DBG")
+
+    @staticmethod
+    def _is_stream_capturing() -> bool:
+        return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+    @classmethod
+    def _eagle_cg_dbg_log(cls, msg: str):
+        global _eagle_cg_dbg_count
+        if not cls._is_eagle_cg_dbg_enabled():
+            return
+        if cls._is_stream_capturing():
+            return
+        if _eagle_cg_dbg_count >= _EAGLE_CG_DBG_MAX_LOGS:
+            return
+        _eagle_cg_dbg_count += 1
+        logger.info(f"EAGLE_CG_DBG trtllm_mha: {msg}")
+
+    @staticmethod
+    def _tensor_summary(tensor: Optional[torch.Tensor], max_items: int = 4) -> str:
+        if tensor is None:
+            return "None"
+        numel = int(tensor.numel())
+        if numel == 0:
+            return "n=0"
+        if tensor.is_cuda and TRTLLMHAAttnBackend._is_stream_capturing():
+            return f"shape={tuple(tensor.shape)},n={numel},capture=1"
+        flat = tensor.reshape(-1)
+        head = flat[: min(max_items, numel)].tolist()
+        tail = flat[max(0, numel - max_items) :].tolist()
+        return (
+            f"n={numel},sum={int(flat.sum().item())},max={int(flat.max().item())},"
+            f"head={head},tail={tail}"
+        )
+
+    @staticmethod
+    def _tensor_sig(tensor: Optional[torch.Tensor], max_sample: int = 256) -> str:
+        if tensor is None:
+            return "None"
+        numel = int(tensor.numel())
+        if numel == 0:
+            return f"shape={tuple(tensor.shape)},n=0"
+        if tensor.is_cuda and TRTLLMHAAttnBackend._is_stream_capturing():
+            return f"shape={tuple(tensor.shape)},n={numel},capture=1"
+
+        flat = tensor.reshape(-1)
+        if numel > max_sample:
+            step = max(1, numel // max_sample)
+            sample = flat[::step][:max_sample]
+        else:
+            sample = flat
+
+        sample_f = sample.float()
+        nan_count = int(torch.isnan(sample_f).sum().item())
+        inf_count = int(torch.isinf(sample_f).sum().item())
+        min_v = float(sample_f.min().item())
+        max_v = float(sample_f.max().item())
+        sum_v = float(sample_f.sum().item())
+        l2_v = float((sample_f * sample_f).sum().item())
+        head = sample[: min(4, int(sample.numel()))].tolist()
+        return (
+            f"shape={tuple(tensor.shape)},n={numel},sample={int(sample.numel())},"
+            f"nan={nan_count},inf={inf_count},sum={sum_v:.4e},l2={l2_v:.4e},"
+            f"min={min_v:.4e},max={max_v:.4e},head={head}"
+        )
+
+    def _log_metadata_state(
+        self,
+        stage: str,
+        forward_mode: ForwardMode,
+        bs: int,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        metadata: Optional[TRTLLMMHAMetadata],
+        req_pool_indices: Optional[torch.Tensor] = None,
+        spec_info: Optional[SpecInput] = None,
+    ):
+        if self._is_stream_capturing():
+            return
+        if metadata is None:
+            self._eagle_cg_dbg_log(
+                f"{stage}: mode={forward_mode}, bs={bs}, metadata=None, "
+                f"seq_lens={self._tensor_summary(seq_lens)}, "
+                f"seq_lens_cpu={self._tensor_summary(seq_lens_cpu)}"
+            )
+            return
+        req_summary = "None"
+        if req_pool_indices is not None:
+            req_summary = self._tensor_summary(req_pool_indices)
+        page_shape = (
+            tuple(metadata.page_table.shape) if metadata.page_table is not None else None
+        )
+        page_row0_summary = (
+            self._tensor_summary(metadata.page_table[0, : min(16, metadata.page_table.shape[1])])
+            if metadata.page_table is not None and metadata.page_table.ndim == 2 and metadata.page_table.shape[0] > 0
+            else None
+        )
+        cu_q_last = (
+            int(metadata.cu_seqlens_q[-1].item())
+            if metadata.cu_seqlens_q is not None and metadata.cu_seqlens_q.numel() > 0
+            else None
+        )
+        cu_k_last = (
+            int(metadata.cu_seqlens_k[-1].item())
+            if metadata.cu_seqlens_k is not None and metadata.cu_seqlens_k.numel() > 0
+            else None
+        )
+        spec_name = type(spec_info).__name__ if spec_info is not None else None
+        self._eagle_cg_dbg_log(
+            f"{stage}: mode={forward_mode}, bs={bs}, spec={spec_name}, "
+            f"max_seq_len_q={metadata.max_seq_len_q}, max_seq_len_k={metadata.max_seq_len_k}, "
+            f"cache={self._tensor_summary(metadata.cache_seqlens_int32)}, "
+            f"seq_lens={self._tensor_summary(seq_lens)}, "
+            f"seq_lens_cpu={self._tensor_summary(seq_lens_cpu)}, "
+            f"cu_q={self._tensor_summary(metadata.cu_seqlens_q)}, "
+            f"cu_k={self._tensor_summary(metadata.cu_seqlens_k)}, "
+            f"cu_q_last={cu_q_last}, cu_k_last={cu_k_last}, "
+            f"page_table_shape={page_shape}, page_table_row0={page_row0_summary}, "
+            f"req_pool_indices={req_summary}"
+        )
 
     def init_cuda_graph_state(
         self,
@@ -220,6 +345,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Initialize metadata for CUDA graph capture."""
         metadata = TRTLLMMHAMetadata()
         device = seq_lens.device
+        seq_lens_for_log = seq_lens[:bs]
 
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
@@ -319,6 +445,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
             self.draft_extend_metadata[bs] = metadata
         self.forward_metadata = metadata
+        self._log_metadata_state(
+            stage="capture_cuda_graph",
+            forward_mode=forward_mode,
+            bs=bs,
+            seq_lens=seq_lens_for_log,
+            seq_lens_cpu=None,
+            metadata=metadata,
+            req_pool_indices=req_pool_indices[:bs],
+            spec_info=spec_info,
+        )
+
+    @staticmethod
+    def _safe_max_seq_len(
+        seq_lens_cpu: Optional[torch.Tensor], seq_lens: torch.Tensor
+    ) -> int:
+        if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+            return int(seq_lens_cpu.max().item())
+        if seq_lens.numel() > 0:
+            return int(seq_lens.max().item())
+        return 0
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -333,15 +479,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ):
         """Replay CUDA graph with new inputs."""
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
+        seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
         req_pool_indices = req_pool_indices[:bs]
+        max_len = self._safe_max_seq_len(seq_lens_cpu, seq_lens)
         metadata = None
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
                 # Draft Decode
                 # Here we only support topk = 1 for now.
                 metadata = self.decode_cuda_graph_metadata[bs]
-                max_len = seq_lens_cpu.max().item()
                 metadata.max_seq_len_k = max_len + self.speculative_step_id + 1
 
                 max_seq_pages = (
@@ -354,7 +500,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
-                max_len = seq_lens_cpu.max().item()
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len
 
@@ -378,9 +523,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
             metadata.max_seq_len_k = (
-                seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
+                max_len + self.speculative_num_draft_tokens
             )
-            max_len = seq_lens_cpu.max().item()
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
@@ -398,8 +542,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
-            metadata.max_seq_len_k = seq_lens_cpu.max().item()
-            max_len = seq_lens_cpu.max().item()
+            metadata.max_seq_len_k = max_len
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
@@ -422,6 +565,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
         self.forward_metadata = metadata
+        self._log_metadata_state(
+            stage="replay_cuda_graph",
+            forward_mode=forward_mode,
+            bs=bs,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            metadata=metadata,
+            req_pool_indices=req_pool_indices,
+            spec_info=spec_info,
+        )
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
@@ -464,6 +617,29 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
         device = seqlens_in_batch.device
+        max_len = self._safe_max_seq_len(forward_batch.seq_lens_cpu, seqlens_in_batch)
+
+        if batch_size == 0:
+            metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+            metadata.max_seq_len_q = 0
+            metadata.max_seq_len_k = 0
+            metadata.cu_seqlens_q = torch.zeros(1, dtype=torch.int32, device=device)
+            metadata.cu_seqlens_k = torch.zeros(1, dtype=torch.int32, device=device)
+            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, :0
+            ]
+            self.forward_metadata = metadata
+            self._log_metadata_state(
+                stage="init_forward",
+                forward_mode=forward_batch.forward_mode,
+                bs=batch_size,
+                seq_lens=seqlens_in_batch,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+                metadata=metadata,
+                req_pool_indices=forward_batch.req_pool_indices,
+                spec_info=forward_batch.spec_info,
+            )
+            return
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if forward_batch.spec_info is not None:
@@ -472,9 +648,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32 = (
                     seqlens_in_batch + (self.speculative_step_id + 1)
                 ).to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
-                    self.speculative_step_id + 1
-                )
+                metadata.max_seq_len_k = max_len + (self.speculative_step_id + 1)
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -490,7 +664,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = max_len
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -507,8 +681,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ).to(torch.int32)
             metadata.max_seq_len_q = self.speculative_num_draft_tokens
             metadata.max_seq_len_k = (
-                forward_batch.seq_lens_cpu.max().item()
-                + self.speculative_num_draft_tokens
+                max_len + self.speculative_num_draft_tokens
             )
             metadata.cu_seqlens_q = torch.arange(
                 0,
@@ -527,7 +700,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         else:
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+            metadata.max_seq_len_k = max_len
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
@@ -562,6 +735,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         self.forward_metadata = metadata
+        self._log_metadata_state(
+            stage="init_forward",
+            forward_mode=forward_batch.forward_mode,
+            bs=batch_size,
+            seq_lens=seqlens_in_batch,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            metadata=metadata,
+            req_pool_indices=forward_batch.req_pool_indices,
+            spec_info=forward_batch.spec_info,
+        )
 
     def forward_decode(
         self,
@@ -699,6 +882,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         bmm2_scale = 1.0
 
         if forward_batch.forward_mode.is_target_verify():
+            self._eagle_cg_dbg_log(
+                "verify_pre_kernel: "
+                f"layer={layer.layer_id}, q={self._tensor_sig(q)}, "
+                f"cache={self._tensor_summary(self.forward_metadata.cache_seqlens_int32)}, "
+                f"cu_q={self._tensor_summary(self.forward_metadata.cu_seqlens_q)}, "
+                f"cu_k={self._tensor_summary(self.forward_metadata.cu_seqlens_k)}, "
+                f"page_table_shape={tuple(self.forward_metadata.page_table.shape) if self.forward_metadata.page_table is not None else None}, "
+                f"q_len_per_req={self.forward_metadata.max_seq_len_q}, "
+                f"max_seq_len_k={self.forward_metadata.max_seq_len_k}, "
+                f"batch_size={forward_batch.batch_size}, "
+                f"spec={type(forward_batch.spec_info).__name__ if forward_batch.spec_info is not None else None}"
+            )
             o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
@@ -713,6 +908,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 sinks=attention_sink,
                 out_dtype=self.q_data_type,  # model_runner.dtype
                 q_len_per_req=self.forward_metadata.max_seq_len_q,
+            )
+            self._eagle_cg_dbg_log(
+                "verify_post_kernel: "
+                f"layer={layer.layer_id}, out={self._tensor_sig(o)}"
             )
         else:
 
