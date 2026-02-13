@@ -908,17 +908,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Launch the current batch
             if batch:
-                logger.info(
-                    f"[DECODE] Starting forward pass: forward_ct={self.forward_ct}, "
-                    f"mode={batch.forward_mode}, batch_size={len(batch.reqs)}"
-                )
-                t0 = time.perf_counter()
                 result = self.run_batch(batch)
-                t1 = time.perf_counter()
-                logger.info(
-                    f"[DECODE] Forward pass completed: forward_ct={self.forward_ct}, "
-                    f"elapsed={t1-t0:.3f}s"
-                )
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
@@ -945,17 +935,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Launch the current batch
             if batch:
-                logger.info(
-                    f"[DECODE-OL] Starting forward pass: forward_ct={self.forward_ct}, "
-                    f"mode={batch.forward_mode}, batch_size={len(batch.reqs)}"
-                )
-                t0 = time.perf_counter()
                 batch_result = self.run_batch(batch)
-                t1 = time.perf_counter()
-                logger.info(
-                    f"[DECODE-OL] Forward pass completed: forward_ct={self.forward_ct}, "
-                    f"elapsed={t1-t0:.3f}s"
-                )
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -1100,16 +1080,8 @@ class SchedulerDisaggregationDecodeMixin:
 
         if self.polling_count % self.polling_interval == 0:
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-            if req_conns:
-                logger.info(
-                    f"[DECODE] Preallocated {len(req_conns)} reqs, moving to transfer queue"
-                )
             self.disagg_decode_transfer_queue.extend(req_conns)
             alloc_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
-            if alloc_reqs:
-                logger.info(
-                    f"[DECODE] {len(alloc_reqs)} reqs transferred, moving to waiting queue"
-                )
             self.waiting_queue.extend(alloc_reqs)
