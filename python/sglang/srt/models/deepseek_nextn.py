@@ -215,6 +215,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.model = DeepseekModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
+        # Null out quant_config for NextN model (same as DeepseekModelNextN)
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            self.quant_config = None
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,

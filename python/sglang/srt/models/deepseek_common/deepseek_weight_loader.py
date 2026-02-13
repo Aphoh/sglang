@@ -314,6 +314,15 @@ class DeepseekV2WeightLoaderMixin:
                                         "fused_qkv_a_proj_with_mqa",
                                     )
                                 )
+                                if param_name not in params_dict:
+                                    # FP8 scale weights for unquantized layers (e.g.,
+                                    # pre-quantized MTP checkpoint with bf16 attention)
+                                    logger.warning(
+                                        f"{param_name} not found in params_dict."
+                                    )
+                                    cached_a_proj.pop(q_a_proj_name)
+                                    cached_a_proj.pop(kv_a_proj_name)
+                                    continue
                                 param = params_dict[param_name]
 
                                 weight_loader = getattr(
@@ -663,11 +672,17 @@ class DeepseekV2WeightLoaderMixin:
         weights_dict = dict(weights)
 
         for partial_name in tqdm.tqdm(partial_names, desc="quant weights to fp8 ue8m0"):
-            original_weight = weights_dict[f"{partial_name}.weight"]
+            weight_key = f"{partial_name}.weight"
+            if weight_key not in weights_dict:
+                continue
+            original_weight = weights_dict[weight_key]
+            if original_weight.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+                # Already FP8 (e.g., pre-quantized MTP checkpoint), skip conversion
+                continue
             out_w, out_s = quant_weight_ue8m0(
                 original_weight, weight_block_size=weight_block_size
             )
-            weights_dict[f"{partial_name}.weight"] = out_w
+            weights_dict[weight_key] = out_w
             weights_dict[f"{partial_name}.weight_scale_inv"] = out_s
 
         if isinstance(

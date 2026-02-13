@@ -233,10 +233,11 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
-        # Store bootstrap_room for validation on decode side
-        self.bootstrap_room[req.metadata_buffer_index, 0] = (
-            req.bootstrap_room if req.bootstrap_room is not None else 0
-        )
+        # Store bootstrap_room for validation on decode side.
+        # Dynamo generates bootstrap_room as u64 which can overflow int64;
+        # mask to signed range (both sides use the same mask so validation still works).
+        br = req.bootstrap_room if req.bootstrap_room is not None else 0
+        self.bootstrap_room[req.metadata_buffer_index, 0] = br & 0x7FFF_FFFF_FFFF_FFFF
 
 
 #########################

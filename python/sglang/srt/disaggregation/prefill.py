@@ -376,7 +376,18 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                logger.info(
+                    f"[PREFILL] Starting forward pass: forward_ct={self.forward_ct}, "
+                    f"mode={batch.forward_mode}, batch_size={len(batch.reqs)}, "
+                    f"rids={[r.rid[:8] for r in batch.reqs]}"
+                )
+                t0 = time.perf_counter()
                 result = self.run_batch(batch)
+                t1 = time.perf_counter()
+                logger.info(
+                    f"[PREFILL] Forward pass completed: forward_ct={self.forward_ct}, "
+                    f"elapsed={t1-t0:.3f}s"
+                )
                 self.process_batch_result_disagg_prefill(batch, result)
             else:
                 self.self_check_during_idle()
@@ -404,7 +415,18 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                logger.info(
+                    f"[PREFILL-OL] Starting forward pass: forward_ct={self.forward_ct}, "
+                    f"mode={batch.forward_mode}, batch_size={len(batch.reqs)}, "
+                    f"rids={[r.rid[:8] for r in batch.reqs]}"
+                )
+                t0 = time.perf_counter()
                 batch_result = self.run_batch(batch)
+                t1 = time.perf_counter()
+                logger.info(
+                    f"[PREFILL-OL] Forward pass completed: forward_ct={self.forward_ct}, "
+                    f"elapsed={t1-t0:.3f}s"
+                )
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -412,6 +434,9 @@ class SchedulerDisaggregationPrefillMixin:
             # Process the last batch
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
+                logger.info(
+                    f"[PREFILL-OL] Processing batch result (KV send)"
+                )
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -501,7 +526,14 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
+                logger.info(
+                    f"[PREFILL] Initiating KV send for req {req.rid[:8]}, "
+                    f"bootstrap_room={req.bootstrap_room}, last_chunk=True"
+                )
                 self.send_kv_chunk(req, last_chunk=True)
+                logger.info(
+                    f"[PREFILL] KV send posted for req {req.rid[:8]}"
+                )
                 req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
 
                 if req.grammar is not None:
