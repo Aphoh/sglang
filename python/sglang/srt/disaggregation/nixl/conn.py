@@ -382,7 +382,9 @@ class NixlKVManager(CommonKVManager):
             prefill_kv_indices, dst_kv_indices
         )
 
-        logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
+        logger.info(f"[NIXL-XFER] send_kvcache: peer={peer_name} notif={notif} "
+                    f"n_prefill_indices={len(prefill_kv_indices)} n_dst_indices={len(dst_kv_indices)} "
+                    f"dst_gpu_id={dst_gpu_id} is_mla={self.is_mla_backend}")
         # Make descs
         if self.is_mla_backend:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
@@ -459,6 +461,8 @@ class NixlKVManager(CommonKVManager):
         )
         src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_reqs, "VRAM")
+        logger.info(f"[NIXL-XFER] send_kvcache: n_src_descs={len(src_reqs)} n_dst_descs={len(dst_reqs)} "
+                    f"total_src_bytes={sum(src_reqs[:,1])} peer={peer_name}")
         # Transfer data
         xfer_handle = self.agent.initialize_xfer(
             "WRITE",
@@ -469,7 +473,9 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
+        logger.info(f"[NIXL-XFER] send_kvcache: initialize_xfer OK, posting transfer...")
         state = self.agent.transfer(xfer_handle)
+        logger.info(f"[NIXL-XFER] send_kvcache: transfer posted, state={state}")
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
@@ -622,6 +628,7 @@ class NixlKVManager(CommonKVManager):
 
         src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM")
+        logger.info(f"[NIXL-XFER] send_aux: n_descs={len(src_addrs)} notif={notif} peer={peer_name}")
         # Transfer data
         xfer_handle = self.agent.initialize_xfer(
             "WRITE",
@@ -633,8 +640,93 @@ class NixlKVManager(CommonKVManager):
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
         state = self.agent.transfer(xfer_handle)
+        logger.info(f"[NIXL-XFER] send_aux: transfer posted, state={state}")
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
+        return xfer_handle
+
+    def _send_kv_state(
+        self,
+        peer_name: str,
+        prefill_state_indices: npt.NDArray[np.int32],
+        dst_state_data_ptrs: list[int],
+        dst_state_indices: npt.NDArray[np.int32],
+        dst_gpu_id: int,
+        notif: str,
+    ):
+        """Transfer page-indexed state data (NSA/SWA) via RDMA.
+
+        This is structurally similar to send_kvcache: per-layer buffers
+        indexed by page, with contiguous block coalescing.
+        """
+        prefill_state_blocks, dst_state_blocks = group_concurrent_contiguous(
+            prefill_state_indices, dst_state_indices
+        )
+
+        prefill_state_data_ptrs_local = self.kv_args.state_data_ptrs
+        prefill_state_item_lens = self.kv_args.state_item_lens
+
+        # Build per-layer descriptors
+        layers_params = [
+            (
+                prefill_state_data_ptrs_local[i],
+                dst_state_data_ptrs[i],
+                prefill_state_item_lens[i],
+            )
+            for i in range(len(prefill_state_data_ptrs_local))
+        ]
+
+        prefill_starts = np.fromiter(
+            (block[0] for block in prefill_state_blocks), dtype=np.int64
+        )
+        dst_starts = np.fromiter(
+            (block[0] for block in dst_state_blocks), dtype=np.int64
+        )
+        block_lens = np.fromiter(
+            (len(block) for block in prefill_state_blocks), dtype=np.int64
+        )
+
+        src_addrs = []
+        src_lens = []
+        dst_addrs = []
+        dst_lens = []
+        for src_ptr, dst_ptr, item_len in layers_params:
+            lengths = item_len * block_lens
+            src_addrs.append(src_ptr + prefill_starts * item_len)
+            src_lens.append(lengths)
+            dst_addrs.append(dst_ptr + dst_starts * item_len)
+            dst_lens.append(lengths)
+
+        def make_req_array(addr_chunks, len_chunks, gpu):
+            if not addr_chunks:
+                return np.empty((0, 3), dtype=np.int64)
+            flat_addrs = np.concatenate(addr_chunks)
+            flat_lens = np.concatenate(len_chunks)
+            return np.column_stack(
+                (flat_addrs, flat_lens, np.full_like(flat_addrs, gpu))
+            )
+
+        src_reqs = make_req_array(src_addrs, src_lens, self.kv_args.gpu_id)
+        dst_reqs = make_req_array(dst_addrs, dst_lens, dst_gpu_id)
+
+        src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
+        dst_descs = self.agent.get_xfer_descs(dst_reqs, "VRAM")
+
+        logger.info(
+            f"[NIXL-XFER] _send_kv_state: n_descs={len(src_reqs)} "
+            f"n_layers={len(layers_params)} n_blocks={len(prefill_state_blocks)} "
+            f"total_bytes={sum(src_reqs[:,1])} notif={notif} peer={peer_name}"
+        )
+
+        xfer_handle = self.agent.initialize_xfer(
+            "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
+        )
+        if not xfer_handle:
+            raise Exception("Failed to create KV state transfer")
+        state = self.agent.transfer(xfer_handle)
+        if state == "ERR":
+            raise Exception("Failed to post KV state transfer")
+        logger.info(f"[NIXL-XFER] _send_kv_state: transfer posted, state={state}")
         return xfer_handle
 
     def _send_mamba_state(
@@ -697,6 +789,10 @@ class NixlKVManager(CommonKVManager):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
 
+        reqs_to_be_processed = self.transfer_infos[bootstrap_room].values()
+        logger.info(f"[NIXL-XFER] add_transfer_request: room={bootstrap_room} "
+                    f"n_peers={len(list(reqs_to_be_processed))} is_last={is_last} "
+                    f"chunk_id={chunk_id} has_state_indices={state_indices is not None}")
         reqs_to_be_processed = self.transfer_infos[bootstrap_room].values()
         handles = []
         for req in reqs_to_be_processed:
@@ -763,6 +859,18 @@ class NixlKVManager(CommonKVManager):
                             f"{req.room}_state_{self.kv_args.pp_rank}",
                         )
                         handles.append(state_xfer_handle)
+                    elif state_type in ("nsa", "swa"):
+                        state_xfer_handle = self._send_kv_state(
+                            req.agent_name,
+                            np.array(state_indices, dtype=np.int32),
+                            self.decode_kv_args_table[
+                                req.agent_name
+                            ].dst_state_data_ptrs,
+                            np.array(req.dst_state_indices, dtype=np.int32),
+                            self.decode_kv_args_table[req.agent_name].gpu_id,
+                            f"{req.room}_state_{self.kv_args.pp_rank}",
+                        )
+                        handles.append(state_xfer_handle)
 
                 assert aux_index is not None
                 aux_xfer_handle = self.send_aux(
@@ -780,6 +888,9 @@ class NixlKVManager(CommonKVManager):
     def update_transfer_status(self):
         # Process notifications from received transfers.
         notif_map = self.agent.get_new_notifs()
+        if notif_map:
+            notif_summary = {k: [m.decode('ascii', errors='replace') for m in v] for k, v in notif_map.items()}
+            logger.info(f"[NIXL-RECV] got notifications: {notif_summary}")
         for peer_name, messages in notif_map.items():
             # We could also check that self.bootstrap_info['agent_name'] matches
             # the message sender. But the bootstrap room alone should be
@@ -832,10 +943,10 @@ class NixlKVManager(CommonKVManager):
                 agent_name = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     # Register new peer and save KV base pointers.
-                    self._add_remote_peer(
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    )
-                    logger.debug(f"Register KVArgs from {agent_name} successfully")
+                    reg_info = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    self._add_remote_peer(reg_info)
+                    logger.info(f"[NIXL-BOOT] Registered KVArgs from {agent_name}, "
+                               f"gpu_id={reg_info.gpu_id}")
                     continue
                 room = int(room)
                 if room not in self.transfer_infos:
@@ -846,9 +957,12 @@ class NixlKVManager(CommonKVManager):
                 required_dst_info_num = self.transfer_infos[room][
                     agent_name
                 ].required_dst_info_num
-                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
+                ti = self.transfer_infos[room][agent_name]
+                logger.info(f"[NIXL-BOOT] got transfer info: room={room} agent={agent_name} "
+                           f"required={required_dst_info_num} have={len(self.transfer_infos[room])} "
+                           f"n_dst_kv_indices={len(ti.dst_kv_indices)} dst_aux_index={ti.dst_aux_index}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
-                    logger.debug(f"{room=} is bootstrapped")
+                    logger.info(f"[NIXL-BOOT] room={room} is bootstrapped (all {required_dst_info_num} peers)")
                     self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
@@ -896,6 +1010,8 @@ class NixlKVSender(CommonKVSender):
         if not self.has_sent:
             return self.kv_mgr.check_status(self.bootstrap_room)
         states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
+        logger.info(f"[NIXL-XFER] KVSender.poll: room={self.bootstrap_room} "
+                    f"n_handles={len(self.xfer_handles)} states={states}")
         if all([x == "DONE" for x in states]):
             return KVPoll.Success  # type: ignore
         if any([x == "ERR" for x in states]):
@@ -939,14 +1055,12 @@ class NixlKVReceiver(CommonKVReceiver):
             return
 
         for bootstrap_info in self.bootstrap_infos:
-            logger.debug(
-                f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
+            logger.info(
+                f"[NIXL-RECV] init: sending bootstrap to prefill: info={bootstrap_info} "
+                f"room={self.bootstrap_room} engine_rank={self.kv_mgr.kv_args.engine_rank}"
             )
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
-            logger.debug(
-                f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
-            )
             with lock:
                 sock.send_multipart(
                     [
@@ -972,6 +1086,11 @@ class NixlKVReceiver(CommonKVReceiver):
 
         self.started_transfer = True
         self.init_time = time.time()
+        logger.info(
+            f"[NIXL-RECV] init complete: room={self.bootstrap_room} "
+            f"expects_state={state_indices is not None} "
+            f"n_bootstrap_infos={len(self.bootstrap_infos)}"
+        )
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -985,6 +1104,25 @@ class NixlKVReceiver(CommonKVReceiver):
 
         now = time.time()
         elapsed = now - self.init_time
+        # Log transfer status details periodically (every ~5s)
+        if not hasattr(self, '_last_poll_log') or (now - self._last_poll_log) > 5.0:
+            self._last_poll_log = now
+            ts = self.kv_mgr.transfer_statuses.get(self.bootstrap_room)
+            if ts:
+                logger.info(
+                    f"[NIXL-RECV] poll room={self.bootstrap_room}: elapsed={elapsed:.1f}s "
+                    f"received_kvs={dict(ts.received_kvs_per_pp)} "
+                    f"expected_kvs={ts.expected_kvs_per_pp} "
+                    f"num_pp_expected={ts.num_pp_ranks_expected} "
+                    f"received_aux={ts.received_aux} "
+                    f"expects_state={ts.expects_state} "
+                    f"received_state={ts.received_state_per_pp}"
+                )
+            else:
+                logger.info(
+                    f"[NIXL-RECV] poll room={self.bootstrap_room}: elapsed={elapsed:.1f}s "
+                    f"NO transfer_status entry!"
+                )
 
         if elapsed >= self.kv_mgr.waiting_timeout:
             logger.error(f"Request {self.bootstrap_room} waiting_timeout")
