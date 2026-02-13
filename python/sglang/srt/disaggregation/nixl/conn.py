@@ -820,15 +820,15 @@ class NixlKVManager(CommonKVManager):
             if is_last:
                 if state_indices is not None:
                     state_type = getattr(self.kv_args, "state_type", "none")
-                    if (
-                        self.attn_tp_size
-                        != self.decode_kv_args_table[req.agent_name].decode_tp_size
-                    ):
-                        raise RuntimeError(
-                            "PD Disaggregation does NOT support PD different TP sizes for hybrid mamba models yet."
-                        )
 
                     if state_type == "mamba":
+                        if (
+                            self.attn_tp_size
+                            != self.decode_kv_args_table[req.agent_name].decode_tp_size
+                        ):
+                            raise RuntimeError(
+                                "PD Disaggregation does NOT support PD different TP sizes for hybrid mamba models yet."
+                            )
                         state_xfer_handle = self._send_mamba_state(
                             req.agent_name,
                             state_indices,
