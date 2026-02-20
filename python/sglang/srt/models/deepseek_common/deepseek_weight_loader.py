@@ -55,6 +55,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
+    enable_nextn_moe_fp8,
 )
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
@@ -646,7 +647,14 @@ class DeepseekV2WeightLoaderMixin:
                             f"model.layers.{layer_id}.self_attn.{stem}"
                         )
 
-                if enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
+                from sglang.srt.server_args import get_global_server_args
+
+                _server_args = get_global_server_args()
+                _draft_model_path = (
+                    _server_args.speculative_draft_model_path
+                    or _server_args.model_path
+                )
+                if enable_nextn_moe_fp8(self.quant_config, model_path=_draft_model_path):
                     expert_sub_names = ["shared_experts"] + [
                         f"experts.{i}" for i in range(self.config.n_routed_experts)
                     ]

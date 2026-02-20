@@ -89,9 +89,56 @@ def awq_dequantize_func():
         return None
 
 
+def is_nextn_moe_checkpoint_fp8(model_path: str) -> bool:
+    """Detect if the nextn/MTP MoE layer is pre-quantized to FP8 in the checkpoint."""
+    import json
+    import os
+
+    # Fast path: dedicated mtp-fp8 file (GLM-5 style)
+    if os.path.exists(os.path.join(model_path, "mtp-fp8.safetensors")):
+        return True
+    # General: inspect safetensors index for weight_scale_inv in MoE layers
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        return False
+    with open(index_path) as f:
+        data = json.load(f)
+    return any(
+        "weight_scale_inv" in k and ".mlp.experts." in k
+        for k in data.get("weight_map", {})
+    )
+
+
+def enable_nextn_moe_fp8(
+    quant_config: Optional[QuantizationConfig],
+    model_path: Optional[str] = None,
+) -> bool:
+    """Whether to build the nextn MoE layer with FP8 quantization.
+
+    True in two cases:
+    - Checkpoint already has FP8 nextn weights (any runner backend), OR
+    - BF16 checkpoint that will be quantized on-the-fly (deep_gemm only).
+    """
+    if not (
+        envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get()
+        and quant_config is not None
+        and quant_config.get_name() == "modelopt_fp4"
+    ):
+        return False
+    if model_path is not None and is_nextn_moe_checkpoint_fp8(model_path):
+        return True  # pre-quantized FP8, any runner works
+    return get_moe_runner_backend().is_deep_gemm()  # BF16 on-the-fly, deep_gemm only
+
+
 def enable_nextn_moe_bf16_cast_to_fp8(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
+    """Whether on-the-fly BF16->UE8M0 quantization was applied to nextn MoE weights.
+
+    Only True when the checkpoint is BF16 and deep_gemm is the runner. Used
+    to gate the UE8M0 format marking after loading; not for layer init or
+    partial_names population (use enable_nextn_moe_fp8 for those).
+    """
     return (
         envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get()
         and quant_config is not None

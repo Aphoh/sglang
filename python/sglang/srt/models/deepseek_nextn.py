@@ -47,7 +47,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
+from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
@@ -67,7 +67,11 @@ class DeepseekModelNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
+        server_args = get_global_server_args()
+        draft_model_path = (
+            server_args.speculative_draft_model_path or server_args.model_path
+        )
+        if enable_nextn_moe_fp8(quant_config, model_path=draft_model_path):
             # refer to real DeepSeek V3 quant config
             moe_quant_config_override = Fp8Config(
                 is_checkpoint_fp8_serialized=True,
