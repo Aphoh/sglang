@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import struct
 import threading
 import time
 import uuid
 from collections import defaultdict
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -49,6 +50,43 @@ def _import_triton_kv_transfer():
 
 GUARD = "NixlMsgGuard".encode("ascii")
 
+# Set SGLANG_NIXL_DEBUG_CHECKSUM=1 to enable KV transfer checksum validation.
+# Prefill logs a checksum after gather; decode logs one before scatter.
+# Mismatches indicate corruption between gather and scatter.
+_NIXL_DEBUG_CHECKSUM = os.environ.get("SGLANG_NIXL_DEBUG_CHECKSUM", "0") == "1"
+
+
+def _kv_checksum(buf: torch.Tensor, label: str, room: int) -> int:
+    """
+    Compute and log a diagnostic checksum of a pinned CPU KV buffer.
+
+    Views the buffer as int16, samples ~1024 evenly-spaced elements, and sums
+    them.  Returns the 32-bit wrapped sum.  Logs at WARNING level so it is
+    visible without changing the log level.
+
+    Detects:
+    - All-zero buffer  → transfer never wrote / wrong address
+    - Value mismatch   → data written to wrong slot / premature pool release
+    - Count of zeros   → partially-written transfer
+    """
+    flat = buf.view(torch.int16)
+    n = flat.numel()
+    step = max(1, n // 1024)
+    sample = flat[::step].to(torch.int32)
+    total = int(sample.sum().item())
+    checksum = total & 0xFFFFFFFF
+    num_zeros = int((sample == 0).sum().item())
+    # Log first 4 and last 4 raw int16 values as a sanity peek
+    head_vals = flat[:4].tolist()
+    tail_vals = flat[-4:].tolist()
+    logger.warning(
+        f"[KV-CKSUM] {label} room={room} "
+        f"checksum=0x{checksum:08x} "
+        f"sampled={len(sample)} zeros={num_zeros}/{len(sample)} "
+        f"head={head_vals} tail={tail_vals}"
+    )
+    return checksum
+
 
 @dataclasses.dataclass
 class TransferInfo:
@@ -62,6 +100,9 @@ class TransferInfo:
     dst_aux_index: int
     required_dst_info_num: int
     dst_state_indices: List[int]
+    # Per-request allocated pinned buffer address and size (for concurrent-safe CPU buffer transfers)
+    dst_pinned_ptr: int = 0
+    dst_pinned_size: int = 0
 
     def is_dummy(self):
         return self.dst_kv_indices.size == 0
@@ -74,6 +115,10 @@ class TransferInfo:
         else:
             dst_state_indices = []
 
+        # Parse per-request pinned buffer info from msg[8]/msg[9] if present
+        dst_pinned_ptr = int(msg[8].decode("ascii")) if len(msg) > 8 else 0
+        dst_pinned_size = int(msg[9].decode("ascii")) if len(msg) > 9 else 0
+
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -83,6 +128,8 @@ class TransferInfo:
             dst_aux_index=int(msg[5].decode("ascii")),
             required_dst_info_num=int(msg[6].decode("ascii")),
             dst_state_indices=dst_state_indices,
+            dst_pinned_ptr=dst_pinned_ptr,
+            dst_pinned_size=dst_pinned_size,
         )
 
 
@@ -228,11 +275,20 @@ class NixlKVManager(CommonKVManager):
         self.register_buffer_to_engine()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Per-request KV index accumulation for CPU buffer chunked-prefill fix.
+            # Maps bootstrap_room -> list of kv_index arrays (one per send() chunk).
+            # All chunks are combined into a single gather+NIXL write on is_last,
+            # preventing each chunk from overwriting the previous chunk's offset in
+            # the destination (decode) CPU buffer.
+            self._cpu_pending_kv: Dict[int, List] = {}
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
+            # Deferred pool releases: (cuda_event, pool_offset) pairs waiting for
+            # the scatter kernel to finish before the pinned region can be reused.
+            self._pending_pool_releases: List[Tuple[torch.cuda.Event, int]] = []
             self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
@@ -793,6 +849,21 @@ class NixlKVManager(CommonKVManager):
                     f"[TRITON-KV] Invalid dst_pinned_ptr=0 for {peer_name}."
                 )
 
+            # Checksum the gather output AFTER the CUDA event has fired,
+            # confirming the gather kernel completed before NIXL reads it.
+            room_for_log = int(notif.split("_")[0])
+            logger.warning(
+                f"[DBG-NIXL-WRITE] room={room_for_log} "
+                f"src=0x{buf_ptr:x} dst=0x{dst_pinned_ptr + dst_offset:x} "
+                f"size={transfer_bytes}"
+            )
+            if _NIXL_DEBUG_CHECKSUM:
+                _kv_checksum(
+                    buffer_region,
+                    f"PREFILL-AFTER-GATHER peer={peer_name}",
+                    room_for_log,
+                )
+
             src_addrs = [(buf_ptr, transfer_bytes, 0)]
             dst_addrs = [(dst_pinned_ptr + dst_offset, transfer_bytes, 0)]
 
@@ -901,6 +972,15 @@ class NixlKVManager(CommonKVManager):
 
         def post_fn():
             handles = []
+            # Checksum the FULL gather buffer once (after the CUDA event fires)
+            if _NIXL_DEBUG_CHECKSUM and requests:
+                first_notif = requests[0][3]
+                room_for_log = int(first_notif.split("_")[0])
+                _kv_checksum(
+                    buffer_region,
+                    f"PREFILL-BATCHED-AFTER-GATHER nreqs={len(requests)}",
+                    room_for_log,
+                )
             for agent_name, dst_pinned_ptr, dst_pinned_size, notif, head_start, num_heads in requests:
                 src_slice_ptr = buf_data_ptr + head_start * head_stride_bytes
                 slice_bytes = num_heads * head_stride_bytes
@@ -940,6 +1020,7 @@ class NixlKVManager(CommonKVManager):
         kv_indices: npt.NDArray[np.int32],
         head_start: int = 0,
         num_heads_received: int = None,
+        pinned_buffer: Optional[torch.Tensor] = None,
     ):
         """
         Scatter received KV data from pinned buffer to KV cache.
@@ -986,12 +1067,13 @@ class NixlKVManager(CommonKVManager):
             self._dst_slot_stride = k_buffers[0].stride(0)
             self._dst_head_stride = k_buffers[0].stride(1)
 
-        # Scatter from shared pool's buffer to KV cache.
+        # Scatter from the per-request allocated region (or whole pool as fallback) to KV cache.
         # No CPU sync needed: the scatter kernel runs on the default CUDA stream, and the
         # subsequent model forward pass also runs on that stream, so GPU stream ordering
         # guarantees the scatter completes before the forward reads the KV cache.
+        input_buffer = pinned_buffer if pinned_buffer is not None else self._pinned_pool.buffer
         scatter_kv_all_layers(
-            pinned_input=self._pinned_pool.buffer,
+            pinned_input=input_buffer,
             k_data_ptrs=self._k_data_ptrs,
             v_data_ptrs=self._v_data_ptrs,
             slot_indices=slot_indices_tensor,
@@ -1214,10 +1296,13 @@ class NixlKVManager(CommonKVManager):
                             f"head_start={head_start}, heads_per_decode={heads_per_decode_rank}"
                         )
                         notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.pp_rank}"
+                        # Use per-request allocated ptr if available, else fall back to static pool start
+                        effective_dst_ptr = req.dst_pinned_ptr if req.dst_pinned_ptr != 0 else decode_info.dst_pinned_ptr
+                        effective_dst_size = req.dst_pinned_size if req.dst_pinned_size != 0 else decode_info.dst_pinned_size
                         batch_requests.append((
                             req.agent_name,
-                            decode_info.dst_pinned_ptr,
-                            decode_info.dst_pinned_size,
+                            effective_dst_ptr,
+                            effective_dst_size,
                             notif,
                             head_start,
                             heads_per_decode_rank,
@@ -1272,7 +1357,19 @@ class NixlKVManager(CommonKVManager):
 
             kv_xfer_handle = None
             if use_cpu_buffer and prefill_tp_size >= decode_tp_size:
-                # Triton CPU buffer path for same-TP or prefill_tp > decode_tp
+                # Triton CPU buffer path for same-TP or prefill_tp > decode_tp.
+                #
+                # Bug fix: chunked prefill sends kv_indices in multiple send()
+                # calls (chunk_id 0, 1, ...).  Without accumulation, each chunk
+                # computes dst_offset using its own num_tokens, so chunk N
+                # overwrites chunk N-1 at the same destination offset, leaving
+                # the second half of the decode CPU buffer as zeros.
+                #
+                # Fix: accumulate all per-chunk kv_indices and issue a single
+                # gather + NIXL WRITE only when is_last=True, covering the full
+                # N_total-token buffer in one shot.  Decode always receives
+                # exactly one KV notification per prefill TP rank (chunk_id=0,
+                # is_last=True), so its is_done() logic is unaffected.
                 num_kv_heads = self.kv_args.kv_head_num
                 local_tp_rank = self.kv_args.engine_rank % prefill_tp_size
 
@@ -1294,17 +1391,37 @@ class NixlKVManager(CommonKVManager):
                     num_heads_to_send = num_kv_heads
                     dst_head_offset = 0
 
-                kv_event, kv_post_fn = self.send_kvcache_triton(
-                    peer_name=req.agent_name,
-                    prefill_kv_indices=kv_indices,
-                    dst_pinned_ptr=decode_info.dst_pinned_ptr,
-                    dst_pinned_size=decode_info.dst_pinned_size,
-                    notif=notif,
-                    head_start=head_start,
-                    num_heads_to_send=num_heads_to_send,
-                    dst_head_offset=dst_head_offset,
-                )
-                pending_posts.append((kv_event, kv_post_fn))
+                # Accumulate kv_indices across chunks for this request.
+                pending_kv = self._cpu_pending_kv.setdefault(bootstrap_room, [])
+                pending_kv.append(kv_indices)
+
+                if is_last:
+                    # Combine all accumulated chunks into one contiguous array.
+                    all_kv_indices = (
+                        np.concatenate(pending_kv) if len(pending_kv) > 1
+                        else pending_kv[0]
+                    )
+                    del self._cpu_pending_kv[bootstrap_room]
+
+                    # Use per-request allocated ptr if available, else fall back to static pool start
+                    effective_dst_ptr = req.dst_pinned_ptr if req.dst_pinned_ptr != 0 else decode_info.dst_pinned_ptr
+                    effective_dst_size = req.dst_pinned_size if req.dst_pinned_size != 0 else decode_info.dst_pinned_size
+
+                    # Always use chunk_id=0 / is_last=True for the CPU buffer
+                    # path: we emit exactly one KV notification per request.
+                    cpu_notif = f"{req.room}_kv_0_1_{self.kv_args.pp_rank}"
+                    kv_event, kv_post_fn = self.send_kvcache_triton(
+                        peer_name=req.agent_name,
+                        prefill_kv_indices=all_kv_indices,
+                        dst_pinned_ptr=effective_dst_ptr,
+                        dst_pinned_size=effective_dst_size,
+                        notif=cpu_notif,
+                        head_start=head_start,
+                        num_heads_to_send=num_heads_to_send,
+                        dst_head_offset=dst_head_offset,
+                    )
+                    pending_posts.append((kv_event, kv_post_fn))
+                # else: not the last chunk — accumulate only, defer send.
             elif self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
                 kv_xfer_handle = self.send_kvcache(
                     req.agent_name,
@@ -1359,7 +1476,33 @@ class NixlKVManager(CommonKVManager):
             del self.transfer_infos[bootstrap_room]
         return handles, pool_allocations, pending_posts
 
+    def _drain_deferred_pool_releases(self) -> None:
+        """Release pinned-buffer regions whose scatter kernels have completed.
+
+        Checks each pending (CUDA event, pool offset) pair.  If the event has
+        fired (GPU kernel done), the pool region is released immediately so it
+        can be reused by the next NIXL transfer.  Pending entries whose events
+        have *not* yet fired are kept for the next call.
+
+        This is called both from ``update_transfer_status()`` (normal poll path)
+        and from ``NixlKVReceiver.init()`` *before* blocking on pool allocation,
+        to avoid a deadlock where the allocator waits for space that would only
+        be freed after ``poll()`` runs on an already-allocated request.
+        """
+        if not self._pending_pool_releases or self._pinned_pool is None:
+            return
+        remaining = []
+        for event, offset in self._pending_pool_releases:
+            if event.query():
+                self._pinned_pool.release(offset)
+            else:
+                remaining.append((event, offset))
+        self._pending_pool_releases = remaining
+
     def update_transfer_status(self):
+        # Drain deferred pinned-buffer releases from completed scatter kernels.
+        self._drain_deferred_pool_releases()
+
         # Process notifications from received transfers.
         notif_map = self.agent.get_new_notifs()
         for peer_name, messages in notif_map.items():
@@ -1543,6 +1686,9 @@ class NixlKVReceiver(CommonKVReceiver):
         # Store kv_indices for Triton scatter after transfer completes
         self._triton_kv_indices: Optional[npt.NDArray[np.int32]] = None
         self._triton_scatter_done = False
+        # Per-request pinned buffer allocation on the receive side
+        self._recv_pool_offset: Optional[int] = None
+        self._recv_pool_buffer_view: Optional[torch.Tensor] = None
 
     def init(
         self,
@@ -1556,6 +1702,40 @@ class NixlKVReceiver(CommonKVReceiver):
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
+
+        # For CPU buffer transfers, allocate a per-request region from the receive pool.
+        # Each concurrent request gets its own region so NIXL writes don't overwrite each other.
+        # We send the allocated ptr to the prefill so it writes to our unique offset.
+        recv_pinned_ptr = 0
+        recv_pinned_size = 0
+        if (
+            self.kv_mgr.nixl_use_cpu_buffer
+            and self.kv_mgr._pinned_pool is not None
+            and self.kv_mgr.kv_args.k_buffers is not None
+        ):
+            k_buffers = self.kv_mgr.kv_args.k_buffers
+            num_layers = len(k_buffers)
+            num_heads = k_buffers[0].shape[1]
+            head_dim = k_buffers[0].shape[2]
+            bytes_per_element = k_buffers[0].element_size()
+            num_tokens = len(kv_indices) * self.kv_mgr.kv_args.page_size
+            recv_pinned_size = (
+                num_layers * 2 * num_tokens * num_heads * head_dim * bytes_per_element
+            )
+            # Drain any deferred releases from completed scatter kernels before
+            # allocating, so we don't block if a previous request's scatter has
+            # already finished but its pool region hasn't been freed yet.
+            self.kv_mgr._drain_deferred_pool_releases()
+            recv_offset, recv_buffer_view = self.kv_mgr._pinned_pool.allocate(
+                recv_pinned_size
+            )
+            self._recv_pool_offset = recv_offset
+            self._recv_pool_buffer_view = recv_buffer_view
+            recv_pinned_ptr = self.kv_mgr._pinned_pool.buffer.data_ptr() + recv_offset
+            logger.warning(
+                f"[DBG-ALLOC] room={self.bootstrap_room} offset={recv_offset} "
+                f"ptr=0x{recv_pinned_ptr:x} size={recv_pinned_size}"
+            )
 
         for bootstrap_info in self.bootstrap_infos:
             logger.debug(
@@ -1582,6 +1762,8 @@ class NixlKVReceiver(CommonKVReceiver):
                             if not is_dummy and state_indices is not None
                             else b""
                         ),
+                        str(recv_pinned_ptr).encode("ascii"),
+                        str(recv_pinned_size).encode("ascii"),
                     ]
                 )
 
@@ -1616,6 +1798,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.bootstrap_room,
                 f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.WaitingForInput",
             )
+            self._release_recv_pool()
             self.conclude_state = KVPoll.Failed
             return KVPoll.Failed
 
@@ -1626,6 +1809,7 @@ class NixlKVReceiver(CommonKVReceiver):
             )
             # Check if the transfer failed
             if self.kv_mgr.transfer_statuses[self.bootstrap_room].is_failed():
+                self._release_recv_pool()
                 self.conclude_state = KVPoll.Failed
                 logger.error(
                     f"Transfer for room {self.bootstrap_room} failed due to node failure"
@@ -1638,16 +1822,43 @@ class NixlKVReceiver(CommonKVReceiver):
                     and not self._triton_scatter_done
                 ):
                     try:
+                        # Checksum the receive buffer AFTER the NIXL notification
+                        # confirms the transfer is done, but BEFORE the scatter
+                        # kernel reads it.  Compare to the prefill-side checksum
+                        # in the prefill log for the same room to detect:
+                        #   - all-zero buffer  → NIXL write never reached this buffer
+                        #   - value mismatch   → wrong buffer address / pool aliasing
+                        #   - partial zeros    → transfer not fully written yet
+                        buf_ptr = self._recv_pool_buffer_view.data_ptr() if self._recv_pool_buffer_view is not None else 0
+                        logger.warning(
+                            f"[DBG-SCATTER] room={self.bootstrap_room} "
+                            f"buf_ptr=0x{buf_ptr:x} offset={self._recv_pool_offset}"
+                        )
+                        if _NIXL_DEBUG_CHECKSUM and self._recv_pool_buffer_view is not None:
+                            _kv_checksum(
+                                self._recv_pool_buffer_view,
+                                "DECODE-BEFORE-SCATTER",
+                                self.bootstrap_room,
+                            )
                         self.kv_mgr.scatter_received_kv(
                             kv_indices=self._triton_kv_indices,
                             head_start=0,
                             num_heads_received=None,
+                            pinned_buffer=self._recv_pool_buffer_view,
                         )
                         self._triton_scatter_done = True
+                        # Defer pool release until scatter kernel completes on GPU.
+                        # Record a CUDA event now (after kernel launch) and hand the
+                        # offset to the manager's deferred-release list.  The pool
+                        # region must not be reused until the GPU kernel has finished
+                        # reading from it, otherwise a concurrent NIXL write could
+                        # corrupt the buffer before the scatter is done.
+                        self._defer_recv_pool_release()
                     except Exception as e:
                         logger.error(
                             f"[TRITON-KV] Scatter failed: room={self.bootstrap_room}, error={e}"
                         )
+                        self._release_recv_pool()
                         self.conclude_state = KVPoll.Failed
                         del self.kv_mgr.transfer_statuses[self.bootstrap_room]
                         return KVPoll.Failed
@@ -1656,6 +1867,29 @@ class NixlKVReceiver(CommonKVReceiver):
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
+
+    def _release_recv_pool(self):
+        """Release the per-request pinned buffer allocation immediately."""
+        if self._recv_pool_offset is not None and self.kv_mgr._pinned_pool is not None:
+            self.kv_mgr._pinned_pool.release(self._recv_pool_offset)
+            self._recv_pool_offset = None
+            self._recv_pool_buffer_view = None
+
+    def _defer_recv_pool_release(self):
+        """Defer pinned-buffer release until the scatter kernel finishes on GPU.
+
+        Records a CUDA event on the current stream immediately after the scatter
+        kernel launch and hands the (event, offset) pair to the manager's
+        deferred-release list.  The pool region is freed in
+        ``update_transfer_status()`` once ``event.query()`` returns True.
+        """
+        if self._recv_pool_offset is None:
+            return
+        event = torch.cuda.Event()
+        event.record()
+        self.kv_mgr._pending_pool_releases.append((event, self._recv_pool_offset))
+        self._recv_pool_offset = None
+        self._recv_pool_buffer_view = None
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
