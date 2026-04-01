@@ -741,6 +741,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+    # For decode-to-decode migration: direct sender ZMQ address (ip:port) to bypass bootstrap
+    migration_sender_addr: Optional[str] = None
 
     # Priority for the request
     priority: Optional[int] = None
@@ -1476,6 +1478,20 @@ class MigrateReqOutput(BaseReq):
     not_found: bool = False
     # Error message if failed
     error: Optional[str] = None
+    # Full token sequences for auto-migration destination reconstruction
+    origin_input_ids: Optional[List[int]] = None
+    all_output_ids: Optional[List[int]] = None
+    # Direct sender connection info (bypass bootstrap for decode-to-decode migration)
+    sender_rank_ip: Optional[str] = None
+    sender_rank_port: Optional[int] = None
+
+
+@dataclass
+class DPMigrateReq(BaseReq):
+    """Command from DP controller to tokenizer manager to trigger migration."""
+
+    src_dp_rank: int = 0
+    dst_dp_rank: int = 0
 
 
 @dataclass
@@ -1744,6 +1760,9 @@ class GetLoadReqOutput(BaseReq):
     num_waiting_reqs: int
     num_tokens: int
     ts_tic: float
+    # Lightest running request info for DP migration balancing
+    lightest_req_rid: Optional[str] = None
+    lightest_req_tokens: Optional[int] = None
 
 
 @dataclass

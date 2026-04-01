@@ -684,12 +684,24 @@ class SchedulerMetricsMixin:
         num_tokens += sum(req.seqlen for queue in waiting_queues for req in queue)
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
 
+        # Find lightest running request for DP migration balancing
+        lightest_rid = None
+        lightest_tokens = None
+        if not self.running_batch.is_empty():
+            for req in self.running_batch.reqs:
+                req_tokens = len(req.origin_input_ids) + len(req.output_ids)
+                if lightest_tokens is None or req_tokens < lightest_tokens:
+                    lightest_tokens = req_tokens
+                    lightest_rid = req.rid
+
         return GetLoadReqOutput(
             dp_rank=self.dp_rank,
             num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
             ts_tic=time.perf_counter(),
+            lightest_req_rid=lightest_rid,
+            lightest_req_tokens=lightest_tokens,
         )
 
     def get_loads(self: Scheduler, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:

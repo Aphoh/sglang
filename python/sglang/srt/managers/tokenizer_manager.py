@@ -62,6 +62,7 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
+    DPMigrateReq,
     MigrateReq,
     MigrateReqOutput,
     OpenSessionReqOutput,
@@ -157,6 +158,11 @@ class ReqState:
 
     request_sent_to_scheduler_ts: float = 0.0
     response_sent_to_client_ts: float = 0.0
+
+    # Stored tokenized request for DP migration reconstruction
+    tokenized_obj: Optional[TokenizedGenerateReqInput] = None
+    # Flag: request is being auto-migrated between DP ranks. Suppress finish handling.
+    is_dp_migrating: bool = False
 
     # For streaming output
     last_output_offset: int = 0
@@ -484,6 +490,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     self._handle_update_weights_from_disk_req_output,
                 ),
                 (MigrateReqOutput, self._handle_migrate_req_output),
+                (DPMigrateReq, self._handle_dp_migrate_command),
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
@@ -1082,6 +1089,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             [], False, asyncio.Event(), obj, created_time=created_time
         )
         state.request_sent_to_scheduler_ts = time.time()
+        # Store tokenized request for DP migration reconstruction
+        if isinstance(tokenized_obj, TokenizedGenerateReqInput):
+            state.tokenized_obj = tokenized_obj
         self.rid_to_state[obj.rid] = state
         trace_slice_end(
             RequestStage.TOKENIZER_DISPATCH, obj.rid, thread_finish_flag=True
@@ -1418,7 +1428,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             }
         finally:
             self._migrate_futures.pop(rid, None)
-            self._migrate_debug.pop(rid, None)
+            # Don't pop _migrate_debug yet — _execute_dp_migration may need it
+
+        # Store raw output for auto-migration handler
+        if rid in self._migrate_debug:
+            self._migrate_debug[rid]["raw_output"] = migrate_output
 
         if migrate_output.not_found:
             logger.warning(f"migrate_request: not found rid={rid}, error={migrate_output.error}")
@@ -1527,6 +1541,153 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     f"src_tp_rank={getattr(recv_obj, 'src_tp_rank', None)} "
                     f"error={getattr(recv_obj, 'error', None)}"
                 )
+
+    def _handle_dp_migrate_command(self, cmd: DPMigrateReq) -> None:
+        """Handle a DP migration command from the DP controller.
+
+        Spawns an async task to execute the migration:
+        1. Call migrate_request() on the source scheduler
+        2. Construct a destination request with the full token sequence
+        3. Send the destination request to the DP controller for routing
+        """
+        rid = cmd.rid
+        src_rank = cmd.src_dp_rank
+        dst_rank = cmd.dst_dp_rank
+
+        if rid not in self.rid_to_state:
+            logger.warning(
+                f"_handle_dp_migrate_command: rid={rid} not in rid_to_state, skipping"
+            )
+            return
+
+        task = asyncio.create_task(
+            self._execute_dp_migration(rid, src_rank, dst_rank)
+        )
+        self.asyncio_tasks.add(task)
+        task.add_done_callback(self.asyncio_tasks.discard)
+
+    async def _execute_dp_migration(
+        self, rid: str, src_rank: int, dst_rank: int
+    ) -> None:
+        """Execute a DP migration: move request from src_rank to dst_rank."""
+        try:
+            state = self.rid_to_state.get(rid)
+            if state is None or state.finished:
+                logger.warning(
+                    f"_execute_dp_migration: rid={rid} not found or finished"
+                )
+                return
+
+            # Mark as migrating to suppress the source's "finish" message
+            state.is_dp_migrating = True
+
+            bootstrap_host = self.server_args.host
+            if not bootstrap_host or bootstrap_host in ("0.0.0.0", "::"):
+                from sglang.srt.utils import get_local_ip_auto
+                bootstrap_host = get_local_ip_auto()
+            bootstrap_port = self.server_args.disaggregation_bootstrap_port
+
+            # tokens_seen=0 means MigrateReqOutput will include all pending outputs
+            result = await self.migrate_request(
+                rid=rid,
+                bootstrap_host=bootstrap_host,
+                bootstrap_port=bootstrap_port,
+                bootstrap_room=0,  # Source scheduler generates its own room
+                tokens_seen=0,
+            )
+
+            if result.get("result") != "migrate":
+                logger.warning(
+                    f"_execute_dp_migration: migration failed for rid={rid}: {result}"
+                )
+                return
+
+            migrate_output_bootstrap_room = result.get("bootstrap_room")
+
+            # Reconstruct destination request from stored tokenized_obj
+            if state.tokenized_obj is None:
+                logger.error(
+                    f"_execute_dp_migration: no stored tokenized_obj for rid={rid}"
+                )
+                return
+
+            # Get the full token sequence from the migrate result
+            # The migrate_request returns the MigrateReqOutput; we need to access
+            # the raw output stored in _migrate_debug or extend migrate_request return.
+            # For now, we stored the future result in migrate_request.
+            # Let's get the origin_input_ids and all_output_ids from the migrate output.
+            migrate_debug = self._migrate_debug.get(rid, {})
+            migrate_output = migrate_debug.get("raw_output")
+
+            if migrate_output is None or not hasattr(migrate_output, "origin_input_ids"):
+                logger.error(
+                    f"_execute_dp_migration: no raw MigrateReqOutput for rid={rid}"
+                )
+                return
+
+            origin_input_ids = migrate_output.origin_input_ids or []
+            all_output_ids = migrate_output.all_output_ids or []
+            full_input_ids = list(origin_input_ids) + list(all_output_ids)
+
+            if not full_input_ids:
+                logger.error(
+                    f"_execute_dp_migration: empty token sequence for rid={rid}"
+                )
+                return
+
+            # Get sender's direct address for the destination receiver
+            sender_rank_ip = getattr(migrate_output, "sender_rank_ip", None)
+            sender_rank_port = getattr(migrate_output, "sender_rank_port", None)
+            migration_sender_addr = None
+            if sender_rank_ip and sender_rank_port:
+                migration_sender_addr = f"{sender_rank_ip}:{sender_rank_port}"
+
+            # Clone the original tokenized request and modify for destination
+            orig = state.tokenized_obj
+            dest_req = TokenizedGenerateReqInput(
+                orig.input_text,
+                full_input_ids,
+                orig.mm_inputs,
+                orig.sampling_params,
+                orig.return_logprob,
+                orig.logprob_start_len,
+                orig.top_logprobs_num,
+                orig.token_ids_logprob,
+                orig.stream,
+                rid=rid,
+                bootstrap_host=bootstrap_host,
+                bootstrap_port=bootstrap_port,
+                bootstrap_room=migrate_output_bootstrap_room,
+                data_parallel_rank=dst_rank,
+                migration_sender_addr=migration_sender_addr,
+                lora_id=orig.lora_id,
+            )
+            dest_req.session_params = orig.session_params
+
+            logger.info(
+                f"_execute_dp_migration: sending destination request rid={rid} "
+                f"dst_rank={dst_rank} input_ids_len={len(full_input_ids)} "
+                f"bootstrap_room={migrate_output_bootstrap_room} "
+                f"migration_sender_addr={migration_sender_addr}"
+            )
+            self.send_to_scheduler.send_pyobj(dest_req)
+
+            # Keep is_dp_migrating=True so we suppress the source's "finish" signal.
+            # The flag stays True; the destination request will produce output under
+            # the same rid.  Normal (non-finish) output is passed through even when
+            # the flag is set (see _handle_batch_output), so tokens flow to the client.
+            # The flag is cleared when the destination finishes normally.
+
+        except Exception as e:
+            logger.error(
+                f"_execute_dp_migration: exception for rid={rid}: {e}",
+                exc_info=True,
+            )
+            # On failure, clear migration flag so the request can finish normally
+            if rid in self.rid_to_state:
+                self.rid_to_state[rid].is_dp_migrating = False
+        finally:
+            self._migrate_debug.pop(rid, None)
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
@@ -1795,6 +1956,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "meta_info": meta_info,
                 }
 
+            # During DP migration, suppress the first "finish" from the source scheduler
+            # so the request stays alive for the destination scheduler to continue.
+            # After suppressing one finish, clear the flag so the destination's finish
+            # is processed normally.
+            if state.is_dp_migrating and recv_obj.finished_reasons[i] is not None:
+                logger.info(
+                    f"Suppressing source finish for migrating request {rid}, "
+                    f"clearing migration flag"
+                )
+                state.is_dp_migrating = False
+                continue
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
                 state.finished_time = time.time()

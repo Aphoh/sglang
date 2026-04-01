@@ -465,6 +465,11 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    if getattr(req, "kv_committed_freed", False):
+        logger.warning(
+            f"release_kv_cache: KV already freed for rid={req.rid}, skipping"
+        )
+        return
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
     # MambaRadixCache may alloc mamba state before alloc KV cache

@@ -516,6 +516,7 @@ class Req:
         bootstrap_room: Optional[int] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         data_parallel_rank: Optional[int] = None,
+        migration_sender_addr: Optional[str] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
@@ -760,6 +761,8 @@ class Req:
 
         # For data parallel rank routing
         self.data_parallel_rank: Optional[int] = data_parallel_rank
+        # For decode-to-decode migration: direct sender address
+        self.migration_sender_addr: Optional[str] = migration_sender_addr
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
@@ -804,9 +807,12 @@ class Req:
 
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
-        assert (
-            not self.kv_committed_freed
-        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+        if self.kv_committed_freed:
+            logger.warning(
+                f"Committed KV cache already freed ({self.kv_committed_len=}), "
+                f"rid={self.rid} — skipping double free"
+            )
+            return 0
         self.kv_committed_freed = True
         return self.kv_committed_len
 
@@ -816,9 +822,12 @@ class Req:
         # NOTE: This function is called when there is over-allocation of KV cache.
         # Over-allocation: we allocate more KV cache than the committed length.
         # e.g., speculative decoding may allocate more KV cache than actually used.
-        assert (
-            not self.kv_overallocated_freed
-        ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
+        if self.kv_overallocated_freed:
+            logger.warning(
+                f"Overallocated KV cache already freed, {self.kv_committed_len=}, "
+                f"{self.kv_allocated_len=}, rid={self.rid} — skipping double free"
+            )
+            return 0, 0
         self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
 

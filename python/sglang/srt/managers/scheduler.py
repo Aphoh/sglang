@@ -1492,6 +1492,7 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 disagg_mode=self.disaggregation_mode,
                 data_parallel_rank=recv_req.data_parallel_rank,
+                migration_sender_addr=getattr(recv_req, "migration_sender_addr", None),
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(

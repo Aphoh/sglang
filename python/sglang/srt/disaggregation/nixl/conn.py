@@ -397,15 +397,26 @@ class NixlKVManager(CommonKVManager):
         if agent_name in self.decode_kv_args_table:
             logger.info(f"Peer {agent_name} was already registered, ignoring.")
             return
-        logger.debug(
-            f"[TRITON-KV] Registering remote peer {agent_name}: "
+        logger.info(
+            f"[_add_remote_peer] agent_name={agent_name}, "
             f"dst_pinned_ptr=0x{decode_kv_args.dst_pinned_ptr:x}, "
             f"dst_pinned_size={decode_kv_args.dst_pinned_size}, "
             f"decode_tp_size={decode_kv_args.decode_tp_size}, "
-            f"decode_tp_rank={decode_kv_args.decode_tp_rank}"
+            f"decode_tp_rank={decode_kv_args.decode_tp_rank}, "
+            f"metadata_len={len(decode_kv_args.agent_metadata) if decode_kv_args.agent_metadata else 'None'}, "
+            f"metadata_type={type(decode_kv_args.agent_metadata).__name__}, "
+            f"self.disaggregation_mode={self.disaggregation_mode}, "
+            f"self.agent={self.agent}"
         )
         self.decode_kv_args_table[agent_name] = decode_kv_args
-        self.agent.add_remote_agent(decode_kv_args.agent_metadata)
+        try:
+            self.agent.add_remote_agent(decode_kv_args.agent_metadata)
+        except Exception as e:
+            logger.error(
+                f"[_add_remote_peer] FAILED add_remote_agent for {agent_name}: {e}, "
+                f"metadata_repr={repr(decode_kv_args.agent_metadata)[:200]}"
+            )
+            raise
 
     def send_kvcache(
         self,
@@ -1565,10 +1576,11 @@ class NixlKVReceiver(CommonKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         prefill_dp_rank: Optional[int] = None,
+        migration_sender_addr: Optional[str] = None,
     ):
         self.started_transfer = False
         self.conclude_state = None
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
+        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank, migration_sender_addr)
 
         # Track this room with its bootstrap address for heartbeat monitoring
         if hasattr(self.kv_mgr, "addr_to_rooms_tracker"):

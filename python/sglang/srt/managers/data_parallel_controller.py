@@ -31,6 +31,7 @@ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BlockReqInput,
+    DPMigrateReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
@@ -89,12 +90,17 @@ class DPBudget:
         self.dp_size = dp_size
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
+        # Per-rank lightest request info for migration
+        self.lightest_req_rid = [None] * dp_size
+        self.lightest_req_tokens = [None] * dp_size
 
     def update_budget(self, load_update: WatchLoadUpdateReq):
         """Update the budget."""
         for load in load_update.loads:
             self.total_requests[load.dp_rank] = load.num_reqs
             self.total_tokens[load.dp_rank] = load.num_tokens
+            self.lightest_req_rid[load.dp_rank] = load.lightest_req_rid
+            self.lightest_req_tokens[load.dp_rank] = load.lightest_req_tokens
 
     def dispatch(self, method: LoadBalanceMethod):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
@@ -111,6 +117,116 @@ class DPBudget:
         # Increment the load of that worker by one as a heuristic
         self.total_requests[target_rank] += 1
         return target_rank
+
+
+class DPMigrationBalancer:
+    """Implements the minimum-weight migration algorithm for DP load balancing.
+
+    On each load update tick:
+    1. Rank DP ranks by total token load.
+    2. Identify the top-M heaviest and bottom-M lightest ranks.
+    3. Find the lightest (youngest) request across all heavy ranks.
+    4. Trigger migration if mean_heavy - mean_light > alpha * w_min.
+    5. Migrate the lightest request from its heavy rank to the lightest rank.
+    6. Enter cooldown for tau ticks to prevent oscillation.
+    """
+
+    def __init__(self, dp_size: int, alpha: float = 2.0, top_m: int = 4,
+                 cooldown_seconds: float = 10.0):
+        self.dp_size = dp_size
+        self.alpha = alpha
+        self.top_m = top_m
+        self.cooldown_seconds = cooldown_seconds
+        self._last_migration_time = 0.0
+        # Track rids currently being migrated to avoid double-migration
+        self._pending_migrations: set = set()
+        # Track recently migrated rids to prevent ping-pong
+        # Maps rid -> timestamp when migration completed
+        self._recently_migrated: dict = {}
+        # Per-rid cooldown: don't re-migrate a request within this window
+        self._rid_cooldown_seconds = cooldown_seconds * 6  # 60s default
+
+    def check(self, budget: DPBudget):
+        """Check for imbalance and return migration actions.
+
+        Returns:
+            List of (rid, src_rank, dst_rank) tuples to migrate.
+        """
+        now = time.monotonic()
+        if now - self._last_migration_time < self.cooldown_seconds:
+            return []
+
+        if self.dp_size < 2:
+            return []
+
+        # 1. Rank by load (total tokens)
+        rank_loads = [
+            (i, budget.total_tokens[i]) for i in range(self.dp_size)
+        ]
+        rank_loads.sort(key=lambda x: x[1])
+
+        m = min(self.top_m, self.dp_size // 2)
+        if m == 0:
+            return []
+
+        light = rank_loads[:m]
+        heavy = rank_loads[-m:]
+
+        mean_heavy = sum(load for _, load in heavy) / m
+        mean_light = sum(load for _, load in light) / m
+
+        # 2. Find lightest request across heavy ranks
+        best_rid = None
+        best_tokens = None
+        best_src_rank = None
+        for rank, _ in heavy:
+            rid = budget.lightest_req_rid[rank]
+            tokens = budget.lightest_req_tokens[rank]
+            if rid is None or tokens is None:
+                continue
+            if rid in self._pending_migrations:
+                continue
+            # Don't migrate internal health check requests
+            if rid.startswith("HEALTH_CHECK_"):
+                continue
+            # Don't re-migrate recently migrated requests (prevents ping-pong)
+            if rid in self._recently_migrated:
+                if now - self._recently_migrated[rid] < self._rid_cooldown_seconds:
+                    continue
+                else:
+                    del self._recently_migrated[rid]
+            if best_tokens is None or tokens < best_tokens:
+                best_tokens = tokens
+                best_rid = rid
+                best_src_rank = rank
+
+        if best_rid is None or best_tokens is None:
+            return []
+
+        # 3. Trigger condition
+        w_min = best_tokens
+        if mean_heavy - mean_light <= self.alpha * w_min:
+            return []
+
+        # 4. Pick lightest destination rank
+        dst_rank = light[0][0]
+
+        logger.info(
+            f"DPMigrationBalancer: triggering migration rid={best_rid} "
+            f"src_rank={best_src_rank} dst_rank={dst_rank} "
+            f"w_min={w_min} mean_heavy={mean_heavy:.0f} mean_light={mean_light:.0f} "
+            f"gap={mean_heavy - mean_light:.0f} threshold={self.alpha * w_min:.0f}"
+        )
+
+        self._pending_migrations.add(best_rid)
+        self._last_migration_time = time.monotonic()
+
+        return [(best_rid, best_src_rank, dst_rank)]
+
+    def migration_completed(self, rid: str):
+        """Called when a migration completes (success or failure)."""
+        self._pending_migrations.discard(rid)
+        self._recently_migrated[rid] = time.monotonic()
 
 
 class DataParallelController:
@@ -134,7 +250,7 @@ class DataParallelController:
         self.global_balance_id = 0
 
         # Init inter-process communication
-        self.context = zmq.Context(1 + server_args.dp_size)
+        self.context = zmq.Context(2 + server_args.dp_size)
         if server_args.node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -152,6 +268,30 @@ class DataParallelController:
 
         # Load balance budget
         self.dp_budget = DPBudget(server_args.dp_size)
+
+        # DP migration balancer
+        self.migration_balancer = None
+        if getattr(server_args, "enable_dp_migration", False):
+            self.migration_balancer = DPMigrationBalancer(
+                dp_size=server_args.dp_size,
+                alpha=getattr(server_args, "dp_migration_alpha", 2.0),
+                top_m=getattr(server_args, "dp_migration_top_m", 4),
+                cooldown_seconds=getattr(server_args, "dp_migration_cooldown", 10.0),
+            )
+            # PUSH socket to send DPMigrateReq to the tokenizer manager
+            # (connects to the same PULL socket the tokenizer listens on)
+            if server_args.node_rank == 0:
+                self.send_to_tokenizer = get_zmq_socket(
+                    self.context,
+                    zmq.PUSH,
+                    port_args.tokenizer_ipc_name,
+                    False,
+                )
+            logger.info(
+                f"DP migration balancer enabled: alpha={server_args.dp_migration_alpha}, "
+                f"top_m={server_args.dp_migration_top_m}, "
+                f"cooldown={server_args.dp_migration_cooldown}"
+            )
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -192,6 +332,21 @@ class DataParallelController:
 
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
+
+        # Check for migration triggers
+        if self.migration_balancer is not None:
+            migrations = self.migration_balancer.check(self.dp_budget)
+            for rid, src_rank, dst_rank in migrations:
+                cmd = DPMigrateReq(
+                    rid=rid,
+                    src_dp_rank=src_rank,
+                    dst_dp_rank=dst_rank,
+                )
+                logger.info(
+                    f"Sending DPMigrateReq: rid={rid} "
+                    f"src={src_rank} dst={dst_rank}"
+                )
+                self.send_to_tokenizer.send_pyobj(cmd)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.status = ranks.status

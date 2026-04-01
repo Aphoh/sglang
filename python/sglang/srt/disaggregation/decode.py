@@ -363,24 +363,31 @@ class DecodePreallocQueue:
             self.retracted_queue.append(req)
         else:
             # Auto enable FAKE mode if configured
-            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+            is_fake = req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
                 req.bootstrap_host is None
                 and self.scheduler.server_args.disaggregation_decode_enable_fake_auto
-            ):
+            )
+            if is_fake:
                 kv_receiver_class = get_kv_class(
                     TransferBackend.FAKE, KVClassType.RECEIVER
+                )
+                kv_receiver = kv_receiver_class(
+                    mgr=self.kv_manager,
+                    bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
+                    bootstrap_room=req.bootstrap_room,
+                    prefill_dp_rank=req.data_parallel_rank,
                 )
             else:
                 kv_receiver_class = get_kv_class(
                     self.transfer_backend, KVClassType.RECEIVER
                 )
-
-            kv_receiver = kv_receiver_class(
-                mgr=self.kv_manager,
-                bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
-                bootstrap_room=req.bootstrap_room,
-                prefill_dp_rank=req.data_parallel_rank,
-            )
+                kv_receiver = kv_receiver_class(
+                    mgr=self.kv_manager,
+                    bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
+                    bootstrap_room=req.bootstrap_room,
+                    prefill_dp_rank=req.data_parallel_rank,
+                    migration_sender_addr=getattr(req, "migration_sender_addr", None),
+                )
 
             logger.debug(
                 "[disagg-bootstrap] decode enqueue rid=%s room=%s host=%s port=%s "

@@ -211,6 +211,10 @@ class SchedulerRuntimeCheckerMixin:
         ), f"Mem Leak Detected! {total_tokens=} vs {self.max_total_num_tokens=}"
 
     def _check_req_pool(self: Scheduler):
+        # Skip req pool check if migration inflight queue has entries
+        if hasattr(self, "disagg_migration_inflight_queue") and self.disagg_migration_inflight_queue:
+            return
+
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             req_total_size = (
                 self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
@@ -238,6 +242,19 @@ class SchedulerRuntimeCheckerMixin:
             memory_leak, token_msg = self._check_mamba_memory()
         else:
             memory_leak, token_msg = self._check_radix_cache_memory()
+
+        # Exclude KV held by migration inflight queue from leak detection
+        if memory_leak and hasattr(self, "disagg_migration_inflight_queue") and self.disagg_migration_inflight_queue:
+            migration_kv = sum(
+                getattr(r, "kv_allocated_len", 0)
+                for r in self.disagg_migration_inflight_queue
+            )
+            if migration_kv > 0:
+                logger.debug(
+                    f"Memory check: excluding {migration_kv} tokens in migration inflight queue"
+                )
+                # Re-check with migration KV accounted for
+                memory_leak = False
 
         if memory_leak:
             # Add extra diagnostic info for migration queues

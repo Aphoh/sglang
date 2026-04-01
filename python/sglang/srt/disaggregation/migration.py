@@ -71,6 +71,12 @@ class SchedulerMigrationMixin:
         """Initialize migration-related data structures."""
         self.disagg_migration_inflight_queue: List[Req] = []
         self._migration_kv_manager: Optional[BaseKVManager] = None
+        # Eagerly initialize the migration KV manager so the ~1.3s VRAM registration
+        # cost is paid at startup, not during the first live migration.
+        if getattr(self.server_args, "enable_dp_migration", False):
+            logger.info("Eagerly initializing migration KV manager...")
+            self._get_migration_kv_manager()
+            logger.info("Migration KV manager ready")
 
     def _handle_migration_failure(
         self: "Scheduler", req: Req, error_message: str
@@ -200,6 +206,11 @@ class SchedulerMigrationMixin:
             is_mla_backend(token_to_kv_pool),
             metrics_collector=getattr(self, "metrics_collector", None),
         )
+        logger.info(
+            f"Migration KV manager initialized: "
+            f"rank_port={self._migration_kv_manager.rank_port}, "
+            f"local_ip={self._migration_kv_manager.local_ip}"
+        )
         return self._migration_kv_manager
 
     def process_migrate_request(self: "Scheduler", recv_req: MigrateReq) -> None:
@@ -232,8 +243,15 @@ class SchedulerMigrationMixin:
             f"src_dp_rank={getattr(self, 'dp_rank', None)}, src_tp_rank={getattr(self, 'tp_rank', None)}"
         )
 
+        # Timestamped profiling for migration stall debugging
+        import time as _time
+        _t0 = _time.perf_counter()
+        def _ms():
+            return (_time.perf_counter() - _t0) * 1000
+
         # Find the request in running_batch
         req = self._find_and_remove_request(rid)
+        logger.info(f"[migrate-timing] rid={rid[:8]} find_and_remove={_ms():.1f}ms")
         if req is None:
             logger.debug(
                 f"Migration: request {rid} not found on this worker (expected in DP setups) "
@@ -314,36 +332,33 @@ class SchedulerMigrationMixin:
         effective_tokens = min(logical_tokens, committed_len)
         token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = token_to_kv_pool.page_size
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :effective_tokens
-        ]
-        page_indices = kv_to_page_indices(kv_indices.cpu().numpy(), page_size)
-        expected_pages = kv_to_page_num(effective_tokens, page_size)
-        if len(page_indices) != expected_pages:
-            error_message = (
-                f"Migration page_indices mismatch for request {rid}: "
-                f"effective_tokens={effective_tokens}, page_size={page_size}, "
-                f"page_indices_len={len(page_indices)}, expected_pages={expected_pages}"
-            )
-            self._handle_migration_failure(req, error_message)
-            output = MigrateReqOutput(
-                rid=rid,
-                src_dp_rank=getattr(self, "dp_rank", None),
-                src_tp_rank=getattr(self, "tp_rank", None),
-                bootstrap_room=bootstrap_room,
-                pending_output_ids=[],
-                total_tokens=logical_tokens,
-                success=False,
-                error=error_message,
-            )
-            self.send_to_tokenizer.send_output(output, recv_req)
-            self.stream_output([req], req.return_logprob)
-            return
 
+        logger.info(f"[migrate-timing] rid={rid[:8]} pre_copy={_ms():.1f}ms effective_tokens={effective_tokens}")
+
+        # Launch GPU→CPU copy on a separate stream so it doesn't block decode forward passes.
+        # We record an event and check completion in process_migration_inflight_queue.
+        if not hasattr(self, "_migration_stream"):
+            self._migration_stream = torch.cuda.Stream()
+
+        with torch.cuda.stream(self._migration_stream):
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :effective_tokens
+            ]
+            kv_indices_cpu = kv_indices.to("cpu", non_blocking=True)
+
+        copy_event = torch.cuda.Event()
+        copy_event.record(self._migration_stream)
+        logger.info(f"[migrate-timing] rid={rid[:8]} async_copy_launched={_ms():.1f}ms")
+
+        # Store on request — process_migration_inflight_queue will check the event
+        # and compute page_indices once the async copy completes (no scheduler stall)
+        req.migration_copy_event = copy_event
+        req.migration_kv_indices_cpu = kv_indices_cpu
+        req.migration_page_size = page_size
+        req.migration_page_indices = None  # computed later when copy_event fires
         req.migration_logical_tokens = logical_tokens
         req.migration_committed_len = committed_len
         req.migration_effective_tokens = effective_tokens
-        req.migration_page_indices = page_indices
         
         # How many output tokens has frontend seen?
         output_tokens_seen = max(0, tokens_seen - origin_input_len)
@@ -369,13 +384,26 @@ class SchedulerMigrationMixin:
             f"kv_committed_len={getattr(req, 'kv_committed_len', None)}, "
             f"kv_allocated_len={allocated_len}, "
             f"effective_tokens={effective_tokens}, "
-            f"page_indices_len={len(page_indices)}, "
+            f"page_indices=deferred, "
             f"tokens_seen_by_frontend={tokens_seen}, "
             f"output_tokens_seen={output_tokens_seen}, "
             f"pending_output_ids_len={len(pending_output_ids)}"
         )
 
-        # Send response back to tokenizer with pending outputs
+        logger.info(f"[migrate-timing] rid={rid[:8]} pre_setup_sender={_ms():.1f}ms")
+
+        # Setup KV sender for migration BEFORE sending the output,
+        # so we can include the sender's direct connection info
+        self._setup_migration_sender(req, bootstrap_host, bootstrap_port, bootstrap_room)
+
+        logger.info(f"[migrate-timing] rid={rid[:8]} post_setup_sender={_ms():.1f}ms")
+
+        # Get the migration sender's direct ZMQ address for the receiver to connect to
+        migration_kv_mgr = self._get_migration_kv_manager()
+        sender_rank_ip = getattr(migration_kv_mgr, "local_ip", None)
+        sender_rank_port = getattr(migration_kv_mgr, "rank_port", None)
+
+        # Send response back to tokenizer with pending outputs and sender connection info
         output = MigrateReqOutput(
             rid=rid,
             src_dp_rank=getattr(self, "dp_rank", None),
@@ -384,11 +412,13 @@ class SchedulerMigrationMixin:
             pending_output_ids=pending_output_ids,
             total_tokens=logical_tokens,
             success=True,
+            origin_input_ids=list(req.origin_input_ids),
+            all_output_ids=list(req.output_ids),
+            sender_rank_ip=sender_rank_ip,
+            sender_rank_port=sender_rank_port,
         )
         self.send_to_tokenizer.send_output(output, recv_req)
-
-        # Setup KV sender for migration
-        self._setup_migration_sender(req, bootstrap_host, bootstrap_port, bootstrap_room)
+        logger.info(f"[migrate-timing] rid={rid[:8]} send_output_done={_ms():.1f}ms")
 
         # Add to migration inflight queue
         # Mark as migrating so normal completion path won't release KV cache
@@ -574,13 +604,20 @@ class SchedulerMigrationMixin:
             if poll == KVPoll.WaitingForInput and not getattr(req, 'migration_kv_sent', False):
                 page_indices = getattr(req, "migration_page_indices", None)
                 if page_indices is None:
-                    error_message = (
-                        f"Migration missing page_indices for request {req.rid} "
-                        f"room={getattr(req, 'migration_bootstrap_room', None)}"
-                    )
-                    self._handle_migration_failure(req, error_message)
-                    done_reqs.append(req)
-                    continue
+                    # Check if async GPU→CPU copy has completed
+                    copy_event = getattr(req, "migration_copy_event", None)
+                    if copy_event is not None and copy_event.query():
+                        # Copy done — compute page_indices now (CPU-only, fast)
+                        kv_indices_cpu = req.migration_kv_indices_cpu.numpy()
+                        page_size = req.migration_page_size
+                        req.migration_page_indices = kv_to_page_indices(kv_indices_cpu, page_size)
+                        page_indices = req.migration_page_indices
+                        req.migration_copy_event = None  # done
+                        req.migration_kv_indices_cpu = None  # free
+                    else:
+                        # Still waiting for GPU→CPU copy
+                        undone_reqs.append(req)
+                        continue
 
                 # Compute num_pages from page indices (same as prefill does)
                 page_size = self.token_to_kv_pool_allocator.get_kvcache().page_size

@@ -647,6 +647,11 @@ class ServerArgs:
     kv_transfer_method: Literal["legacy", "triton"] = "legacy"
     # Total size of pinned CPU buffer for triton KV transfers (GB)
     pinned_buffer_max_gb: float = 64.0
+    # Automatic DP migration: move requests between DP ranks to balance KV cache load
+    enable_dp_migration: bool = False
+    dp_migration_alpha: float = 2.0  # Trigger multiplier (higher = less sensitive)
+    dp_migration_cooldown: float = 10.0  # Cooldown seconds between migrations
+    dp_migration_top_m: int = 4  # Number of ranks in heavy/light groups
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -4605,6 +4610,31 @@ class ServerArgs:
             help="Total size of pinned CPU buffer for triton KV transfers (GB). "
             "Used by range allocator for variable-sized concurrent transfers. "
             "Should be sized for sum of max concurrent transfers. Default is 64.0.",
+        )
+
+        # DP migration
+        parser.add_argument(
+            "--enable-dp-migration",
+            action="store_true",
+            help="Enable automatic migration of requests between DP ranks to balance KV cache load.",
+        )
+        parser.add_argument(
+            "--dp-migration-alpha",
+            type=float,
+            default=ServerArgs.dp_migration_alpha,
+            help="Trigger multiplier for DP migration. Higher values make migration less sensitive. Default is 2.0.",
+        )
+        parser.add_argument(
+            "--dp-migration-cooldown",
+            type=float,
+            default=ServerArgs.dp_migration_cooldown,
+            help="Cooldown seconds between DP migrations. Default is 10.0.",
+        )
+        parser.add_argument(
+            "--dp-migration-top-m",
+            type=int,
+            default=ServerArgs.dp_migration_top_m,
+            help="Number of ranks in heavy/light groups for DP migration. Default is 4.",
         )
 
         # Encode prefill disaggregation

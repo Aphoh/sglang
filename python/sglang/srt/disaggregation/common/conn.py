@@ -278,11 +278,17 @@ class CommonKVReceiver(BaseKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         prefill_dp_rank: Optional[int] = None,
+        migration_sender_addr: Optional[str] = None,
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
+
+        # Fast path for decode-to-decode migration: skip bootstrap, connect directly
+        if migration_sender_addr:
+            self._init_migration_receiver(migration_sender_addr)
+            return
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             (
@@ -473,6 +479,53 @@ class CommonKVReceiver(BaseKVReceiver):
             self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
         assert len(self.bootstrap_infos) > 0
+
+    def _init_migration_receiver(self, sender_addr: str):
+        """Fast-path init for decode-to-decode migration receiver.
+
+        Bypasses the bootstrap server entirely. The sender's ZMQ address is
+        known from the MigrateReqOutput, so we connect directly.
+
+        Args:
+            sender_addr: "ip:port" of the migration sender's ZMQ PULL socket.
+        """
+        # For migration, sender and receiver are the same model with same config
+        self.prefill_attn_tp_size = self.kv_mgr.attn_tp_size
+        self.prefill_dp_size = 1  # Migration is 1-to-1
+        self.prefill_pp_size = self.kv_mgr.pp_size
+        self.prefill_page_size = self.kv_mgr.kv_args.page_size
+        self.target_tp_rank = self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
+        self.target_tp_ranks = [self.target_tp_rank]
+        self.target_dp_group = 0
+        self.target_pp_ranks = [0]
+        self.required_dst_info_num = 1
+        self.required_prefill_response_num = 1
+        self.prefill_dp_rank = 0
+
+        self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = 1
+
+        # Parse sender address
+        parts = sender_addr.rsplit(":", 1)
+        rank_ip = parts[0]
+        rank_port = int(parts[1])
+
+        bootstrap_info = {
+            "rank_ip": rank_ip,
+            "rank_port": rank_port,
+            "is_dummy": False,
+        }
+        self.bootstrap_infos = [bootstrap_info]
+
+        # Use a unique key so it doesn't collide with normal PD connections
+        bootstrap_key = f"migration_{sender_addr}_{self.bootstrap_room}"
+        self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
+
+        # Register our KV args with the migration sender
+        self._register_kv_args()
+        logger.info(
+            f"[migration] Receiver initialized: room={self.bootstrap_room}, "
+            f"sender={sender_addr}, tp_rank={self.target_tp_rank}"
+        )
 
     def _get_bootstrap_info_from_server(
         self, engine_rank, target_dp_group, target_pp_rank
