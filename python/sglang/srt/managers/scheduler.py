@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.decode_migration import SchedulerDecodeMigrationMixin
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
@@ -123,7 +124,9 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
+    FinalizeDecodeMigrationReqInput,
     PauseGenerationReqInput,
+    PrepareDecodeMigrationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -288,6 +291,7 @@ _is_npu = is_npu()
 
 
 class Scheduler(
+    SchedulerDecodeMigrationMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
@@ -529,6 +533,7 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.init_decode_migration()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1362,6 +1367,8 @@ class Scheduler(
                 (GetLoadsReqInput, self.handle_get_loads_req),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (PrepareDecodeMigrationReqInput, self.prepare_decode_migration),
+                (FinalizeDecodeMigrationReqInput, self.finalize_decode_migration),
                 (ConfigureLoggingReq, self.configure_logging),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
@@ -1435,6 +1442,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.process_decode_migration_transfers()
             if self._engine_paused:
                 continue
 
@@ -1471,6 +1479,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.process_decode_migration_transfers()
             if self._engine_paused:
                 continue
 

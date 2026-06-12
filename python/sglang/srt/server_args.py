@@ -866,6 +866,7 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_radix_cache: bool = False
     disaggregation_decode_enable_offload_kvcache: bool = False
+    enable_decode_migration: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
@@ -7411,6 +7412,14 @@ class ServerArgs:
             "--disaggregation-decode-enable-offload-kvcache",
             action="store_true",
             help="Enable async KV cache offloading on decode server (PD mode).",
+        )
+        parser.add_argument(
+            "--enable-decode-migration",
+            action="store_true",
+            help=(
+                "Enable experimental live decode-to-decode KV migration control "
+                "and bootstrap services."
+            ),
         )
         parser.add_argument(
             "--num-reserved-decode-tokens",

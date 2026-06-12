@@ -1590,6 +1590,63 @@ class UpdateExpertBackupReq(BaseReq):
 
 
 @dataclass
+class PrepareDecodeMigrationReqInput(BaseReq):
+    """Quiesce a source request and synchronize it to a prepared destination."""
+
+    migration_id: str
+    bootstrap_host: str
+    bootstrap_port: int
+    bootstrap_room: int
+    output_tokens_seen: int = 0
+
+
+@dataclass
+class PrepareDecodeMigrationReqOutput(BaseReq):
+    migration_id: str
+    success: bool
+    status: Literal["prepared", "finished", "not_found", "busy", "error"]
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
+    committed_input_ids: List[int] = field(default_factory=list)
+    pending_input_ids: List[int] = field(default_factory=list)
+    unforwarded_committed_output_ids: List[int] = field(default_factory=list)
+    prompt_len: int = 0
+    committed_len: int = 0
+    logical_len: int = 0
+    output_tokens_seen: int = 0
+    source_dp_rank: int = 0
+    error: Optional[str] = None
+
+
+@dataclass
+class FinalizeDecodeMigrationReqInput(BaseReq):
+    """Commit, resume, or cancel a prepared decode migration."""
+
+    migration_id: str
+    action: Literal["commit", "resume", "cancel"]
+
+    def __post_init__(self):
+        allowed = ["commit", "resume", "cancel"]
+        if self.action not in allowed:
+            raise ValueError(
+                f"Invalid migration finalization action: {self.action!r}. "
+                f"Expected one of {allowed}."
+            )
+
+
+@dataclass
+class FinalizeDecodeMigrationReqOutput(BaseReq):
+    migration_id: str
+    action: str
+    success: bool
+    transfer_status: Literal[
+        "bootstrapping", "transferring", "transferred", "failed", "unknown"
+    ] = "unknown"
+    error: Optional[str] = None
+
+
+@dataclass
 class BackupDramReq(BaseReq):
     rank: int
     weight_pointer_map: Dict[str, Any]
