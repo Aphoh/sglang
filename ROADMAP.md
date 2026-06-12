@@ -1,319 +1,245 @@
 # Decode-to-Decode Migration Roadmap
 
-## Goal
+## Objective
 
-Implement live SGLang decode-to-decode migration behind Dynamo without giving
-workers special public/private identities. Every migration-enabled decode
-worker keeps its normal model deployment card and exposes the same endpoints:
+Support transactional migration of a live decode request from one ordinary
+SGLang worker to another. Dynamo owns routing and trigger policy. SGLang owns
+request quiescence, exact KV frontiers, NIXL transfer, destination admission,
+and rollback-safe cleanup.
+
+Every worker started with `--enable-decode-migration` can be a source or a
+destination. Fast and slow are deployment taints in Dynamo, not SGLang worker
+roles. Workers keep their normal model registration and generation endpoint.
+
+## Implemented Prototype
+
+The prototype is one-shot and uses the normal SGLang decode-side NIXL machinery.
+It implements:
+
+- source request lookup and exact quiescence at a scheduler iteration boundary;
+- retained source request, KV allocation, radix ownership, and sampling state
+  until Dynamo commits the migration;
+- a destination receiver on ordinary aggregated workers, without requiring the
+  worker to run globally in P/D decode mode;
+- opaque random bootstrap rooms that do not encode rank;
+- explicit migration request state, including source rank and whether a request
+  is the prepared destination continuation;
+- equal-TP transfer and the existing heterogeneous-TP staging path;
+- exact stream-frontier data for `--stream-interval > 1` reconciliation;
+- source `commit`, `resume`, and `cancel` cleanup;
+- destination receive admission that preserves the KV ownership established by
+  decode preallocation and avoids a second radix-cache match.
+
+The current source barrier is intentionally coarse: it pauses the scheduler on
+that worker and permits one source migration at a time. This is sufficient to
+prove transaction correctness, but it is not the production concurrency model.
+
+## Endpoint Model
+
+Dynamo exposes these worker RPCs on every migration-enabled worker:
 
 - `generate`
 - `migration_prepare`
 - `migration_sync`
 - `migration_finalize`
 
-Worker metadata describes scheduling policy (`fast` or `slow`) and transfer
-compatibility. It does not remove workers from normal discovery and does not
-claim that only some workers can send or receive KV. Every compatible worker
-can be either side of a migration.
+SGLang itself implements the engine operations reached by those handlers.
 
-## Core Decisions
+### `migration_sync` on the source
 
-### Destination owns preparation
+`phase=describe` returns the source NIXL bootstrap address. It does not alter the
+request.
 
-`migration_prepare` is always called on the selected destination. It creates a
-destination migration session, reserves KV capacity, chooses an opaque NIXL
-bootstrap room, and records the selected source's bootstrap endpoint.
+`phase=quiesce` is the source-side transactional boundary:
 
-Preparation is intentionally separate from copying KV. Reasoning length may be
-unknown when a destination is selected, so the reservation has an estimated or
-bounded size and may grow before the final handoff.
+1. Pause between scheduler iterations.
+2. Find the exact live request.
+3. Reject migration if the request already finished or is finishing.
+4. Compute prompt, committed-KV, logical-token, pending-token, and emitted-token
+   frontiers.
+5. Create the NIXL sender for the destination's opaque room.
+6. Retain the request and all KV state until `commit`, `resume`, or `cancel`.
 
-### Source owns synchronization
-
-`migration_sync` is always called on the exact source instance that owns the
-live request. It snapshots a stable KV frontier and sends a requested range to
-the destination transfer ticket. With `quiesce=true`, it parks the source at a
-decode iteration boundary and returns the final request and stream frontiers.
-
-### Exact receiver arming is a separate state
-
-The destination cannot infer the exact committed KV frontier from client-visible
-stream chunks, especially when `--stream-interval > 1`. The one-shot protocol
-therefore distinguishes capacity reservation from receiver arming:
-
-1. Destination `migration_prepare` reserves capacity and returns a session and
-   opaque room.
-2. Source `migration_sync(quiesce=true, ticket)` returns the exact committed,
-   logical, and emitted frontiers, creates a pending sender for the ticket, and
-   retains ownership. The sender waits for receiver metadata before copying.
-3. Destination `migration_prepare` is retried idempotently with that exact
-   frontier. It allocates destination indices, starts the NIXL receiver, and
-   returns a ready transfer ticket using the same session and room.
-4. Destination receiver arming supplies its allocated indices through the NIXL
-   bootstrap service. The pending source sync then transfers the stable range.
-
-The implementation may later combine steps 2 and 3 with a control-plane callback,
-but the state machine and ownership boundaries must remain explicit.
-
-### Rank is explicit
-
-`bootstrap_room` is an opaque random 63-bit rendezvous identifier. It must not
-encode a DP rank through modulo arithmetic. Transfer tickets carry source and
-destination DP ranks explicitly. SGLang's NIXL bootstrap path must use those
-fields directly when selecting the participating rank.
-
-### Migration and room IDs are different
-
-- `migration_id` is a UUID-like control-plane transaction identity used for
-  idempotency, retries, logging, cleanup, commit, and abort.
-- `bootstrap_room` is a data-plane rendezvous identity. A migration may use
-  multiple rooms as incremental synchronization is added.
-
-## Compatibility Metadata
-
-All workers publish their normal MDC. Migration metadata should minimally carry:
-
-```json
-{
-  "decode_migration": {
-    "protocol_version": 1,
-    "decode_class": "fast",
-    "transport": "nixl",
-    "compatibility_id": "model-revision-layout-page-size-kv-dtype-pp-protocol"
-  }
-}
-```
-
-`decode_class` is a routing hint, not an engine capability. A worker can be fast
-in one deployment and slow in another without changing SGLang.
-
-The compatibility ID must account for at least model revision, KV dtype/layout,
-page size, PP topology, and transfer protocol version. TP size is separate
-topology metadata: equal TP is the simplest case, but NIXL can transform certain
-heterogeneous TP layouts. DP rank and live capacity are dynamic routing inputs,
-not compatibility identity.
-
-The router must validate a source/destination TP pair against transfer
-capabilities. Non-MLA GQA/MHA uses head slicing or the GPU staging path. MLA KV is
-replicated across TP ranks and can use the direct transfer path.
-
-## One-Shot Protocol
+For the current non-speculative path, the sampled pending token is not yet in KV:
 
 ```text
-GENERATING(source)
-  -> destination PREPARED (capacity lease, room allocated)
-  -> source QUIESCED (exact frontiers captured, rollback retained)
-  -> destination ARMED (KV indices registered with source bootstrap service)
-  -> source TRANSFERRING
-  -> destination RECEIVED
-  -> destination ACTIVE
-  -> source RELEASED
+logical_len = committed_len + 1
 ```
 
-Failure before destination activation aborts the destination session and resumes
-the retained source. Failure after destination activation is handled as normal
-destination request failure; source release is only sent after activation has
-been acknowledged.
+The response includes the committed input IDs, pending input ID, and any
+committed output tokens that Dynamo has not yet forwarded.
 
-## Endpoint Contracts
+### `migration_prepare` on the destination
 
-### `migration_prepare` on destination
+The worker handler currently has two idempotent phases:
 
-First call creates the reservation:
+1. `reserved`: allocate a migration record and opaque room.
+2. `ready`: start the destination `async_generate` receiver with the exact source
+   frontier and retain that prepared stream for the subsequent `generate` RPC.
 
-```json
-{
-  "migration_id": "...",
-  "request_id": "...",
-  "source": {
-    "instance_id": 17,
-    "bootstrap_host": "10.0.0.17",
-    "bootstrap_port": 8998,
-    "dp_rank": 2
-  },
-  "reserve_tokens": 4096,
-  "compatibility_id": "..."
-}
-```
+Important limitation: the first phase is a logical reservation. It records
+`reserve_tokens`, but does not yet acquire a hard KV-capacity lease. Actual KV
+indices are allocated when the second phase starts the normal decode receiver.
+A production implementation needs an engine-owned reservation with TTL,
+capacity accounting, and deterministic release.
 
-It returns `status=reserved`, the destination instance/rank, and an opaque room.
+A destination continuation is marked explicitly. If its prepared stream is
+missing or consumed twice, generation fails closed instead of silently running a
+fresh prefill.
 
-An idempotent call with exact source state arms the receiver:
-
-```json
-{
-  "migration_id": "...",
-  "request_id": "...",
-  "source_state": {
-    "committed_input_ids": [],
-    "pending_input_ids": [],
-    "committed_len": 0,
-    "logical_len": 0
-  }
-}
-```
-
-It returns `status=ready` only after destination KV indices and NIXL agent
-metadata have been registered with the source bootstrap service.
-
-### `migration_sync` on source
-
-The quiescent sync captures exact state and installs a sender that waits for the
-destination receiver:
-
-```json
-{
-  "migration_id": "...",
-  "request_id": "...",
-  "output_tokens_seen": 12,
-  "bootstrap_room": 123,
-  "quiesce": true
-}
-```
-
-A transfer call supplies the destination ticket and range:
-
-```json
-{
-  "migration_id": "...",
-  "request_id": "...",
-  "transfer_ticket": {
-    "bootstrap_room": 123,
-    "destination_dp_rank": 0
-  },
-  "from_token": 0,
-  "through_token": 1600,
-  "quiesce": true
-}
-```
-
-It returns monotonically increasing source-generated, KV-stable, transferred,
-and client-emitted watermarks.
-
-### `migration_finalize` on either side
-
-Destination actions:
-
-- `activate`: verify receive completion, install exact request state, and make
-  the parked request runnable.
-- `abort`: release reservation, receiver, request row, and KV allocation.
+### `migration_finalize`
 
 Source actions:
 
-- `release`: abort the retained source request through normal cleanup after the
-  destination is active.
-- `resume`: discard transfer state and make the parked source runnable again.
-- `cancel`: release source state because the client disconnected.
+- `commit`: allowed only after NIXL reports transfer success; abort the retained
+  source through the normal scheduler finish path.
+- `resume`: discard transfer state and continue the untouched source request.
+- `cancel`: discard transfer state and terminate the retained source request.
 
-All control operations are idempotent by `(migration_id, action)`.
+Destination actions:
 
-## Stream Correctness
+- `activate`: mark the prepared continuation authoritative.
+- `abort`: abort the receive/generation request and release handler state.
 
-The protocol tracks independent numeric frontiers:
+Control calls are keyed by `migration_id`. The current implementation is robust
+to repeated prepare and cleanup calls used by normal retry paths, but complete
+persistent idempotency across process failure is out of scope.
 
-- `logical_len`: prompt plus all sampled output tokens.
-- `committed_len`: tokens represented in stable source KV.
-- `transferred_len`: stable KV installed at destination.
-- `output_tokens_seen`: output token positions already forwarded to the client.
-
-For the initial non-speculative implementation:
+## Data-Plane Sequence
 
 ```text
-logical_len == committed_len + 1
+source generate
+  -> source describe
+  -> destination prepare(reserve logical session and room)
+  -> source sync(quiesce and create sender)
+  -> destination prepare(arm exact continuation and receiver)
+  -> NIXL sends [destination prefix, committed_len)
+  -> destination produces its first valid output
+  -> destination activate
+  -> source commit
+  -> destination continues generation
 ```
 
-The sampled-but-uncommitted token becomes the destination's first decode input.
-Committed output tokens hidden by `--stream-interval` are emitted exactly once
-by the coordinator before destination output. Stream chunk boundaries never
-define KV ownership.
+The destination receiver reports its cached prefix to the source. The source
+therefore sends only the missing committed range, including prompt KV when the
+destination has no warm prefix.
 
-## Trigger Policy Boundary
+## Correctness Invariants
 
-SGLang does not interpret reasoning syntax or decide when a request should move.
-Dynamo may trigger on a generated-token count, Qwen3's `</think>` token, an SLA
-signal, or a router policy. Once triggered, `migration_sync` captures the same
-exact committed/logical frontier regardless of why it was called.
+1. The source remains authoritative until destination output is valid and source
+   commit succeeds.
+2. A pre-commit failure aborts the destination and resumes or cancels the
+   retained source according to client ownership.
+3. KV ownership is based on numeric token frontiers, never stream chunk
+   boundaries.
+4. The destination receives committed KV and starts from the sampled pending
+   token.
+5. Tokens already emitted by the source are trimmed from destination replay.
+6. Source tokens committed but not emitted are forwarded once before handoff.
+7. A request with a finish reason is never migrated.
+8. Destination admission must not rematch radix cache after receive
+   preallocation; doing so can leak or double-protect transferred KV pages.
+9. Cancellation releases source transfer metadata, destination receive state,
+   request rows, KV pages, and handler reservations.
 
-The current coordinator forwards the matching boundary token before quiescing.
-For `--stream-interval > 1`, any later tokens coalesced in the same source chunk
-are handled by the same emitted and duplicate-trimming watermarks. A request
-that has already reached a finish reason is not migrated.
+## Current Constraints
 
-Incremental KV movement should extend `migration_sync` with successive stable
-ranges on the existing destination session. The final policy boundary performs
-a quiescent delta and activation; it must not require a separate reasoning-aware
-engine path.
+- `--disable-overlap-schedule` is required for an exact source frontier.
+- The source worker is scheduler-paused during transfer.
+- One source migration may be active per worker.
+- Transfer is one-shot.
+- The live test topology uses DP=1. Rank is no longer encoded in the room, but
+  multi-DP endpoint routing and rank validation still need dedicated work.
+- Speculative decoding, beam search, multiple return sequences, guided decoding,
+  multimodal continuation state, and session migration are not supported.
+- Model revision, KV layout/dtype, page size, PP layout, and transfer protocol
+  must match. Heterogeneous TP is supported only where the existing NIXL direct
+  or staging layout supports it.
+- Destination capacity reservation is not yet hard or durable.
 
-## Implementation Phases
+## Next Implementation Steps
 
-### Phase 1: reshape the working prototype
+### 1. Per-request source parking
 
-- Retain the known-good one-shot NIXL transfer and exact frontier helper.
-- Rename source-side prepare to `migration_sync`; keep snapshot and asynchronous
-  send as explicit states within the same idempotent sync operation.
-- Add destination reservation/session records and receiver-ready status.
-- Remove DP-rank encoding from room generation and carry ranks explicitly.
-- Keep source state until destination activation succeeds.
-- Keep the current scheduler-wide pause only as a prototype barrier.
+Replace `_engine_paused` with a scheduler-owned migration state on one request.
+The parked request must retain its request-pool row, KV pages, radix locks,
+sampling state, output IDs, and pending token while unrelated requests continue.
 
-### Phase 2: normal Dynamo discovery
+Required races:
 
-- Remove `internal_decode_migration_worker` and MDC suppression.
-- Publish role and compatibility metadata through the normal runtime config.
-- Route migration-enabled requests through a coordinator/operator using request
-  metadata and constrained worker selection.
-- Preserve ordinary generation for requests that do not opt into migration.
+- finish before and during park;
+- normal abort and client cancellation;
+- preemption while migration is requested;
+- two independent migrations on the same worker;
+- rollback after destination arm or transfer failure.
 
-### Phase 3: per-request parking
+### 2. Engine-owned destination reservation
 
-- Replace the scheduler-wide pause with a typed parked-request state.
-- Keep request-pool row, KV pages, radix locks, sampling state, and output state.
-- Allow unrelated requests and independent migrations to proceed.
-- Integrate finish and cancellation races with parked-request cleanup.
+Move reservation state out of the Dynamo Python handler and into SGLang. Reserve
+request-pool and KV capacity before quiescing the source. Add:
 
-### Phase 4: incremental synchronization
+- requested, granted, and consumed token capacity;
+- TTL and expiry cleanup;
+- idempotent reserve, grow, arm, activate, and abort transitions;
+- admission backpressure rather than late allocation failure;
+- metrics for reserved KV-token-seconds and stranded capacity.
 
-- Reuse the destination session and capacity lease.
-- Arm successive transfer ranges with new opaque rooms or resettable receiver
-  generations.
-- Copy only `[transferred_len, stable_len)` while source decode continues.
-- Perform a final quiescent delta, activate destination, then release source.
+### 3. Incremental KV synchronization
 
-## Required Tests
+Keep one destination session while the source continues decoding. Extend sync to
+accept a monotonically increasing range:
 
-Unit tests:
+```text
+migration_sync(quiesce=false, from_token, through_token)
+```
 
-- opaque room generation independent of rank;
-- explicit rank serialization and routing;
-- prepare/sync/finalize idempotency;
-- reservation expiry and cleanup;
-- exact frontier calculations for multiple stream intervals;
-- request finish before and during each migration state;
-- cancellation in reserved, quiesced, transferring, received, and active states;
-- retry after lost control responses;
-- destination failure followed by source resume.
+For each increment:
 
-Live tests with two Qwen3-0.6B workers and Dynamo:
+1. Snapshot a stable source frontier without parking the request.
+2. Transfer only `[transferred_len, stable_len)` into destination-owned KV slots.
+3. Advance the destination session watermark after NIXL completion.
+4. At the configured trigger, park the source and transfer the final delta.
+5. Reuse the existing activation, stream reconciliation, and source commit path.
 
-- deterministic source-only output equals migrated output;
-- token-count and semantic-token migration triggers;
-- `--stream-interval=1` and a value greater than one;
-- request finishing just before and just after the handoff threshold;
-- injected destination preparation and activation failures;
-- client disconnect during handoff followed by successful worker reuse;
-- logs prove source instance targeting, destination reservation, NIXL transfer,
-  destination activation, and source release.
+Non-final ranges should be page-aligned where required by the transfer backend.
+The final range may be exact. Each transfer generation needs an unambiguous room
+or generation identifier; rank remains a separate field.
 
-## Verified Prototype Status
+### 4. Compatibility and DP validation
 
-The one-shot engine prototype meets the original completion criteria. It has
-passed the stream, finish-race, rollback, cancellation, and post-cancellation
-recovery scenarios, plus Qwen3-8B TP4-to-TP1 migration at the semantic
-`</think>` boundary. In a 20-example paired GSM8K smoke run, all requests
-completed the NIXL handoff, baseline and migrated accuracy were both 95%, hidden
-reasoning matched 20/20, and extracted answers matched 20/20.
+Expose a structured transfer capability derived from the actual cache layout and
+validate source/destination pairs before quiescence. Add multi-DP tests that prove
+control calls and NIXL handshakes reach the selected rank.
 
-The remaining engine work for a production PR is per-request parking instead of
-a scheduler-wide pause, lease expiry and cleanup under concurrent migrations,
-idempotency coverage for lost control responses, incremental stable-range sync,
-and transfer/SLA measurement at realistic reasoning lengths.
+### 5. Observability
+
+Emit phase timings and terminal outcomes for reserve, quiesce, receiver arm,
+bytes/pages transferred, first destination output, commit, rollback, cancel, and
+cleanup. These are required for the Pareto experiments in `measurement_plan.md`.
+
+## Verification Matrix
+
+Implemented tests cover:
+
+- frontier construction and radix lock ownership;
+- destination receive admission and cleanup;
+- source finish before trigger and during quiescence;
+- cancellation before and after handoff;
+- stream intervals 1 and 4;
+- finish immediately after handoff;
+- concurrent trigger attempts under the coarse source barrier;
+- deterministic source-only versus migrated output;
+- Qwen3-8B TP4 source to TP1 destination using NIXL staging;
+- paired Qwen3 thinking-boundary GSM8K checks.
+
+The June 12, 2026 Qwen3-8B TP4-to-TP1 run collected 20 committed migrations
+after skipping one completion that never emitted `</think>`. The fast-only
+baseline scored 19/20 and the migrated path scored 18/20, with 90% extracted
+answer agreement. No scheduler exception or KV-pool leak signature was observed.
+This passes the configured one-regression smoke gate, but it is not evidence of
+accuracy neutrality; a larger run and a same-TP control are required to separate
+normal TP-layout numerical divergence from migration-specific defects.
+
+Before upstreaming, add fault injection for receiver allocation failure, NIXL
+failure/timeout, lost control responses, process loss, reservation expiry, and
+multi-DP rank mismatch.

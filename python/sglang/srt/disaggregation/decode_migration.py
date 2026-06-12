@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Dict, Optional
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_migration_state import (
     build_decode_migration_frontier,
 )
@@ -35,13 +36,15 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.managers.io_struct import (
     FinalizeDecodeMigrationReqInput,
     FinalizeDecodeMigrationReqOutput,
     PrepareDecodeMigrationReqInput,
     PrepareDecodeMigrationReqOutput,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.mem_cache.common import kv_to_page_indices
 
 if TYPE_CHECKING:
@@ -88,13 +91,69 @@ class SchedulerDecodeMigrationMixin:
                 hidden_states_dtype=torch.float32,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
+        # A migration-capable worker may be either endpoint regardless of its
+        # ordinary serving mode. Reuse the normal decode receiver queues instead
+        # of requiring the whole worker to run in PD decode mode.
+        self._init_decode_migration_receiver()
+
         # Fail startup early on transfer-backend incompatibility and avoid
         # constructing/registering the NIXL manager while a request is paused.
         self._get_decode_migration_kv_manager()
 
+    def _init_decode_migration_receiver(self: "Scheduler") -> None:
+        if self.disagg_decode_prealloc_queue is not None:
+            return
+
+        draft_token_to_kv_pool, _ = kv_cache_builder.get_draft_kv_pool(
+            draft_worker=self.draft_worker,
+            spec_algorithm=self.spec_algorithm,
+            server_args=self.server_args,
+        )
+        self.disagg_decode_transfer_queue = DecodeTransferQueue(
+            gloo_group=self.attn_tp_cpu_group,
+            req_to_metadata_buffer_idx_allocator=(
+                self.req_to_metadata_buffer_idx_allocator
+            ),
+            tp_rank=self.ps.tp_rank,
+            metadata_buffers=self.disagg_metadata_buffers,
+            scheduler=self,
+            tree_cache=self.tree_cache,
+        )
+        self.disagg_decode_prealloc_queue = DecodePreallocQueue(
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            draft_token_to_kv_pool=draft_token_to_kv_pool,
+            req_to_metadata_buffer_idx_allocator=(
+                self.req_to_metadata_buffer_idx_allocator
+            ),
+            metadata_buffers=self.disagg_metadata_buffers,
+            scheduler=self,
+            transfer_queue=self.disagg_decode_transfer_queue,
+            tree_cache=self.tree_cache,
+            gloo_group=self.attn_tp_cpu_group,
+            tp_rank=self.ps.tp_rank,
+            tp_size=self.ps.tp_size,
+            dp_size=self.server_args.dp_size,
+            gpu_id=self.ps.gpu_id,
+            bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+            max_total_num_tokens=self.max_total_num_tokens,
+            pp_rank=self.ps.pp_rank,
+            num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
+            transfer_backend=self.transfer_backend,
+            # Aggregated workers have a normal prefix cache. Match it during
+            # receive preallocation so imported KV never duplicates a prefix
+            # that admission later marks as protected.
+            enable_radix_cache=True,
+        )
+
     def _get_decode_migration_kv_manager(self: "Scheduler") -> "BaseKVManager":
         if self._decode_migration_kv_manager is not None:
             return self._decode_migration_kv_manager
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            manager = self.disagg_prefill_bootstrap_queue.kv_manager
+            self._decode_migration_kv_manager = manager
+            return manager
 
         if not self.server_args.enable_decode_migration:
             raise RuntimeError("Decode migration is not enabled")
@@ -158,10 +217,93 @@ class SchedulerDecodeMigrationMixin:
         self._decode_migration_kv_manager = manager
         return manager
 
+    def process_decode_migration_receives(self: "Scheduler") -> None:
+        """Advance destination handshakes on non-PD-decode workers."""
+        if (
+            not self.server_args.enable_decode_migration
+            or self.disaggregation_mode == DisaggregationMode.DECODE
+        ):
+            return
+        self.process_decode_queue()
+
+    def admit_ready_decode_migrations(self: "Scheduler") -> None:
+        """Merge transferred destination requests without recomputing their KV."""
+        if (
+            not self.server_args.enable_decode_migration
+            or self.disaggregation_mode == DisaggregationMode.DECODE
+        ):
+            return
+
+        ready = [
+            req
+            for req in self.waiting_queue
+            if getattr(req, "is_decode_migration_destination", False)
+        ]
+        if not ready:
+            return
+
+        available = min(self.req_to_token_pool.size, self.max_running_requests)
+        available -= self.running_batch.batch_size()
+        if available <= 0:
+            return
+        selected = ready[:available]
+        selected_ids = {id(req) for req in selected}
+        self.waiting_queue = [
+            req for req in self.waiting_queue if id(req) not in selected_ids
+        ]
+
+        for req in selected:
+            # Decode preallocation already established the complete destination
+            # KV layout, with or without decode-side radix matching. Preserve
+            # that exact ownership state. Re-matching here can observe a prefix
+            # inserted while transfer was in flight and mark transferred indices
+            # as cache-protected even though this request does not own that lock.
+            req.init_next_round_input(None)
+            if req.kv_committed_len is not None:
+                req.fill_len = req.kv_committed_len
+                req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
+        set_time_batch(selected, "set_forward_entry_time")
+
+        batch = ScheduleBatch.init_new(
+            selected,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        batch.prepare_for_prebuilt()
+        batch.process_prebuilt(self.server_args, self.future_map)
+        self.batch_result_processor.process_batch_result_prebuilt(batch)
+        batch.filter_batch()
+        if batch.is_empty():
+            return
+        if self.running_batch.is_empty():
+            self.running_batch = batch
+        else:
+            self.running_batch.merge_batch(batch)
+        self.running_batch.batch_is_full = False
+
+    def abort_decode_migration_receive(self: "Scheduler", recv_req) -> None:
+        """Abort destination handshakes when the scheduler is not in decode mode."""
+        if (
+            not self.server_args.enable_decode_migration
+            or self.disaggregation_mode == DisaggregationMode.DECODE
+        ):
+            return
+        for decode_req in self.disagg_decode_prealloc_queue.queue:
+            if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                decode_req.kv_receiver.abort()
+        for decode_req in self.disagg_decode_transfer_queue.queue:
+            if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                decode_req.kv_receiver.abort()
+
     def _find_decode_migration_req(self: "Scheduler", rid: str) -> Optional[Req]:
         for req in self.running_batch.reqs:
             if req.rid == rid:
                 return req
+        logger.debug("Decode migration request lookup missed rid=%s", rid)
         return None
 
     def prepare_decode_migration(

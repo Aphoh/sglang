@@ -314,6 +314,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
+        queue.enable_radix_cache = True
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._match_prefix_and_lock = MagicMock(
