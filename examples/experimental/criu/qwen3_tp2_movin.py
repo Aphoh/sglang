@@ -153,7 +153,11 @@ def main() -> None:
     if not 0 < args.mem_fraction_static <= 1:
         raise ValueError("--mem-fraction-static must be in (0, 1]")
 
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", args.gpus)
+    nvidia_visible = os.environ.get("NVIDIA_VISIBLE_DEVICES")
+    if nvidia_visible and nvidia_visible not in {"all", "none", "void"}:
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", nvidia_visible)
+    else:
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", args.gpus)
     os.environ.setdefault("NCCL_IB_DISABLE", "1")
     os.environ.setdefault("UCX_TLS", "cuda_ipc,cuda_copy,sm,self")
     os.environ.setdefault("UV_USE_IO_URING", "0")

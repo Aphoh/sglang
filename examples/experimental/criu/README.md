@@ -60,7 +60,7 @@ logs, and cleans checkpoint images. For local development:
 docker run --rm \
   --privileged --pid=host --ipc=host \
   --gpus 'device=4,5' \
-  -e CUDA_VISIBLE_DEVICES=0,1 \
+  -e CUDA_VISIBLE_DEVICES=4,5 \
   -e SGLANG_CRIU_GPUS=0,1 \
   -e SGLANG_CRIU_MODEL=/mnt/shared/Qwen3-8B \
   -e SGLANG_CRIU_GSM8K_QUESTIONS=200 \
