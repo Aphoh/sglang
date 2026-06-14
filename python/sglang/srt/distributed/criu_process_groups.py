@@ -21,7 +21,9 @@ class SuspendedDeviceProcessGroup:
 
 _suspended_device_group: SuspendedDeviceProcessGroup | None = None
 _device_group_generation = 0
-_registered_groups: dict[str, Any] = {}
+_registered_groups: weakref.WeakValueDictionary[str, Any] = (
+    weakref.WeakValueDictionary()
+)
 
 
 def register_group(group: Any) -> None:
@@ -34,6 +36,59 @@ def unregister_group(group: Any) -> None:
 
 def registered_groups() -> list[Any]:
     return list(_registered_groups.values())
+
+
+def _model_uses_moe(model_config: Any) -> bool:
+    config = model_config.hf_text_config
+    for name in (
+        "n_routed_experts",
+        "num_local_experts",
+        "num_experts",
+        "num_moe_experts",
+        "moe_num_experts",
+    ):
+        value = getattr(config, name, None)
+        if isinstance(value, (list, tuple)):
+            if any(item for item in value if isinstance(item, int)):
+                return True
+        elif isinstance(value, int) and value > 0:
+            return True
+    ffn_config = getattr(config, "ffn_config", None)
+    return bool(ffn_config and getattr(ffn_config, "moe_num_experts", 0))
+
+
+def validate_checkpoint_configuration(
+    server_args: Any,
+    model_config: Any,
+) -> None:
+    """Reject runtime modes outside the currently validated dense-TP scope."""
+    checks = (
+        ("pipeline parallelism", server_args.pp_size != 1),
+        ("data parallelism", server_args.dp_size != 1),
+        ("expert parallelism", server_args.ep_size != 1),
+        ("MoE data parallelism", server_args.moe_dp_size != 1),
+        ("context parallelism", server_args.attn_cp_size != 1),
+        ("DP attention", server_args.enable_dp_attention),
+        ("MoE all-to-all", server_args.moe_a2a_backend != "none"),
+        ("PD disaggregation", server_args.disaggregation_mode != "null"),
+        (
+            "hierarchical cache",
+            server_args.enable_hierarchical_cache
+            or server_args.hicache_storage_backend is not None,
+        ),
+        ("radix cache", not server_args.disable_radix_cache),
+        ("custom all-reduce", not server_args.disable_custom_all_reduce),
+        ("symmetric memory", server_args.enable_symm_mem),
+    )
+    unsupported = [name for name, enabled in checks if enabled]
+    if _model_uses_moe(model_config):
+        unsupported.append("MoE model")
+    if unsupported:
+        raise RuntimeError(
+            "CRIU checkpoint mode currently supports dense TP with PP=DP=EP=CP=1, "
+            "radix cache disabled, and checkpointable Movin/FlashInfer collectives; "
+            f"unsupported configuration: {', '.join(unsupported)}"
+        )
 
 
 def validate_checkpoint_topology(groups: Iterable[Any]) -> None:
@@ -57,6 +112,8 @@ def validate_checkpoint_topology(groups: Iterable[Any]) -> None:
             f"CPU-only singleton groups; owned device subgroups are unsupported: "
             f"{unsupported}"
         )
+    for group in groups:
+        group.validate_checkpoint_lifecycle()
 
 
 def suspend_device_process_group(
@@ -87,12 +144,10 @@ def suspend_device_process_group(
     rank = torch.distributed.get_rank(group=default_group)
     world_size = torch.distributed.get_world_size(group=default_group)
 
-    torch.distributed.barrier(group=default_group)
     if rank == 0:
         for path in (Path(store_path), resume_path):
             with contextlib.suppress(FileNotFoundError):
                 path.unlink()
-    torch.distributed.barrier(group=default_group)
 
     rebound = 0
     for group in groups:

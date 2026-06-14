@@ -6,7 +6,7 @@ import os
 import time
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import torch
 import zmq
@@ -31,19 +31,29 @@ class CriuCheckpointCoordinator:
     PREPARE_RPC = "prepare_criu"
     RESTORE_RPC = "restore_after_criu"
 
-    def __init__(self, *, device: torch.device, groups: Iterable[Any]):
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        groups: Iterable[Any],
+        server_args: Any,
+        model_config: Any,
+    ):
         self.device = device
         self.groups = tuple(dict.fromkeys(groups))
         self.state = CheckpointState.READY
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
         self._checkpoint_rpc_generation = 0
+        self._checkpoint_generation = 0
         if envs.SGLANG_CRIU_SUSPEND_DEVICE_PROCESS_GROUP.get():
             from sglang.srt.distributed.criu_process_groups import (
                 registered_groups,
+                validate_checkpoint_configuration,
                 validate_checkpoint_topology,
             )
 
+            validate_checkpoint_configuration(server_args, model_config)
             validate_checkpoint_topology(registered_groups())
 
     def collective_status(
@@ -80,20 +90,28 @@ class CriuCheckpointCoordinator:
             validate_checkpoint_topology,
         )
 
-        if self.state is not CheckpointState.READY:
-            raise RuntimeError(f"cannot prepare CRIU from state {self.state.name}")
-        validate_checkpoint_topology(registered_groups())
-        self.collective_status("preflight", require_clean=True)
+        self._checkpoint_generation += 1
+        self._run_phase(
+            "prepare-preflight",
+            lambda: self._prepare_preflight(
+                registered_groups(),
+                validate_checkpoint_topology,
+            ),
+        )
         self.state = CheckpointState.PREPARING
         try:
-            torch.cuda.synchronize(self.device)
-            prepare_flashinfer_workspaces_for_criu()
-            for collectives in self._collective_sets():
-                collectives.prepare_criu()
-            torch.cuda.synchronize(self.device)
-            suspend_cpu_process_groups()
-            suspend_device_process_group()
-            wait_for_process_group_teardown()
+            self._run_phase(
+                "prepare-collectives",
+                lambda: self._prepare_collectives(
+                    prepare_flashinfer_workspaces_for_criu
+                ),
+            )
+            self._run_phase("prepare-cpu-groups", suspend_cpu_process_groups)
+            self._run_phase("prepare-device-group", suspend_device_process_group)
+            self._run_phase(
+                "prepare-process-group-teardown",
+                wait_for_process_group_teardown,
+            )
         except Exception:
             self.state = CheckpointState.FAILED
             logger.exception("CRIU prepare failed; worker lifecycle is terminal")
@@ -109,22 +127,69 @@ class CriuCheckpointCoordinator:
             restore_flashinfer_workspaces_after_criu,
         )
 
-        if self.state is not CheckpointState.PREPARED:
-            raise RuntimeError(f"cannot restore CRIU from state {self.state.name}")
+        self._run_phase("restore-preflight", self._validate_restore_state)
         self.state = CheckpointState.RESTORING
         try:
-            resume_device_process_group()
-            resume_cpu_process_groups()
-            restore_flashinfer_workspaces_after_criu()
-            for collectives in self._collective_sets():
-                collectives.restore_after_criu()
-            torch.cuda.synchronize(self.device)
-            self.collective_status("restored", require_clean=True)
+            self._run_phase("restore-device-group", resume_device_process_group)
+            self._run_phase("restore-cpu-groups", resume_cpu_process_groups)
+            self._run_phase(
+                "restore-collectives",
+                lambda: self._restore_collectives(
+                    restore_flashinfer_workspaces_after_criu
+                ),
+            )
         except Exception:
             self.state = CheckpointState.FAILED
             logger.exception("CRIU restore failed; worker lifecycle is terminal")
             raise
         self.state = CheckpointState.READY
+
+    def _prepare_preflight(self, groups, validate_topology: Callable) -> None:
+        if self.state is not CheckpointState.READY:
+            raise RuntimeError(f"cannot prepare CRIU from state {self.state.name}")
+        validate_topology(groups)
+        self.collective_status("preflight", require_clean=True)
+
+    def _prepare_collectives(self, prepare_flashinfer: Callable[[], None]) -> None:
+        torch.cuda.synchronize(self.device)
+        prepare_flashinfer()
+        for collectives in self._collective_sets():
+            collectives.prepare_criu()
+        torch.cuda.synchronize(self.device)
+
+    def _validate_restore_state(self) -> None:
+        if self.state is not CheckpointState.PREPARED:
+            raise RuntimeError(f"cannot restore CRIU from state {self.state.name}")
+
+    def _restore_collectives(self, restore_flashinfer: Callable[[], None]) -> None:
+        restore_flashinfer()
+        for collectives in self._collective_sets():
+            collectives.restore_after_criu()
+        torch.cuda.synchronize(self.device)
+        self.collective_status("restored", require_clean=True)
+
+    def _run_phase(
+        self,
+        phase: str,
+        action: Callable[[], None],
+        timeout: float = 120.0,
+    ) -> None:
+        try:
+            action()
+            success = True
+            error = ""
+        except Exception as exc:
+            success = False
+            error = str(exc)
+            logger.exception("CRIU lifecycle phase %s failed locally", phase)
+        success, error = self._converge_file_status(
+            namespace=f"phase.{self._checkpoint_generation}.{phase}",
+            success=success,
+            error=error,
+            timeout=timeout,
+        )
+        if not success:
+            raise RuntimeError(error)
 
     def should_barrier_after_rpc(self, method: str, *, success: bool) -> bool:
         return success and method != self.PREPARE_RPC
@@ -140,14 +205,29 @@ class CriuCheckpointCoordinator:
         """Give every rank the same checkpoint RPC outcome without a PG."""
         if method not in (self.PREPARE_RPC, self.RESTORE_RPC):
             return success, error
+        self._checkpoint_rpc_generation += 1
+        return self._converge_file_status(
+            namespace=f"rpc.{self._checkpoint_rpc_generation}.{method}",
+            success=success,
+            error=error,
+            timeout=timeout,
+        )
+
+    def _converge_file_status(
+        self,
+        *,
+        namespace: str,
+        success: bool,
+        error: str,
+        timeout: float,
+    ) -> tuple[bool, str]:
         store_base = envs.SGLANG_CRIU_DEVICE_STORE.get()
         if not store_base:
             raise RuntimeError(
-                "SGLANG_CRIU_DEVICE_STORE is required for checkpoint RPC consensus"
+                "SGLANG_CRIU_DEVICE_STORE is required for checkpoint consensus"
             )
 
-        self._checkpoint_rpc_generation += 1
-        prefix = Path(f"{store_base}.rpc.{self._checkpoint_rpc_generation}.{method}")
+        prefix = Path(f"{store_base}.{namespace}")
         result_path = Path(f"{prefix}.result.{self.rank}.json")
         temporary = Path(f"{result_path}.{os.getpid()}.tmp")
         temporary.write_text(json.dumps({"success": success, "error": error}) + "\n")

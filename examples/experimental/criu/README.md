@@ -39,6 +39,15 @@ docker build \
 The digest-pinned image contains the patched CRIU fork, NVIDIA CUDA checkpoint tool, and
 checkpoint helper. The runtime runner installs a mounted Movin checkout as an
 editable package and explicitly fetches its pinned NIXL/UCX build headers.
+For a standalone SGLang installation, the `criu` extra pins the reviewed Movin
+package commit:
+
+```bash
+uv pip install -e './python[criu]'
+```
+
+The handoff runner deliberately replaces that package with the mounted Movin
+checkout so it can verify the exact pair of commits recorded by the recipe.
 
 ## Direct run
 

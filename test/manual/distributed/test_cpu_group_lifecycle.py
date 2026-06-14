@@ -6,7 +6,6 @@ Run with:
 """
 
 import os
-from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -20,6 +19,14 @@ from sglang.srt.distributed.parallel_state import (
     suspend_device_process_group,
     wait_for_process_group_teardown,
 )
+
+
+class FakeMovinCollectives:
+    def __init__(self, control_group):
+        self.control_group = control_group
+
+    def set_control_group(self, control_group) -> None:
+        self.control_group = control_group
 
 
 def make_cpu_only_coordinator(cpu_group) -> GroupCoordinator:
@@ -48,10 +55,12 @@ def make_cpu_only_coordinator(cpu_group) -> GroupCoordinator:
         "ca_comm",
         "qr_comm",
         "torch_symm_mem_comm",
+        "hpu_communicator",
+        "xpu_communicator",
+        "npu_communicator",
     ):
         setattr(coordinator, name, None)
-    coordinator.movin_collectives = None
-    coordinator.pynccl_comm = SimpleNamespace(group=cpu_group)
+    coordinator.movin_collectives = FakeMovinCollectives(cpu_group)
     _register_group(coordinator)
     return coordinator
 
@@ -86,7 +95,7 @@ def main() -> None:
 
         suspend_cpu_process_groups()
         assert coordinator.cpu_group is None
-        assert coordinator.pynccl_comm.group is None
+        assert coordinator.movin_collectives.control_group is None
         suspend_device_process_group()
         wait_for_process_group_teardown()
         assert not dist.is_initialized()
@@ -96,7 +105,9 @@ def main() -> None:
         assert dist.is_initialized()
         assert coordinator.device_group is dist.group.WORLD
         resume_cpu_process_groups()
-        assert coordinator.cpu_group is coordinator.pynccl_comm.group
+        assert (
+            coordinator.cpu_group is coordinator.movin_collectives.control_group
+        )
         assert coordinator._cpu_group_generation == cycle + 1
         dist.barrier()
 

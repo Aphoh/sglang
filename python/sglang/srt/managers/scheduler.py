@@ -891,6 +891,8 @@ class Scheduler(
         self.criu_checkpoint = CriuCheckpointCoordinator(
             device=self.device,
             groups=(self.tp_group, self.attn_tp_group),
+            server_args=self.server_args,
+            model_config=self.model_config,
         )
         # TODO(Jialin): Migrate pad_input_ids implementations to return array.
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()

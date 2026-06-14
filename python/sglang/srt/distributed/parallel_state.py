@@ -328,7 +328,6 @@ class GroupCoordinator:
         group_name = group_name or "anonymous"
         self.group_name = group_name
         self.unique_name = _get_unique_name(group_name)
-        _register_group(self)
 
         # Set rank info
         self.rank = torch.distributed.get_rank()
@@ -560,6 +559,7 @@ class GroupCoordinator:
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
             )
+        _register_group(self)
 
     def __repr__(self):
         return (
@@ -1636,6 +1636,11 @@ class GroupCoordinator:
             self.mq_broadcaster = None
 
     def _set_communicator_cpu_group(self, cpu_group) -> None:
+        if self.movin_collectives is not None:
+            self.movin_collectives.set_control_group(cpu_group)
+
+    def validate_checkpoint_lifecycle(self) -> None:
+        unsupported = []
         for communicator_name in (
             "pynccl_comm",
             "pymscclpp_comm",
@@ -1644,10 +1649,21 @@ class GroupCoordinator:
             "torch_symm_mem_comm",
         ):
             communicator = getattr(self, communicator_name, None)
-            if communicator is not None and hasattr(communicator, "group"):
-                communicator.group = cpu_group
-        if self.movin_collectives is not None:
-            self.movin_collectives.set_control_group(cpu_group)
+            if communicator is not None:
+                unsupported.append(communicator_name)
+        for communicator_name in (
+            "hpu_communicator",
+            "xpu_communicator",
+            "npu_communicator",
+        ):
+            communicator = getattr(self, communicator_name, None)
+            if communicator is not None and not communicator.disabled:
+                unsupported.append(communicator_name)
+        if unsupported:
+            raise RuntimeError(
+                f"group {self.unique_name} owns communicators without a "
+                f"checkpoint lifecycle: {unsupported}"
+            )
 
     def suspend_cpu_group(self) -> None:
         from sglang.srt.distributed.criu_process_groups import suspend_cpu_group

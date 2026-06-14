@@ -92,7 +92,7 @@ default = true
 
 [project.optional-dependencies]
 criu = [
-  "movin[all] @ git+https://github.com/NVIDIA-dev/warnold-movin.git@f6072bb448a81c9d2309467d1200d12c088977f0",
+  "movin[all] @ git+https://github.com/NVIDIA-dev/warnold-movin.git@262b344e099fdac9dcd0d3833ce5459bc9cb7d90",
 ]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
