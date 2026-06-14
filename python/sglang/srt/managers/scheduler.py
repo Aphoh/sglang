@@ -297,6 +297,22 @@ class Scheduler(
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
+    @property
+    def tp_cpu_group(self):
+        return self.tp_group.cpu_group
+
+    @property
+    def attn_tp_cpu_group(self):
+        return self.attn_tp_group.cpu_group
+
+    @property
+    def attn_cp_cpu_group(self):
+        return self.attn_cp_group.cpu_group
+
+    @property
+    def dp_tp_cpu_group(self):
+        return self.dp_tp_group.cpu_group
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -853,11 +869,8 @@ class Scheduler(
             )
 
         self.tp_group = get_tp_group()
-        self.tp_cpu_group = self.tp_group.cpu_group
         self.attn_tp_group = get_attention_tp_group()
-        self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
         self.attn_cp_group = get_attention_cp_group()
-        self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
@@ -871,8 +884,14 @@ class Scheduler(
             if self.server_args.enable_dp_attention
             else self.tp_group
         )
-        self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
+        from sglang.srt.distributed.criu_coordinator import (
+            CriuCheckpointCoordinator,
+        )
 
+        self.criu_checkpoint = CriuCheckpointCoordinator(
+            device=self.device,
+            groups=(self.tp_group, self.attn_tp_group),
+        )
         # TODO(Jialin): Migrate pad_input_ids implementations to return array.
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
@@ -1577,7 +1596,7 @@ class Scheduler(
     def init_profiler(self) -> None:
         self.profiler_manager = SchedulerProfilerManager(
             ps=self.ps,
-            dp_tp_cpu_group=self.dp_tp_cpu_group,
+            dp_tp_group=self.dp_tp_group,
             get_forward_ct=lambda: self.forward_ct,
         )
 
@@ -1585,7 +1604,7 @@ class Scheduler(
         self.weight_updater = SchedulerWeightUpdaterManager(
             tp_worker=self.tp_worker,
             draft_worker=self.draft_worker,
-            tp_cpu_group=self.tp_cpu_group,
+            tp_group=self.tp_group,
             memory_saver_adapter=self.memory_saver_adapter,
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
@@ -1633,11 +1652,8 @@ class Scheduler(
             mm_receiver=self.mm_receiver,
             ps=self.ps,
             tp_group=self.tp_group,
-            tp_cpu_group=self.tp_cpu_group,
             attn_tp_group=self.attn_tp_group,
-            attn_tp_cpu_group=self.attn_tp_cpu_group,
             attn_cp_group=self.attn_cp_group,
-            attn_cp_cpu_group=self.attn_cp_cpu_group,
             world_group=self.world_group,
             server_args=self.server_args,
             model_config=self.model_config,
@@ -1729,12 +1745,20 @@ class Scheduler(
             get_waiting_queue=lambda: self.waiting_queue,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: (
+                self.disagg_prefill_bootstrap_queue
+            ),
+            get_disagg_prefill_inflight_queue=lambda: (
+                self.disagg_prefill_inflight_queue
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
         )
 
     def init_output_streamer(self) -> None:
@@ -2699,9 +2723,8 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
 
             if self.running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     break
 
@@ -3623,6 +3646,22 @@ class Scheduler(
     def save_sharded_model(self, **kwargs):
         self.weight_updater.save_sharded_model(kwargs)
 
+    def log_movin_nixl_status(
+        self,
+        phase: str = "",
+        require_clean: bool = False,
+    ):
+        return self.criu_checkpoint.collective_status(
+            phase,
+            require_clean=require_clean,
+        )
+
+    def prepare_criu(self):
+        self.criu_checkpoint.prepare()
+
+    def restore_after_criu(self):
+        self.criu_checkpoint.restore()
+
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests
         logger.info(
@@ -3642,7 +3681,18 @@ class Scheduler(
             exec = e
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
 
-        barrier()
+        success, consensus_error = self.criu_checkpoint.converge_rpc_result(
+            recv_req.method,
+            success=success,
+            error="" if exec is None else str(exec),
+        )
+        if consensus_error:
+            exec = RuntimeError(consensus_error)
+        if self.criu_checkpoint.should_barrier_after_rpc(
+            recv_req.method,
+            success=success,
+        ):
+            barrier()
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):

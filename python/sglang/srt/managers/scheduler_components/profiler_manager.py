@@ -46,14 +46,18 @@ from sglang.srt.utils.profile_utils import ProfileManager
 @dataclass(kw_only=True)
 class SchedulerProfilerManager:
     ps: Any
-    dp_tp_cpu_group: Any
+    dp_tp_group: Any
     get_forward_ct: Callable[[], int]
+
+    @property
+    def dp_tp_cpu_group(self):
+        return self.dp_tp_group.cpu_group
 
     def __post_init__(self) -> None:
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
                 ps=self.ps,
-                cpu_group=self.dp_tp_cpu_group,
+                group=self.dp_tp_group,
             )
             return
 

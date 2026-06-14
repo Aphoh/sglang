@@ -30,16 +30,20 @@ logger = logging.getLogger(__name__)
 
 
 class ProfileManager:
-    def __init__(self, ps: ParallelState, cpu_group):
+    def __init__(self, ps: ParallelState, group):
         self.stage_based_trigger = _StageBasedTrigger(
             on_start=self._do_start,
             on_stop=self._do_stop,
         )
         self.ps = ps
-        self.cpu_group = cpu_group
+        self.group = group
         self.first_rank_in_node = ps.gpu_id == get_global_server_args().base_gpu_id
         self.profiler_kwargs = None
         self.profiler = None
+
+    @property
+    def cpu_group(self):
+        return self.group.cpu_group
 
     def step(self, forward_mode: ForwardMode):
         stage = _get_stage_from_forward_mode(forward_mode)

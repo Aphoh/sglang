@@ -138,10 +138,14 @@ class ShmRingBuffer:
         )
 
     def __del__(self):
+        self.close()
+
+    def close(self):
         if hasattr(self, "shared_memory"):
             self.shared_memory.close()
             if self.is_creator:
                 self.shared_memory.unlink()
+            del self.shared_memory
 
     @contextmanager
     def get_data(self, current_idx: int):
@@ -255,6 +259,21 @@ class MessageQueue:
 
     def export_handle(self) -> Handle:
         return self.handle
+
+    def close(self) -> None:
+        for socket_name in ("local_socket", "remote_socket"):
+            socket = getattr(self, socket_name, None)
+            if socket is not None:
+                socket.close(linger=0)
+                setattr(self, socket_name, None)
+
+        buffer = getattr(self, "buffer", None)
+        if buffer is not None:
+            buffer.close()
+            self.buffer = None
+        handle = getattr(self, "handle", None)
+        if handle is not None:
+            handle.buffer = None
 
     @staticmethod
     def create_from_handle(handle: Handle, rank) -> "MessageQueue":

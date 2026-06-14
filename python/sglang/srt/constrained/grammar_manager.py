@@ -44,7 +44,7 @@ class GrammarManager:
             else False
         )
 
-        self.grammar_sync_group = scheduler.dp_tp_cpu_group
+        self.grammar_sync_coordinator = scheduler.dp_tp_group
         self.grammar_sync_size = scheduler.dp_tp_group.world_size
         self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
         self.is_grammar_sync_entry = scheduler.dp_tp_group.is_first_rank
@@ -53,6 +53,10 @@ class GrammarManager:
         self.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = (
             envs.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS.get()
         )
+
+    @property
+    def grammar_sync_group(self):
+        return self.grammar_sync_coordinator.cpu_group
 
     def __len__(self):
         return len(self.grammar_queue)

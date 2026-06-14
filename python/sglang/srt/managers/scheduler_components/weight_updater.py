@@ -74,7 +74,7 @@ def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
     draft_worker: Any
-    tp_cpu_group: Any
+    tp_group: Any
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
@@ -82,6 +82,10 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+
+    @property
+    def tp_cpu_group(self):
+        return self.tp_group.cpu_group
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:

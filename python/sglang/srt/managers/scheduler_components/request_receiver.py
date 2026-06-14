@@ -18,6 +18,7 @@ from sglang.srt.disaggregation.utils import prepare_abort
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    RpcReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
@@ -49,11 +50,8 @@ class SchedulerRequestReceiver:
     mm_receiver: Any
     ps: ParallelState
     tp_group: Any
-    tp_cpu_group: Any
     attn_tp_group: Any
-    attn_tp_cpu_group: Any
     attn_cp_group: Any
-    attn_cp_cpu_group: Any
     world_group: Any
     server_args: ServerArgs
     model_config: ModelConfig
@@ -61,6 +59,18 @@ class SchedulerRequestReceiver:
     stream_output: Callable[..., None]
     get_last_forward_mode: Callable[[], Any]
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
+
+    @property
+    def tp_cpu_group(self):
+        return self.tp_group.cpu_group
+
+    @property
+    def attn_tp_cpu_group(self):
+        return self.attn_tp_group.cpu_group
+
+    @property
+    def attn_cp_cpu_group(self):
+        return self.attn_cp_group.cpu_group
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -71,6 +81,9 @@ class SchedulerRequestReceiver:
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+
+        if self.tp_cpu_group is None:
+            return self._recv_cpu_group_resume()
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()
@@ -91,6 +104,16 @@ class SchedulerRequestReceiver:
         self._finalize_shm_features(recv_reqs)
 
         return recv_reqs
+
+    def _recv_cpu_group_resume(self) -> List[RpcReqInput]:
+        from sglang.srt.distributed.criu_coordinator import (
+            receive_restore_request,
+        )
+
+        return receive_restore_request(
+            tp_group=self.tp_group,
+            recv_from_rpc=self.recv_from_rpc,
+        )
 
     def _pull_raw_reqs(self) -> Optional[List]:
         if self.ps.pp_rank == 0:

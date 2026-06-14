@@ -350,6 +350,11 @@ class Envs:
 
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
+    SGLANG_CRIU_REUSE_DEVICE_PROCESS_GROUPS = EnvBool(False)
+    SGLANG_CRIU_DISABLE_PYNCCL = EnvBool(False)
+    SGLANG_CRIU_DISABLE_TORCH_NCCL = EnvBool(False)
+    SGLANG_CRIU_SUSPEND_DEVICE_PROCESS_GROUP = EnvBool(False)
+    SGLANG_CRIU_DEVICE_STORE = EnvStr(None)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")

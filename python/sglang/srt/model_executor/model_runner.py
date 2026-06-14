@@ -1099,6 +1099,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             raise
 
         backend = get_default_distributed_backend(self.device)
+        if self.device == "cuda" and envs.SGLANG_CRIU_DISABLE_TORCH_NCCL.get():
+            backend = "gloo"
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
             backend = "mooncake"
             if self.server_args.mooncake_ib_device:

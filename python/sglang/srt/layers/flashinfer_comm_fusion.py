@@ -16,6 +16,7 @@ from sglang.srt.distributed import (
     get_moe_tp_group,
     get_tp_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
@@ -26,7 +27,6 @@ from sglang.srt.utils.custom_op import register_custom_op
 logger = logging.getLogger(__name__)
 
 _flashinfer_comm = None
-_TorchDistBackend = None
 _flashinfer_allreduce_unavailable = False
 _flashinfer_create_workspace_supports_group = False
 _flashinfer_create_workspace_supports_comm_backend = False
@@ -61,45 +61,7 @@ if is_flashinfer_available():
     except ImportError:
         _flashinfer_allreduce_unavailable = True
         logger.warning(
-            "flashinfer.comm is not available, falling back to standard "
-            "implementation"
-        )
-
-    try:
-        from flashinfer.comm.mnnvl import TorchDistBackend
-
-        class _FixedTorchDistBackend(TorchDistBackend):
-            """Workaround for FlashInfer TorchDistBackend issues.
-
-            1. bcast fix: TorchDistBackend.bcast passes the in-group rank
-               directly as `src` to broadcast_object_list, which expects a
-               global rank.
-            2. Graph-capture fix: initialize with NCCL device_group (so
-               the backend derives correct device_idx / GPU mapping), but
-               broadcast via GLOO cpu_group (to avoid NCCL collectives
-               that interfere with CUDA graph capture).
-            """
-
-            def __init__(self, device_group, cpu_group):
-                super().__init__(group=device_group)
-                self._cpu_group = cpu_group
-
-            def bcast(self, data, root):
-                import torch.distributed as dist
-
-                group_ranks = dist.get_process_group_ranks(self._cpu_group)
-                global_root = group_ranks[root]
-                object_list = [data]
-                dist.broadcast_object_list(
-                    object_list, src=global_root, group=self._cpu_group
-                )
-                return object_list[0]
-
-        _TorchDistBackend = _FixedTorchDistBackend
-    except ImportError:
-        logger.debug(
-            "flashinfer.comm.mnnvl.TorchDistBackend is not available, "
-            "allreduce fusion will use the default process group"
+            "flashinfer.comm is not available, falling back to standard implementation"
         )
 
 
@@ -278,6 +240,7 @@ class FlashInferWorkspaceManager:
         self.hidden_dim = None
         self.dtype = None
         self.initialized = False
+        self.checkpoint = None
 
     def initialize(
         self,
@@ -327,16 +290,32 @@ class FlashInferWorkspaceManager:
                 # Pin the symmetric-memory rendezvous to the actual subgroup.
                 # Older FlashInfer releases only support comm_backend.
                 kwargs["group"] = device_group
+            comm_backend = None
             if (
-                _TorchDistBackend is not None
-                and _flashinfer_create_workspace_supports_comm_backend
+                _flashinfer_create_workspace_supports_comm_backend
                 and device_group is not None
                 and cpu_group is not None
             ):
-                kwargs["comm_backend"] = _TorchDistBackend(
-                    device_group=device_group, cpu_group=cpu_group
-                )
-            self.workspace = create_workspace(**kwargs)
+                from movin import TorchDistributedHandleBackend
+
+                comm_backend = TorchDistributedHandleBackend(cpu_group)
+                kwargs["comm_backend"] = comm_backend
+
+            checkpointable = envs.SGLANG_CRIU_SUSPEND_DEVICE_PROCESS_GROUP.get()
+            if checkpointable:
+                if comm_backend is None:
+                    raise RuntimeError(
+                        "Checkpointable FlashInfer workspaces require a CPU "
+                        "communication backend"
+                    )
+                from movin import CheckpointableFlashInferWorkspace
+
+                self.checkpoint = CheckpointableFlashInferWorkspace()
+                with self.checkpoint.allocation_context(comm_backend, rank):
+                    self.workspace = create_workspace(**kwargs)
+                self.checkpoint.bind(self.workspace, rank)
+            else:
+                self.workspace = create_workspace(**kwargs)
         except Exception as e:
             _flashinfer_allreduce_unavailable = True
             logger.warning(
@@ -383,6 +362,31 @@ class FlashInferWorkspaceManager:
             logger.debug(f"FlashInfer workspace size check failed: {e}")
             return False
 
+    @property
+    def criu_detached(self) -> bool:
+        return self.checkpoint is not None and self.checkpoint.detached
+
+    def prepare_criu(self) -> None:
+        if not self.initialized or self.workspace is None:
+            return
+        if self.checkpoint is None:
+            raise RuntimeError(
+                "FlashInfer workspace was not created with checkpointable memory"
+            )
+        self.checkpoint.prepare_criu()
+        self.group = (None, None)
+        logger.info("Detached FlashInfer TRT-LLM workspace for CRIU")
+
+    def restore_after_criu(self, device_group, cpu_group) -> None:
+        if not self.criu_detached:
+            return
+        from movin import TorchDistributedHandleBackend
+
+        comm_backend = TorchDistributedHandleBackend(cpu_group)
+        self.checkpoint.restore_after_criu(comm_backend)
+        self.group = (device_group, cpu_group)
+        logger.info("Restored FlashInfer TRT-LLM workspace after CRIU")
+
     def cleanup(self):
         """Clean up workspace"""
         if self.workspace is not None:
@@ -392,13 +396,16 @@ class FlashInferWorkspaceManager:
                 logger.warning(f"Failed to cleanup FlashInfer workspace: {e}")
             finally:
                 self.workspace = None
-                self.initialized = False
-                self.world_size = None
-                self.rank = None
-                self.group = None
-                self.max_token_num = None
-                self.hidden_dim = None
-                self.dtype = None
+        self.initialized = False
+        self.world_size = None
+        self.rank = None
+        self.group = None
+        self.max_token_num = None
+        self.hidden_dim = None
+        self.dtype = None
+        if self.checkpoint is not None:
+            self.checkpoint.reset()
+        self.checkpoint = None
 
 
 _attn_tp_workspace_manager = FlashInferWorkspaceManager()
@@ -409,6 +416,41 @@ def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManage
     return (
         _attn_tp_workspace_manager if use_attn_tp_group else _moe_tp_workspace_manager
     )
+
+
+def create_flashinfer_raw_allreduce(control_group):
+    from movin import FlashInferAllReduce
+
+    return FlashInferAllReduce(
+        workspace_provider=_attn_tp_workspace_manager,
+        comm_module=_flashinfer_comm,
+        expected_group=control_group,
+    )
+
+
+def prepare_flashinfer_workspaces_for_criu() -> None:
+    """Detach every live TRT-LLM all-reduce workspace before group teardown."""
+    for manager in (_attn_tp_workspace_manager, _moe_tp_workspace_manager):
+        manager.prepare_criu()
+
+
+def restore_flashinfer_workspaces_after_criu() -> None:
+    """Rebind live workspaces to recreated SGLang control-plane groups."""
+    if _attn_tp_workspace_manager.criu_detached:
+        coordinator = get_attn_tp_group()
+        _attn_tp_workspace_manager.restore_after_criu(
+            coordinator.device_group, coordinator.cpu_group
+        )
+
+    if _moe_tp_workspace_manager.criu_detached:
+        coordinator = (
+            get_moe_ep_group()
+            if get_moe_expert_parallel_world_size() > 1
+            else get_moe_tp_group()
+        )
+        _moe_tp_workspace_manager.restore_after_criu(
+            coordinator.device_group, coordinator.cpu_group
+        )
 
 
 def _sync_allreduce_unavailable_across_tp():
