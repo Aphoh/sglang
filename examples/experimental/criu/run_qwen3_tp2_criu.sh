@@ -10,16 +10,13 @@ python_bin=${SGLANG_PYTHON:-/usr/bin/python}
 uv_bin=${UV_BIN:-uv}
 movin_deps_dir=${MOVIN_DEPS_DIR:-/var/cache/movin/deps}
 cuda_checkpoint_helper=${CUDA_CHECKPOINT_HELPER_BIN:-/usr/local/bin/cuda-checkpoint-helper}
-cuda_criu_plugin=${SGLANG_CRIU_CUDA_PLUGIN:-/usr/local/lib/criu/cuda_plugin.so}
-cuda_backend=${SGLANG_CRIU_CUDA_BACKEND:-helper}
 mkdir -p "${state_root}"
 state_dir=$(mktemp -d "${state_root%/}/run.XXXXXX")
 run_dir="${state_dir}/run"
 images_dir="${state_dir}/images"
-cuda_plugin_bin_dir="${state_dir}/bin"
 plugin_dir="${state_dir}/plugins"
 dist_store="${run_dir}/torch-dist-store"
-mkdir -p "${run_dir}" "${images_dir}" "${plugin_dir}" "${cuda_plugin_bin_dir}"
+mkdir -p "${run_dir}" "${images_dir}" "${plugin_dir}"
 
 "${uv_bin}" pip install --system --break-system-packages --no-deps \
   --editable "${movin_root}"
@@ -29,18 +26,6 @@ MOVIN_DEPS_DIR="${movin_deps_dir}" "${python_bin}" -m movin.build_deps
 cc -O2 -Wall -Wextra -Werror -shared -fPIC \
   "${movin_root}/examples/cuda_checkpoint/nvidiactl_criu_plugin.c" \
   -o "${plugin_dir}/nvidiactl_plugin.so"
-case "${cuda_backend}" in
-  helper)
-    ;;
-  plugin)
-    install -m 0755 "${cuda_criu_plugin}" "${plugin_dir}/cuda_plugin.so"
-    install -m 0755 "${sglang_root}/examples/experimental/criu/cuda_checkpoint_plugin_wrapper.sh" "${cuda_plugin_bin_dir}/cuda-checkpoint"
-    ;;
-  *)
-    echo "unsupported SGLANG_CRIU_CUDA_BACKEND=${cuda_backend}; expected helper or plugin" >&2
-    exit 2
-    ;;
-esac
 
 echo "checkpoint state: ${state_dir}"
 criu --version
@@ -156,8 +141,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ "${cuda_backend}" == helper ]]; then
-  mapfile -t process_tree_pids < <(
+mapfile -t process_tree_pids < <(
     python3 - "${controller_pid}" "${run_dir}/worker-pids.json" <<'PY'
 import json
 import sys
@@ -197,42 +181,37 @@ for worker in workers:
 for child in children.get(root, ()):
     emit_subtree(child)
 PY
-  )
+)
 
-  cuda_pids=()
-  for pid in "${process_tree_pids[@]}"; do
-    if timeout 10s "${cuda_checkpoint_helper}" --get-restore-tid --pid "${pid}" \
-        >/dev/null 2>&1; then
-      cuda_pids+=("${pid}")
-      pid_start_times["${pid}"]=$(process_start_time "${pid}")
-    fi
-  done
-  if [[ ${#cuda_pids[@]} -lt 2 ]]; then
-    echo "expected at least two CUDA processes, found ${#cuda_pids[@]}" >&2
+cuda_pids=()
+for pid in "${process_tree_pids[@]}"; do
+  if timeout 10s "${cuda_checkpoint_helper}" --get-restore-tid --pid "${pid}" \
+      >/dev/null 2>&1; then
+    cuda_pids+=("${pid}")
+    pid_start_times["${pid}"]=$(process_start_time "${pid}")
+  fi
+done
+if [[ ${#cuda_pids[@]} -lt 2 ]]; then
+  echo "expected at least two CUDA processes, found ${#cuda_pids[@]}" >&2
+  exit 1
+fi
+echo "CUDA checkpoint PIDs: ${cuda_pids[*]}"
+
+for pid in "${cuda_pids[@]}"; do
+  timeout 30s "${cuda_checkpoint_helper}" --action lock --pid "${pid}" --timeout 20000
+  locked+=("${pid}")
+done
+for pid in "${cuda_pids[@]}"; do
+  timeout 30s "${cuda_checkpoint_helper}" --action checkpoint --pid "${pid}"
+  checkpointed+=("${pid}")
+  state=$(timeout 10s "${cuda_checkpoint_helper}" --get-state --pid "${pid}")
+  if [[ "${state}" != checkpointed ]]; then
+    echo "CUDA process ${pid} is ${state}, expected checkpointed" >&2
     exit 1
   fi
-  echo "CUDA checkpoint PIDs: ${cuda_pids[*]}"
+done
 
-  for pid in "${cuda_pids[@]}"; do
-    timeout 30s "${cuda_checkpoint_helper}" --action lock --pid "${pid}" --timeout 20000
-    locked+=("${pid}")
-  done
-  for pid in "${cuda_pids[@]}"; do
-    timeout 30s "${cuda_checkpoint_helper}" --action checkpoint --pid "${pid}"
-    checkpointed+=("${pid}")
-    state=$(timeout 10s "${cuda_checkpoint_helper}" --get-state --pid "${pid}")
-    if [[ "${state}" != checkpointed ]]; then
-      echo "CUDA process ${pid} is ${state}, expected checkpointed" >&2
-      exit 1
-    fi
-  done
-fi
-
-criu_env=()
-if [[ "${cuda_backend}" == plugin ]]; then
-  criu_env=(env "PATH=${cuda_plugin_bin_dir}:${PATH}")
-fi
-timeout "${timeout_seconds}s" "${criu_env[@]}" criu dump \
+timeout "${timeout_seconds}s" criu dump \
   --tree "${controller_pid}" \
   --images-dir "${images_dir}" \
   --shell-job --file-locks --link-remap --tcp-established --manage-cgroups=ignore \
@@ -240,7 +219,7 @@ timeout "${timeout_seconds}s" "${criu_env[@]}" criu dump \
   --timeout "${criu_timeout_seconds}" \
   --libdir "${plugin_dir}" --log-file dump.log -v4
 
-timeout "${timeout_seconds}s" "${criu_env[@]}" criu restore \
+timeout "${timeout_seconds}s" criu restore \
   --images-dir "${images_dir}" \
   --shell-job --file-locks --link-remap --tcp-established --manage-cgroups=ignore \
   --timeout "${criu_timeout_seconds}" \
@@ -252,19 +231,17 @@ if grep -Eq "RESUME_DEVICES (RESTORE|UNLOCK) failed|Could not restore on process
   exit 1
 fi
 
-if [[ "${cuda_backend}" == helper ]]; then
-  for pid in "${cuda_pids[@]}"; do
-    pid_start_times["${pid}"]=$(process_start_time "${pid}")
-  done
-  for pid in "${cuda_pids[@]}"; do
-    timeout 30s "${cuda_checkpoint_helper}" --action restore --pid "${pid}"
-  done
-  checkpointed=()
-  for pid in "${cuda_pids[@]}"; do
-    timeout 30s "${cuda_checkpoint_helper}" --action unlock --pid "${pid}"
-  done
-  locked=()
-fi
+for pid in "${cuda_pids[@]}"; do
+  pid_start_times["${pid}"]=$(process_start_time "${pid}")
+done
+for pid in "${cuda_pids[@]}"; do
+  timeout 30s "${cuda_checkpoint_helper}" --action restore --pid "${pid}"
+done
+checkpointed=()
+for pid in "${cuda_pids[@]}"; do
+  timeout 30s "${cuda_checkpoint_helper}" --action unlock --pid "${pid}"
+done
+locked=()
 
 printf 'restored\n' >"${run_dir}/phase.tmp"
 mv "${run_dir}/phase.tmp" "${run_dir}/phase"
