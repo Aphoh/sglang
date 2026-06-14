@@ -80,6 +80,7 @@ controller_log="${state_dir}/controller.log"
         --gsm8k-max-new-tokens "${SGLANG_CRIU_GSM8K_MAX_TOKENS:-64}" \
         --gsm8k-min-accuracy "${SGLANG_CRIU_GSM8K_MIN_ACCURACY:-0.0}" \
         --max-total-tokens "${SGLANG_CRIU_MAX_TOTAL_TOKENS:-4096}" \
+        --mem-fraction-static "${SGLANG_CRIU_MEM_FRACTION_STATIC:-0.60}" \
         ${SGLANG_CRIU_DISABLE_FLASHINFER_FUSION:+--disable-flashinfer-allreduce-fusion}
 ) >"${controller_log}" 2>&1 &
 launcher_pid=$!

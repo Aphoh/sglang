@@ -138,6 +138,7 @@ def main() -> None:
     parser.add_argument("--gsm8k-max-new-tokens", type=int, default=64)
     parser.add_argument("--gsm8k-min-accuracy", type=float, default=0.0)
     parser.add_argument("--max-total-tokens", type=int, default=4096)
+    parser.add_argument("--mem-fraction-static", type=float, default=0.60)
     parser.add_argument(
         "--disable-flashinfer-allreduce-fusion",
         action="store_true",
@@ -149,6 +150,8 @@ def main() -> None:
     )
     parser.add_argument("--gsm8k-enable-thinking", action="store_true")
     args = parser.parse_args()
+    if not 0 < args.mem_fraction_static <= 1:
+        raise ValueError("--mem-fraction-static must be in (0, 1]")
 
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", args.gpus)
     os.environ.setdefault("NCCL_IB_DISABLE", "1")
@@ -179,7 +182,7 @@ def main() -> None:
         model_path=args.model,
         tp_size=args.tp_size,
         dtype="bfloat16",
-        mem_fraction_static=0.15,
+        mem_fraction_static=args.mem_fraction_static,
         max_total_tokens=args.max_total_tokens,
         max_running_requests=1,
         cuda_graph_max_bs_decode=1,

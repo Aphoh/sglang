@@ -48,6 +48,8 @@ uv pip install -e './python[criu]'
 
 The handoff runner deliberately replaces that package with the mounted Movin
 checkout so it can verify the exact pair of commits recorded by the recipe.
+`SGLANG_CRIU_MEM_FRACTION_STATIC` controls SGLang's static GPU-memory target;
+the B200 handoff recipe uses `0.60` for Qwen3-8B with 16K total tokens.
 
 ## Direct run
 
