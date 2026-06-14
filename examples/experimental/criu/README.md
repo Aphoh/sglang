@@ -56,7 +56,7 @@ CRIU commit `00b4a49`.
 | Metric | Before checkpoint | After restore |
 |---|---:|---:|
 | GSM8K accuracy | 0.93 | 0.93 |
-| Output throughput | 232.332 token/s | 234.052 token/s |
+| Output throughput | 232.725 token/s | 234.023 token/s |
 
 All 200 predictions and generated texts were identical.
 
