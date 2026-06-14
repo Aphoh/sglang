@@ -34,7 +34,6 @@ dependencies = [
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
-  "movin[all] @ git+https://github.com/NVIDIA-dev/warnold-movin.git@3a8a69ac07d56ff24ea319e7c1d525bdbf873705",
   "msgspec",
   "ninja",
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
@@ -92,6 +91,9 @@ url = "https://pypi.org/simple"
 default = true
 
 [project.optional-dependencies]
+criu = [
+  "movin[all] @ git+https://github.com/NVIDIA-dev/warnold-movin.git@f6072bb448a81c9d2309467d1200d12c088977f0",
+]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
