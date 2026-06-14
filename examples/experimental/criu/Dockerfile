@@ -49,11 +49,11 @@ RUN curl -LsSf \
 
 RUN curl -LsSf https://astral.sh/uv/0.11.16/install.sh | \
       env UV_INSTALL_DIR=/usr/local/bin sh \
-    && uv pip install --system --break-system-packages --upgrade \
+    && uv pip install --system --break-system-packages --no-deps \
       'nixl-cu13==1.1.0' \
       'sglang-kernel==0.4.3' \
     && criu --version \
     && uv --version \
-    && python -c 'import importlib.metadata as m; print(m.version("sglang-kernel"))'
+    && python -c 'import importlib.metadata as m, torch; assert m.version("torch").startswith("2.11.0"); assert torch.version.cuda == "13.0"; assert m.version("nixl-cu13") == "1.1.0"; assert m.version("sglang-kernel") == "0.4.3"'
 
 WORKDIR /workspace/sglang
