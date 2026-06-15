@@ -279,6 +279,48 @@ if [[ -n "${source_gpu_uuids}" ]]; then
   wait_for_worker_gpu_residency before_checkpoint "${source_gpu_uuids}"
 fi
 
+cuda_migration_pids=()
+if [[ -n "${cuda_device_map}" ]]; then
+  if [[ -z "${source_gpu_uuids}" ]]; then
+    echo "SGLANG_CRIU_SOURCE_GPU_UUIDS is required with SGLANG_CRIU_DEVICE_MAP" >&2
+    exit 1
+  fi
+  mapfile -t cuda_migration_pids < <(
+    python3 - "${source_gpu_uuids}" "${cuda_pids[@]}" <<'PY'
+import subprocess
+import sys
+
+source_gpu_uuids = {value for value in sys.argv[1].split(",") if value}
+cuda_pids = {int(value) for value in sys.argv[2:]}
+resident_pids = set()
+rows = subprocess.check_output(
+    [
+        "nvidia-smi",
+        "--query-compute-apps=gpu_uuid,pid",
+        "--format=csv,noheader,nounits",
+    ],
+    text=True,
+).splitlines()
+for row in rows:
+    gpu_uuid, raw_pid = (value.strip() for value in row.split(",", 1))
+    pid = int(raw_pid)
+    if pid in cuda_pids and gpu_uuid in source_gpu_uuids:
+        resident_pids.add(pid)
+for pid in sorted(resident_pids):
+    print(pid)
+PY
+  )
+  if [[ ${#cuda_migration_pids[@]} -eq 0 ]]; then
+    echo "no CUDA checkpoint PID is resident on the source GPUs" >&2
+    exit 1
+  fi
+fi
+declare -A migrate_cuda_pid=()
+for pid in "${cuda_migration_pids[@]}"; do
+  migrate_cuda_pid["${pid}"]=1
+done
+echo "CUDA migration PIDs: ${cuda_migration_pids[*]:-none}"
+
 for pid in "${cuda_pids[@]}"; do
   timeout 30s "${cuda_checkpoint_helper}" --action lock --pid "${pid}" --timeout 20000
   locked+=("${pid}")
@@ -318,9 +360,10 @@ for pid in "${cuda_pids[@]}"; do
 done
 for pid in "${cuda_pids[@]}"; do
   restore_args=(--action restore --pid "${pid}")
-  if [[ -n "${cuda_device_map}" ]]; then
+  if [[ -n "${migrate_cuda_pid[${pid}]:-}" ]]; then
     restore_args+=(--device-map "${cuda_device_map}")
   fi
+  echo "Restoring CUDA PID ${pid} with device map: ${migrate_cuda_pid[${pid}]:-0}"
   timeout 30s "${cuda_checkpoint_helper}" "${restore_args[@]}"
 done
 checkpointed=()
