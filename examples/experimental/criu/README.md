@@ -27,6 +27,14 @@ CUDA-bearing PIDs and explicitly performs:
 2. CRIU process-tree dump and restore;
 3. CUDA restore and unlock.
 
+On display driver 580 or newer, the runner also accepts a complete
+`SGLANG_CRIU_DEVICE_MAP` of `old-uuid=new-uuid` pairs. The Movin handoff recipe
+uses this to expose a source and destination pair, checkpoint TP2 on the source,
+and restore the same logical CUDA devices and captured graph onto the
+destination. `SGLANG_CRIU_SOURCE_GPU_UUIDS` and
+`SGLANG_CRIU_RESTORE_GPU_UUIDS` enable strict NVML residency checks around the
+checkpoint.
+
 The CRIU `nvidiactl` plugin compiled by the runner only reopens
 `/dev/nvidiactl` descriptors. It does not checkpoint CUDA state.
 

@@ -10,6 +10,9 @@ python_bin=${SGLANG_PYTHON:-/usr/bin/python}
 uv_bin=${UV_BIN:-uv}
 movin_deps_dir=${MOVIN_DEPS_DIR:-/var/cache/movin/deps}
 cuda_checkpoint_helper=${CUDA_CHECKPOINT_HELPER_BIN:-/usr/local/bin/cuda-checkpoint-helper}
+cuda_device_map=${SGLANG_CRIU_DEVICE_MAP:-}
+source_gpu_uuids=${SGLANG_CRIU_SOURCE_GPU_UUIDS:-}
+restore_gpu_uuids=${SGLANG_CRIU_RESTORE_GPU_UUIDS:-${source_gpu_uuids}}
 mkdir -p "${state_root}"
 state_dir=$(mktemp -d "${state_root%/}/run.XXXXXX")
 run_dir="${state_dir}/run"
@@ -87,6 +90,79 @@ wait_for_file() {
     fi
     sleep 0.1
   done
+}
+
+capture_worker_gpu_residency() {
+  local phase=$1
+  local expected_gpu_uuids=$2
+  python3 - \
+    "${phase}" \
+    "${run_dir}/worker-pids.json" \
+    "${expected_gpu_uuids}" \
+    "${run_dir}/gpu-migration.json" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+phase = sys.argv[1]
+worker_path = Path(sys.argv[2])
+expected = {value for value in sys.argv[3].split(",") if value}
+output_path = Path(sys.argv[4])
+workers = {int(pid) for pid in json.loads(worker_path.read_text())}
+residency = {pid: set() for pid in workers}
+
+rows = subprocess.check_output(
+    [
+        "nvidia-smi",
+        "--query-compute-apps=gpu_uuid,pid",
+        "--format=csv,noheader,nounits",
+    ],
+    text=True,
+).splitlines()
+for row in rows:
+    gpu_uuid, raw_pid = (value.strip() for value in row.split(",", 1))
+    pid = int(raw_pid)
+    if pid in residency:
+        residency[pid].add(gpu_uuid)
+
+missing = sorted(pid for pid, gpu_uuids in residency.items() if not gpu_uuids)
+observed = set().union(*residency.values()) if residency else set()
+if missing or observed != expected:
+    raise RuntimeError(
+        f"{phase} GPU residency mismatch: missing={missing}, "
+        f"expected={sorted(expected)}, observed={sorted(observed)}, "
+        f"workers={{{', '.join(f'{pid}: {sorted(values)}' for pid, values in sorted(residency.items()))}}}"
+    )
+
+payload = json.loads(output_path.read_text()) if output_path.exists() else {}
+payload[phase] = {
+    "expected_gpu_uuids": sorted(expected),
+    "worker_gpu_uuids": {
+        str(pid): sorted(gpu_uuids) for pid, gpu_uuids in sorted(residency.items())
+    },
+}
+temporary = output_path.with_suffix(".tmp")
+temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+temporary.replace(output_path)
+print(json.dumps({phase: payload[phase]}, sort_keys=True), flush=True)
+PY
+}
+
+wait_for_worker_gpu_residency() {
+  local phase=$1
+  local expected_gpu_uuids=$2
+  local error_log="${run_dir}/gpu-residency-${phase}.error"
+  local deadline=$((SECONDS + 30))
+  while ! capture_worker_gpu_residency \
+      "${phase}" "${expected_gpu_uuids}" 2>"${error_log}"; do
+    if (( SECONDS >= deadline )); then
+      cat "${error_log}" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  rm -f "${error_log}"
 }
 
 wait_for_file "${run_dir}/job-ready" "SGLang checkpoint barrier"
@@ -196,6 +272,9 @@ if [[ ${#cuda_pids[@]} -lt 2 ]]; then
   exit 1
 fi
 echo "CUDA checkpoint PIDs: ${cuda_pids[*]}"
+if [[ -n "${source_gpu_uuids}" ]]; then
+  wait_for_worker_gpu_residency before_checkpoint "${source_gpu_uuids}"
+fi
 
 for pid in "${cuda_pids[@]}"; do
   timeout 30s "${cuda_checkpoint_helper}" --action lock --pid "${pid}" --timeout 20000
@@ -235,13 +314,20 @@ for pid in "${cuda_pids[@]}"; do
   pid_start_times["${pid}"]=$(process_start_time "${pid}")
 done
 for pid in "${cuda_pids[@]}"; do
-  timeout 30s "${cuda_checkpoint_helper}" --action restore --pid "${pid}"
+  restore_args=(--action restore --pid "${pid}")
+  if [[ -n "${cuda_device_map}" ]]; then
+    restore_args+=(--device-map "${cuda_device_map}")
+  fi
+  timeout 30s "${cuda_checkpoint_helper}" "${restore_args[@]}"
 done
 checkpointed=()
 for pid in "${cuda_pids[@]}"; do
   timeout 30s "${cuda_checkpoint_helper}" --action unlock --pid "${pid}"
 done
 locked=()
+if [[ -n "${restore_gpu_uuids}" ]]; then
+  wait_for_worker_gpu_residency after_restore "${restore_gpu_uuids}"
+fi
 
 printf 'restored\n' >"${run_dir}/phase.tmp"
 mv "${run_dir}/phase.tmp" "${run_dir}/phase"
