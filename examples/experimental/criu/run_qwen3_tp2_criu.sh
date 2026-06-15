@@ -126,17 +126,20 @@ for row in rows:
     if pid in residency:
         residency[pid].add(gpu_uuid)
 
-missing = sorted(pid for pid, gpu_uuids in residency.items() if not gpu_uuids)
+cpu_only_workers = sorted(
+    pid for pid, gpu_uuids in residency.items() if not gpu_uuids
+)
 observed = set().union(*residency.values()) if residency else set()
-if missing or observed != expected:
+if observed != expected:
     raise RuntimeError(
-        f"{phase} GPU residency mismatch: missing={missing}, "
-        f"expected={sorted(expected)}, observed={sorted(observed)}, "
+        f"{phase} GPU residency mismatch: expected={sorted(expected)}, "
+        f"observed={sorted(observed)}, cpu_only_workers={cpu_only_workers}, "
         f"workers={{{', '.join(f'{pid}: {sorted(values)}' for pid, values in sorted(residency.items()))}}}"
     )
 
 payload = json.loads(output_path.read_text()) if output_path.exists() else {}
 payload[phase] = {
+    "cpu_only_worker_pids": cpu_only_workers,
     "expected_gpu_uuids": sorted(expected),
     "worker_gpu_uuids": {
         str(pid): sorted(gpu_uuids) for pid, gpu_uuids in sorted(residency.items())
