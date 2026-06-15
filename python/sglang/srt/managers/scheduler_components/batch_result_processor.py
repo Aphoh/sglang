@@ -80,8 +80,22 @@ class SchedulerBatchResultProcessor:
     abort_request: Callable
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
-        assert self.disaggregation_mode == DisaggregationMode.DECODE
-        use_free_group = self.server_args.disaggregation_decode_enable_radix_cache
+        # Request migration can admit a transferred prebuilt batch on an
+        # otherwise aggregated worker. Reject every other non-decode caller.
+        assert self.disaggregation_mode == DisaggregationMode.DECODE or (
+            self.server_args.enable_decode_migration
+            and all(
+                getattr(req, "is_decode_migration_destination", False)
+                for req in batch.reqs
+            )
+        )
+        use_free_group = (
+            self.server_args.disaggregation_decode_enable_radix_cache
+            or any(
+                getattr(req, "is_decode_migration_destination", False)
+                for req in batch.reqs
+            )
+        )
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()
         for req in batch.reqs:

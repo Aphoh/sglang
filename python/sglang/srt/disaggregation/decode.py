@@ -293,6 +293,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         pp_rank: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
+        enable_radix_cache: Optional[bool] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -314,6 +315,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_rank = pp_rank
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
+        self.enable_radix_cache = (
+            scheduler.server_args.disaggregation_decode_enable_radix_cache
+            if enable_radix_cache is None
+            else enable_radix_cache
+        )
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
@@ -860,7 +866,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # TODO: add new_token ratio
             origin_input_len = len(decode_req.req.origin_input_ids)
             prefix_match: Optional[DecodePrefixMatch] = None
-            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+            if self.enable_radix_cache:
                 # Match prefix against decode's radix cache.
                 prefix_match = self._match_prefix_and_lock(decode_req.req)
                 prefix_indices = prefix_match.prefix_indices
@@ -1160,13 +1166,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
-            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+            if self.enable_radix_cache:
                 available_size += self.tree_cache.evictable_size()
         else:
             available_size = self.token_to_kv_pool_allocator.available_size()
             # Include evictable decode-radix cache entries in the budget -- they
             # can be freed on demand before allocation.
-            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+            if self.enable_radix_cache:
                 available_size += self.tree_cache.evictable_size()
         allocatable_tokens = available_size - max(
             reserved_tokens, need_space_for_single_req
@@ -1310,7 +1316,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # Evict cached entries if the pool doesn't have enough free pages.
         if (
-            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            self.enable_radix_cache
             and self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens
         ):
             num_to_evict = (
@@ -1751,6 +1757,7 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
+            self.process_decode_migration_transfers()
             if self._engine_paused:
                 continue
 
@@ -1783,6 +1790,7 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.process_decode_queue()
+            self.process_decode_migration_transfers()
             if self._engine_paused:
                 continue
 

@@ -68,7 +68,11 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
+    FinalizeDecodeMigrationReqInput,
+    FinalizeDecodeMigrationReqOutput,
     PauseGenerationReqInput,
+    PrepareDecodeMigrationReqInput,
+    PrepareDecodeMigrationReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -411,6 +415,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
+        self.decode_migration_futures: Dict[str, asyncio.Future] = {}
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -557,6 +562,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             [
                 (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
+                (
+                    PrepareDecodeMigrationReqOutput,
+                    self._handle_decode_migration_output,
+                ),
+                (
+                    FinalizeDecodeMigrationReqOutput,
+                    self._handle_decode_migration_output,
+                ),
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
@@ -1679,6 +1692,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
 
+    async def prepare_decode_migration(
+        self, obj: PrepareDecodeMigrationReqInput
+    ) -> PrepareDecodeMigrationReqOutput:
+        self.auto_create_handle_loop()
+        if obj.migration_id in self.decode_migration_futures:
+            raise RuntimeError(
+                f"Migration waiter already exists for {obj.migration_id}"
+            )
+        future = asyncio.get_running_loop().create_future()
+        self.decode_migration_futures[obj.migration_id] = future
+        try:
+            await self.send_to_scheduler.send_pyobj(obj)
+            return await asyncio.wait_for(future, timeout=10.0)
+        finally:
+            self.decode_migration_futures.pop(obj.migration_id, None)
+
+    async def finalize_decode_migration(
+        self, obj: FinalizeDecodeMigrationReqInput
+    ) -> FinalizeDecodeMigrationReqOutput:
+        self.auto_create_handle_loop()
+        if obj.migration_id in self.decode_migration_futures:
+            raise RuntimeError(
+                f"Migration waiter already exists for {obj.migration_id}"
+            )
+        future = asyncio.get_running_loop().create_future()
+        self.decode_migration_futures[obj.migration_id] = future
+        try:
+            await self.send_to_scheduler.send_pyobj(obj)
+            return await asyncio.wait_for(future, timeout=10.0)
+        finally:
+            self.decode_migration_futures.pop(obj.migration_id, None)
+
     async def update_weights_from_disk(
         self,
         obj: UpdateWeightFromDiskReqInput,
@@ -2709,6 +2754,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if not future.done():
             future.set_result(recv_obj.session_id if recv_obj.success else None)
+
+    def _handle_decode_migration_output(self, recv_obj):
+        future = self.decode_migration_futures.get(recv_obj.migration_id)
+        if future is None:
+            logger.warning(
+                "Decode migration response arrived after waiter cleanup: %s",
+                recv_obj.migration_id,
+            )
+            return
+        if not future.done():
+            future.set_result(recv_obj)
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
         if self.server_args.dp_size == 1:

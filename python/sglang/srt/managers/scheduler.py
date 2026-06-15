@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
+from sglang.srt.disaggregation.decode_migration import SchedulerDecodeMigrationMixin
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
@@ -123,7 +124,9 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
+    FinalizeDecodeMigrationReqInput,
     PauseGenerationReqInput,
+    PrepareDecodeMigrationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -289,6 +292,7 @@ _is_npu = is_npu()
 
 
 class Scheduler(
+    SchedulerDecodeMigrationMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
@@ -530,6 +534,7 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.init_decode_migration()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1400,6 +1405,8 @@ class Scheduler(
                 (GetLoadsReqInput, self.handle_get_loads_req),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
+                (PrepareDecodeMigrationReqInput, self.prepare_decode_migration),
+                (FinalizeDecodeMigrationReqInput, self.finalize_decode_migration),
                 (ConfigureLoggingReq, self.configure_logging),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
@@ -1474,6 +1481,8 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.process_decode_migration_receives()
+            self.process_decode_migration_transfers()
             if self._engine_paused:
                 continue
 
@@ -1510,6 +1519,8 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.process_decode_migration_receives()
+            self.process_decode_migration_transfers()
             if self._engine_paused:
                 continue
 
@@ -2219,6 +2230,17 @@ class Scheduler(
         if not self._set_or_validate_priority(req):
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
+            if (
+                self.server_args.enable_decode_migration
+                and req.bootstrap_room is not None
+            ):
+                req.is_decode_migration_destination = True
+                self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
+                if not is_retracted:
+                    req.time_stats.set_decode_prealloc_queue_entry_time()
+                else:
+                    req.time_stats.set_retract_time()
+                return
             if self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
@@ -2543,6 +2565,10 @@ class Scheduler(
             self.running_batch.filter_batch()
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
+
+        # Destination migrations arrive with their KV already populated. Admit
+        # them as prebuilt decode requests before considering ordinary prefills.
+        self.admit_ready_decode_migrations()
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
@@ -3420,7 +3446,10 @@ class Scheduler(
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
 
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                or self.server_args.enable_decode_migration
+            ):
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
@@ -3683,6 +3712,7 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator
+        self.abort_decode_migration_receive(recv_req)
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -3699,8 +3729,10 @@ class Scheduler(
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
-            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
+            # Decode-mode and migrated destination requests already own KV.
+            if self.disaggregation_mode == DisaggregationMode.DECODE or getattr(
+                req, "is_decode_migration_destination", False
+            ):
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
