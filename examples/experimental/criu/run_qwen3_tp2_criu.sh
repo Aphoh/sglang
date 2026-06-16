@@ -280,19 +280,20 @@ if [[ -n "${source_gpu_uuids}" ]]; then
 fi
 
 cuda_migration_pids=()
+declare -A cuda_device_map_by_pid=()
 if [[ -n "${cuda_device_map}" ]]; then
   if [[ -z "${source_gpu_uuids}" ]]; then
     echo "SGLANG_CRIU_SOURCE_GPU_UUIDS is required with SGLANG_CRIU_DEVICE_MAP" >&2
     exit 1
   fi
-  mapfile -t cuda_migration_pids < <(
-    python3 - "${source_gpu_uuids}" "${cuda_pids[@]}" <<'PY'
+  mapfile -t cuda_migration_entries < <(
+    python3 - "${cuda_device_map}" "${cuda_pids[@]}" <<'PY'
 import subprocess
 import sys
 
-source_gpu_uuids = {value for value in sys.argv[1].split(",") if value}
+device_map = dict(pair.split("=", 1) for pair in sys.argv[1].split(",") if pair)
 cuda_pids = {int(value) for value in sys.argv[2:]}
-resident_pids = set()
+residency = {pid: set() for pid in cuda_pids}
 rows = subprocess.check_output(
     [
         "nvidia-smi",
@@ -304,22 +305,31 @@ rows = subprocess.check_output(
 for row in rows:
     gpu_uuid, raw_pid = (value.strip() for value in row.split(",", 1))
     pid = int(raw_pid)
-    if pid in cuda_pids and gpu_uuid in source_gpu_uuids:
-        resident_pids.add(pid)
-for pid in sorted(resident_pids):
-    print(pid)
+    if pid in residency and gpu_uuid in device_map:
+        residency[pid].add(gpu_uuid)
+for pid, gpu_uuids in sorted(residency.items()):
+    if gpu_uuids:
+        pairs = ",".join(
+            f"{gpu_uuid}={device_map[gpu_uuid]}" for gpu_uuid in sorted(gpu_uuids)
+        )
+        print(f"{pid}\t{pairs}")
 PY
   )
+  for entry in "${cuda_migration_entries[@]}"; do
+    pid=${entry%%$'\t'*}
+    pid_device_map=${entry#*$'\t'}
+    cuda_migration_pids+=("${pid}")
+    cuda_device_map_by_pid["${pid}"]=${pid_device_map}
+  done
   if [[ ${#cuda_migration_pids[@]} -eq 0 ]]; then
     echo "no CUDA checkpoint PID is resident on the source GPUs" >&2
     exit 1
   fi
 fi
-declare -A migrate_cuda_pid=()
-for pid in "${cuda_migration_pids[@]}"; do
-  migrate_cuda_pid["${pid}"]=1
-done
 echo "CUDA migration PIDs: ${cuda_migration_pids[*]:-none}"
+for pid in "${cuda_migration_pids[@]}"; do
+  echo "CUDA migration map for PID ${pid}: ${cuda_device_map_by_pid[${pid}]}"
+done
 
 for pid in "${cuda_pids[@]}"; do
   timeout 30s "${cuda_checkpoint_helper}" --action lock --pid "${pid}" --timeout 20000
@@ -360,10 +370,11 @@ for pid in "${cuda_pids[@]}"; do
 done
 for pid in "${cuda_pids[@]}"; do
   restore_args=(--action restore --pid "${pid}")
-  if [[ -n "${migrate_cuda_pid[${pid}]:-}" ]]; then
-    restore_args+=(--device-map "${cuda_device_map}")
+  pid_device_map=${cuda_device_map_by_pid[${pid}]:-}
+  if [[ -n "${pid_device_map}" ]]; then
+    restore_args+=(--device-map "${pid_device_map}")
   fi
-  echo "Restoring CUDA PID ${pid} with device map: ${migrate_cuda_pid[${pid}]:-0}"
+  echo "Restoring CUDA PID ${pid} with device map: ${pid_device_map:-none}"
   timeout 30s "${cuda_checkpoint_helper}" "${restore_args[@]}"
 done
 checkpointed=()
