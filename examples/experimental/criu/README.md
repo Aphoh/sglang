@@ -31,9 +31,10 @@ On display driver 580 or newer, the runner also accepts a complete
 `SGLANG_CRIU_DEVICE_MAP` of `old-uuid=new-uuid` pairs. The Movin handoff recipe
 uses this to expose a source and destination pair, checkpoint TP2 on the source,
 and restore the same logical CUDA devices and captured graph onto the
-destination. Before checkpoint, the runner filters that map to the exact GPUs
-resident in each CUDA process because the driver restore API rejects entries
-for GPUs that were not checkpointed by that process. `SGLANG_CRIU_SOURCE_GPU_UUIDS` and
+destination. On the validated privileged-container setup, the map is a
+host-wide bijection: selected source and destination UUIDs are swapped and all
+other physical GPUs are identity-mapped. The runner applies the map only to
+CUDA processes resident on source GPUs. `SGLANG_CRIU_SOURCE_GPU_UUIDS` and
 `SGLANG_CRIU_RESTORE_GPU_UUIDS` enable strict NVML residency checks around the
 checkpoint.
 
