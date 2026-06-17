@@ -72,7 +72,7 @@ def create_movin_collectives(
     config = config or MovinCollectiveConfig.from_env()
 
     from movin import (
-        CollectiveSet,
+        CollectiveManager,
         TorchDistributedNixlAllReduce,
         TorchDistributedSymmetricAllGather,
     )
@@ -113,4 +113,4 @@ def create_movin_collectives(
         type(all_reduce).__name__ if all_reduce is not None else "disabled",
         type(all_gather).__name__ if all_gather is not None else "disabled",
     )
-    return CollectiveSet(all_reduce=all_reduce, all_gather=all_gather)
+    return CollectiveManager(all_reduce=all_reduce, all_gather=all_gather)

@@ -1,5 +1,6 @@
 import inspect
 import logging
+from contextlib import contextmanager
 from typing import Optional, Tuple
 
 import torch
@@ -231,7 +232,8 @@ def _preflight_check_workspace_memory(
 
 
 class FlashInferWorkspaceManager:
-    def __init__(self):
+    def __init__(self, *, use_attn_tp_group: bool):
+        self.use_attn_tp_group = use_attn_tp_group
         self.workspace = None
         self.world_size = None
         self.rank = None
@@ -241,6 +243,10 @@ class FlashInferWorkspaceManager:
         self.dtype = None
         self.initialized = False
         self.checkpoint = None
+
+    @contextmanager
+    def capture(self):
+        yield
 
     def initialize(
         self,
@@ -366,26 +372,54 @@ class FlashInferWorkspaceManager:
     def criu_detached(self) -> bool:
         return self.checkpoint is not None and self.checkpoint.detached
 
-    def prepare_criu(self) -> None:
+    def prepare_checkpoint(self) -> None:
         if not self.initialized or self.workspace is None:
             return
         if self.checkpoint is None:
             raise RuntimeError(
                 "FlashInfer workspace was not created with checkpointable memory"
             )
-        self.checkpoint.prepare_criu()
+        self.checkpoint.prepare_checkpoint()
         self.group = (None, None)
         logger.info("Detached FlashInfer TRT-LLM workspace for CRIU")
 
-    def restore_after_criu(self, device_group, cpu_group) -> None:
+    def prepare_criu(self) -> None:
+        self.prepare_checkpoint()
+
+    def set_control_group(self, group) -> None:
+        if isinstance(group, tuple) and len(group) == 2:
+            self.group = group
+            return
+        device_group = self.group[0] if self.group is not None else None
+        self.group = (device_group, group)
+
+    def restore_after_criu(self, device_group=None, cpu_group=None) -> None:
         if not self.criu_detached:
             return
-        from movin import TorchDistributedHandleBackend
-
-        comm_backend = TorchDistributedHandleBackend(cpu_group)
-        self.checkpoint.restore_after_criu(comm_backend)
+        if device_group is None or cpu_group is None:
+            coordinator = self._current_coordinator()
+            device_group = coordinator.device_group
+            cpu_group = coordinator.cpu_group
+        self.checkpoint.set_control_group(cpu_group)
+        self.checkpoint.restore_after_checkpoint()
         self.group = (device_group, cpu_group)
         logger.info("Restored FlashInfer TRT-LLM workspace after CRIU")
+
+    def restore_after_checkpoint(self) -> None:
+        self.restore_after_criu()
+
+    def status(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.cleanup()
+
+    def _current_coordinator(self):
+        if self.use_attn_tp_group:
+            return get_attn_tp_group()
+        if get_moe_expert_parallel_world_size() > 1:
+            return get_moe_ep_group()
+        return get_moe_tp_group()
 
     def cleanup(self):
         """Clean up workspace"""
@@ -408,8 +442,13 @@ class FlashInferWorkspaceManager:
         self.checkpoint = None
 
 
-_attn_tp_workspace_manager = FlashInferWorkspaceManager()
-_moe_tp_workspace_manager = FlashInferWorkspaceManager()
+_attn_tp_workspace_manager = FlashInferWorkspaceManager(
+    use_attn_tp_group=True,
+)
+_moe_tp_workspace_manager = FlashInferWorkspaceManager(
+    use_attn_tp_group=False,
+)
+_flashinfer_collective_manager = None
 
 
 def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManager:
@@ -428,29 +467,19 @@ def create_flashinfer_raw_allreduce(control_group):
     )
 
 
-def prepare_flashinfer_workspaces_for_criu() -> None:
-    """Detach every live TRT-LLM all-reduce workspace before group teardown."""
-    for manager in (_attn_tp_workspace_manager, _moe_tp_workspace_manager):
-        manager.prepare_criu()
+def get_flashinfer_collective_manager():
+    """Return the shared lifecycle boundary for FlashInfer workspaces."""
+    global _flashinfer_collective_manager
+    if _flashinfer_collective_manager is None:
+        from movin import CollectiveManager
 
-
-def restore_flashinfer_workspaces_after_criu() -> None:
-    """Rebind live workspaces to recreated SGLang control-plane groups."""
-    if _attn_tp_workspace_manager.criu_detached:
-        coordinator = get_attn_tp_group()
-        _attn_tp_workspace_manager.restore_after_criu(
-            coordinator.device_group, coordinator.cpu_group
+        _flashinfer_collective_manager = CollectiveManager(
+            participants={
+                "flashinfer_attention": _attn_tp_workspace_manager,
+                "flashinfer_moe": _moe_tp_workspace_manager,
+            }
         )
-
-    if _moe_tp_workspace_manager.criu_detached:
-        coordinator = (
-            get_moe_ep_group()
-            if get_moe_expert_parallel_world_size() > 1
-            else get_moe_tp_group()
-        )
-        _moe_tp_workspace_manager.restore_after_criu(
-            coordinator.device_group, coordinator.cpu_group
-        )
+    return _flashinfer_collective_manager
 
 
 def _sync_allreduce_unavailable_across_tp():
@@ -703,11 +732,11 @@ def pre_initialize_workspaces(
 
 
 def cleanup_flashinfer_workspace():
-    global _attn_tp_workspace_manager, _moe_tp_workspace_manager
-    if _attn_tp_workspace_manager is not None:
-        _attn_tp_workspace_manager.cleanup()
-    if (
-        _moe_tp_workspace_manager is not None
-        and _moe_tp_workspace_manager is not _attn_tp_workspace_manager
-    ):
+    global _flashinfer_collective_manager
+    if _flashinfer_collective_manager is not None:
+        _flashinfer_collective_manager.close()
+        _flashinfer_collective_manager = None
+        return
+    _attn_tp_workspace_manager.cleanup()
+    if _moe_tp_workspace_manager is not _attn_tp_workspace_manager:
         _moe_tp_workspace_manager.cleanup()

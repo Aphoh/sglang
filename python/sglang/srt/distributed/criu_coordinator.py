@@ -82,9 +82,6 @@ class CriuCheckpointCoordinator:
             suspend_device_process_group,
             wait_for_process_group_teardown,
         )
-        from sglang.srt.layers.flashinfer_comm_fusion import (
-            prepare_flashinfer_workspaces_for_criu,
-        )
         from sglang.srt.distributed.criu_process_groups import (
             registered_groups,
             validate_checkpoint_topology,
@@ -102,9 +99,7 @@ class CriuCheckpointCoordinator:
         try:
             self._run_phase(
                 "prepare-collectives",
-                lambda: self._prepare_collectives(
-                    prepare_flashinfer_workspaces_for_criu
-                ),
+                self._prepare_collectives,
             )
             self._run_phase("prepare-cpu-groups", suspend_cpu_process_groups)
             self._run_phase("prepare-device-group", suspend_device_process_group)
@@ -123,9 +118,6 @@ class CriuCheckpointCoordinator:
             resume_cpu_process_groups,
             resume_device_process_group,
         )
-        from sglang.srt.layers.flashinfer_comm_fusion import (
-            restore_flashinfer_workspaces_after_criu,
-        )
 
         self._run_phase("restore-preflight", self._validate_restore_state)
         self.state = CheckpointState.RESTORING
@@ -134,9 +126,7 @@ class CriuCheckpointCoordinator:
             self._run_phase("restore-cpu-groups", resume_cpu_process_groups)
             self._run_phase(
                 "restore-collectives",
-                lambda: self._restore_collectives(
-                    restore_flashinfer_workspaces_after_criu
-                ),
+                self._restore_collectives,
             )
         except Exception:
             self.state = CheckpointState.FAILED
@@ -150,21 +140,19 @@ class CriuCheckpointCoordinator:
         validate_topology(groups)
         self.collective_status("preflight", require_clean=True)
 
-    def _prepare_collectives(self, prepare_flashinfer: Callable[[], None]) -> None:
+    def _prepare_collectives(self) -> None:
         torch.cuda.synchronize(self.device)
-        prepare_flashinfer()
         for collectives in self._collective_sets():
-            collectives.prepare_criu()
+            collectives.prepare_checkpoint()
         torch.cuda.synchronize(self.device)
 
     def _validate_restore_state(self) -> None:
         if self.state is not CheckpointState.PREPARED:
             raise RuntimeError(f"cannot restore CRIU from state {self.state.name}")
 
-    def _restore_collectives(self, restore_flashinfer: Callable[[], None]) -> None:
-        restore_flashinfer()
+    def _restore_collectives(self) -> None:
         for collectives in self._collective_sets():
-            collectives.restore_after_criu()
+            collectives.restore_after_checkpoint()
         torch.cuda.synchronize(self.device)
         self.collective_status("restored", require_clean=True)
 
@@ -272,7 +260,13 @@ class CriuCheckpointCoordinator:
             time.sleep(0.01)
 
     def _collective_sets(self):
-        seen = set()
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            get_flashinfer_collective_manager,
+        )
+
+        flashinfer_collectives = get_flashinfer_collective_manager()
+        seen = {id(flashinfer_collectives)}
+        yield flashinfer_collectives
         for group in self.groups:
             collectives = getattr(group, "movin_collectives", None)
             if collectives is not None and id(collectives) not in seen:

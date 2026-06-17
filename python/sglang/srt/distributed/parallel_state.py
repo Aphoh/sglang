@@ -1004,8 +1004,8 @@ class GroupCoordinator:
 
         movin_collectives = self.movin_collectives
         if movin_collectives is not None:
-            if movin_collectives.should_all_gather(output, input):
-                movin_collectives.all_gather(output, input)
+            if movin_collectives.should_all_gather(input, output):
+                movin_collectives.all_gather(input, output=output)
                 return
             if (
                 movin_collectives.has_all_gather
