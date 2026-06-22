@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.disaggregation.decode_migration import SchedulerDecodeMigrationMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.scheduler import Scheduler
 
 
 class _FakeBatch:
@@ -110,52 +111,40 @@ class DecodeMigrationDestinationAdmissionTests(unittest.TestCase):
 
 class DecodeMigrationReceiverInitializationTests(unittest.TestCase):
     @patch(
-        "sglang.srt.disaggregation.decode_migration.DecodePreallocQueue",
+        "sglang.srt.managers.scheduler.create_decode_transfer_queues",
         autospec=True,
     )
     @patch(
-        "sglang.srt.disaggregation.decode_migration.DecodeTransferQueue",
-        autospec=True,
-    )
-    @patch(
-        "sglang.srt.disaggregation.decode_migration.kv_cache_builder.get_draft_kv_pool",
+        "sglang.srt.managers.scheduler.kv_cache_builder.get_draft_kv_pool",
         autospec=True,
         return_value=(None, None),
     )
-    def test_hybrid_receiver_matches_prefix_before_allocation(
-        self, _get_draft_kv_pool, transfer_queue, prealloc_queue
+    def test_hybrid_receiver_uses_standard_decode_queues_with_radix_matching(
+        self, _get_draft_kv_pool, create_queues
     ):
+        prealloc_queue = object()
+        transfer_queue = object()
+        create_queues.return_value = (prealloc_queue, transfer_queue)
         scheduler = SimpleNamespace(
-            disagg_decode_prealloc_queue=None,
             draft_worker=object(),
             spec_algorithm=object(),
+            model_config=object(),
             server_args=SimpleNamespace(
-                dp_size=1,
-                disaggregation_bootstrap_port=12345,
-                num_reserved_decode_tokens=512,
+                disaggregation_mode="null",
+                disaggregation_transfer_backend="nixl",
+                enable_decode_migration=True,
+                language_only=False,
+                encoder_transfer_backend="zmq_to_scheduler",
             ),
-            attn_tp_cpu_group=object(),
             req_to_metadata_buffer_idx_allocator=object(),
             disagg_metadata_buffers=object(),
-            ps=SimpleNamespace(tp_rank=0, tp_size=1, gpu_id=0, pp_rank=0),
-            tree_cache=object(),
-            req_to_token_pool=object(),
-            token_to_kv_pool_allocator=object(),
-            max_total_num_tokens=1024,
-            transfer_backend=object(),
         )
 
-        SchedulerDecodeMigrationMixin._init_decode_migration_receiver(scheduler)
+        Scheduler.init_disaggregation(scheduler)
 
-        self.assertIs(
-            scheduler.disagg_decode_transfer_queue, transfer_queue.return_value
-        )
-        self.assertIs(
-            scheduler.disagg_decode_prealloc_queue, prealloc_queue.return_value
-        )
-        self.assertIs(
-            prealloc_queue.call_args.kwargs["enable_radix_cache"], True
-        )
+        create_queues.assert_called_once_with(scheduler, None, enable_radix_cache=True)
+        self.assertIs(scheduler.disagg_decode_prealloc_queue, prealloc_queue)
+        self.assertIs(scheduler.disagg_decode_transfer_queue, transfer_queue)
 
 
 if __name__ == "__main__":

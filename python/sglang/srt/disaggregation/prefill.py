@@ -97,6 +97,89 @@ def maybe_release_metadata_buffer(
         req.metadata_buffer_index = -1
 
 
+def create_prefill_kv_manager(
+    *,
+    token_to_kv_pool: KVCache,
+    draft_token_to_kv_pool: Optional[KVCache],
+    metadata_buffers: MetadataBuffers,
+    transfer_backend: TransferBackend,
+    scheduler: Scheduler,
+    tp_rank: int,
+    pp_rank: int,
+) -> CommonKVManager:
+    """Create the sender-side manager shared by prefill and decode migration."""
+    is_mla = is_mla_backend(token_to_kv_pool)
+    if envs.SGLANG_DISAGG_STAGING_BUFFER.get() and is_mla:
+        raise RuntimeError(
+            "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
+            "(e.g. GQA, MHA). MLA models should not set this flag."
+        )
+
+    kv_args_class = get_kv_class(transfer_backend, KVClassType.KVARGS)
+    kv_args = kv_args_class()
+    kv_args.engine_rank = tp_rank
+    kv_args.pp_rank = pp_rank
+    kv_args.system_dp_rank = scheduler.ps.dp_rank
+    kv_args.prefill_start_layer = token_to_kv_pool.start_layer
+    kv_args.prefill_end_layer = getattr(token_to_kv_pool, "end_layer", None)
+    kv_args.mla_compression_ratios = None
+    kv_data_ptrs, kv_data_lens, kv_item_lens = (
+        token_to_kv_pool.get_contiguous_buf_infos()
+    )
+
+    if draft_token_to_kv_pool is not None:
+        draft_ptrs, draft_lens, draft_item_lens = (
+            draft_token_to_kv_pool.get_contiguous_buf_infos()
+        )
+        kv_data_ptrs += draft_ptrs
+        kv_data_lens += draft_lens
+        kv_item_lens += draft_item_lens
+
+    kv_args.kv_data_ptrs = kv_data_ptrs
+    kv_args.kv_data_lens = kv_data_lens
+    kv_args.kv_item_lens = kv_item_lens
+    if not is_mla:
+        kv_args.kv_head_num = token_to_kv_pool.head_num
+        kv_args.total_kv_head_num = scheduler.model_config.get_total_num_kv_heads()
+    kv_args.page_size = token_to_kv_pool.page_size
+    kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
+        metadata_buffers.get_buf_infos()
+    )
+    kv_args.ib_device = scheduler.server_args.disaggregation_ib_device
+    kv_args.gpu_id = scheduler.ps.gpu_id
+    setup_state_kv_args(
+        kv_args,
+        token_to_kv_pool,
+        draft_token_to_kv_pool,
+        scheduler.model_config.num_hidden_layers,
+        req_to_token_pool=getattr(scheduler, "req_to_token_pool", None),
+    )
+
+    if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
+        kv_args.mla_compression_ratios = list(token_to_kv_pool.compression_ratios)
+
+    manager_class = get_kv_class(transfer_backend, KVClassType.MANAGER)
+    manager = manager_class(
+        kv_args,
+        DisaggregationMode.PREFILL,
+        scheduler.server_args,
+        is_mla,
+    )
+    if (
+        envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        and hasattr(manager, "set_kv_buffer_tensors")
+        and not is_mla
+    ):
+        kv_pool = getattr(token_to_kv_pool, "full_kv_pool", token_to_kv_pool)
+        if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
+            manager.set_kv_buffer_tensors(
+                kv_pool.k_buffer,
+                kv_pool.v_buffer,
+                kv_pool.page_size,
+            )
+    return manager
+
+
 class PrefillBootstrapQueue:
     """
     Store the requests in bootstrapping
@@ -145,83 +228,15 @@ class PrefillBootstrapQueue:
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> CommonKVManager:
-        kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
-        kv_args = kv_args_class()
-        kv_args.engine_rank = self.tp_rank
-        kv_args.pp_rank = self.pp_rank
-        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
-        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
-        kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
-        kv_args.mla_compression_ratios = None
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            self.token_to_kv_pool.get_contiguous_buf_infos()
+        return create_prefill_kv_manager(
+            token_to_kv_pool=self.token_to_kv_pool,
+            draft_token_to_kv_pool=self.draft_token_to_kv_pool,
+            metadata_buffers=self.metadata_buffers,
+            transfer_backend=self.transfer_backend,
+            scheduler=self.scheduler,
+            tp_rank=self.tp_rank,
+            pp_rank=self.pp_rank,
         )
-
-        if self.draft_token_to_kv_pool is not None:
-            # We should also transfer draft model kv cache. The indices are
-            # always shared with a target model.
-            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
-            )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
-
-        kv_args.kv_data_ptrs = kv_data_ptrs
-        kv_args.kv_data_lens = kv_data_lens
-        kv_args.kv_item_lens = kv_item_lens
-        if not self.is_mla_backend:
-            kv_args.kv_head_num = self.token_to_kv_pool.head_num
-            kv_args.total_kv_head_num = (
-                self.scheduler.model_config.get_total_num_kv_heads()
-            )
-        kv_args.page_size = self.token_to_kv_pool.page_size
-
-        kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
-            self.metadata_buffers.get_buf_infos()
-        )
-        kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
-        kv_args.gpu_id = self.scheduler.ps.gpu_id
-
-        req_to_token_pool = getattr(self.scheduler, "req_to_token_pool", None)
-        setup_state_kv_args(
-            kv_args,
-            self.token_to_kv_pool,
-            self.draft_token_to_kv_pool,
-            self.scheduler.model_config.num_hidden_layers,
-            req_to_token_pool=req_to_token_pool,
-        )
-
-        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
-            # V4's KVCache is organized by compression-ratio
-            # buckets rather than by layer.
-            kv_args.mla_compression_ratios = list(
-                self.token_to_kv_pool.compression_ratios
-            )
-
-        kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager = kv_manager_class(
-            kv_args,
-            DisaggregationMode.PREFILL,
-            self.scheduler.server_args,
-            self.is_mla_backend,
-        )
-        # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
-        if (
-            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-            and hasattr(kv_manager, "set_kv_buffer_tensors")
-            and not self.is_mla_backend
-        ):
-            kv_pool = self.token_to_kv_pool
-            if hasattr(kv_pool, "full_kv_pool"):
-                kv_pool = kv_pool.full_kv_pool
-            if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
-                kv_manager.set_kv_buffer_tensors(
-                    kv_pool.k_buffer,
-                    kv_pool.v_buffer,
-                    kv_pool.page_size,
-                )
-        return kv_manager
 
     def create_sender(self, req: Req, num_kv_heads: int) -> bool:
         """Create a KV sender for the request without enqueuing it.

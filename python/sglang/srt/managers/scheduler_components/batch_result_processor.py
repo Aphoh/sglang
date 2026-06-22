@@ -78,6 +78,7 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: "SchedulerLogprobResultProcessor"
     output_streamer: "SchedulerOutputStreamer"
     abort_request: Callable
+    maybe_park_decode_migration_at_boundary: Optional[Callable] = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         # Request migration can admit a transferred prebuilt batch on an
@@ -230,7 +231,11 @@ class SchedulerBatchResultProcessor:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if req.finished() or req.is_retracted:
+                if (
+                    req.finished()
+                    or req.is_retracted
+                    or getattr(req, "is_decode_migration_source_parked", False)
+                ):
                     # decode req in mixed batch or retracted req
                     continue
 
@@ -243,12 +248,19 @@ class SchedulerBatchResultProcessor:
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
                     req.update_finish_state()
-                    if req.finished():
+                    parked = (
+                        self.maybe_park_decode_migration_at_boundary(req)
+                        if self.maybe_park_decode_migration_at_boundary is not None
+                        else False
+                    )
+                    if req.finished() and not parked:
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    elif not parked and (
+                        not batch.decoding_reqs or req not in batch.decoding_reqs
+                    ):
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if self.server_args.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
@@ -652,6 +664,9 @@ class SchedulerBatchResultProcessor:
         for i, req in enumerate(batch.reqs):
             req: Req
 
+            if getattr(req, "is_decode_migration_source_parked", False):
+                continue
+
             if (self.enable_overlap or self.enable_overlap_mlx) and (
                 req.finished() or req.is_retracted
             ):
@@ -661,9 +676,15 @@ class SchedulerBatchResultProcessor:
 
             if is_spec_v1:
                 req.time_stats.set_last_decode_finish_time()
-                self._handle_finish_state_updated_req(
-                    req, batch, result, i, logits_output
+                parked = (
+                    self.maybe_park_decode_migration_at_boundary(req)
+                    if self.maybe_park_decode_migration_at_boundary is not None
+                    else False
                 )
+                if not parked:
+                    self._handle_finish_state_updated_req(
+                        req, batch, result, i, logits_output
+                    )
                 if req.return_hidden_states and logits_output.hidden_states is not None:
                     req.hidden_states.append(
                         logits_output.hidden_states[i].cpu().clone().tolist()
@@ -686,7 +707,15 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accepted_len)
 
-            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+            parked = (
+                self.maybe_park_decode_migration_at_boundary(req)
+                if self.maybe_park_decode_migration_at_boundary is not None
+                else False
+            )
+            if not parked:
+                self._handle_finish_state_updated_req(
+                    req, batch, result, i, logits_output
+                )
 
             if req.return_logprob:
                 self._apply_decode_logprobs(

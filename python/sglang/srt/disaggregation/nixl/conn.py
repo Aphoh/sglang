@@ -1826,6 +1826,14 @@ class NixlKVManager(CommonKVManager):
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )
 
+                if waiting_req_bytes[0] == b"ABORT":
+                    room = int(waiting_req_bytes[1].decode("ascii"))
+                    self.record_failure(room, "Destination aborted bootstrap room")
+                    self.update_status(room, KVPoll.Failed)
+                    self.transfer_infos.pop(room, None)
+                    self.req_to_decode_prefix_len.pop(room, None)
+                    continue
+
                 # Staging: decode reports consumption watermark back to prefill
                 if waiting_req_bytes[0] == b"WATERMARK":
                     if self.enable_staging:

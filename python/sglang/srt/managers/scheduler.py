@@ -43,14 +43,13 @@ from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
-    DecodePreallocQueue,
-    DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
+    create_decode_transfer_queues,
 )
-from sglang.srt.disaggregation.decode_migration import SchedulerDecodeMigrationMixin
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
+from sglang.srt.disaggregation.decode_migration import SchedulerDecodeMigrationMixin
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
@@ -107,6 +106,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
+    FinalizeDecodeMigrationReqInput,
     FlushCacheReqInput,
     FreezeGCReq,
     GetInternalStateReq,
@@ -124,7 +124,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
-    FinalizeDecodeMigrationReqInput,
     PauseGenerationReqInput,
     PrepareDecodeMigrationReqInput,
     ProfileReq,
@@ -1083,37 +1082,10 @@ class Scheduler(
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
-            # The decode requests polling kv cache
-            self.disagg_decode_transfer_queue = DecodeTransferQueue(
-                gloo_group=self.attn_tp_cpu_group,
-                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
-                tp_rank=self.ps.tp_rank,
-                metadata_buffers=self.disagg_metadata_buffers,
-                scheduler=self,
-                tree_cache=self.tree_cache,
-            )
-
-            # The decode requests pending for pre-allocation
-            self.disagg_decode_prealloc_queue = DecodePreallocQueue(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                draft_token_to_kv_pool=draft_token_to_kv_pool,
-                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
-                metadata_buffers=self.disagg_metadata_buffers,
-                scheduler=self,
-                transfer_queue=self.disagg_decode_transfer_queue,
-                tree_cache=self.tree_cache,
-                gloo_group=self.attn_tp_cpu_group,
-                tp_rank=self.ps.tp_rank,
-                tp_size=self.ps.tp_size,
-                dp_size=self.server_args.dp_size,
-                gpu_id=self.ps.gpu_id,
-                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
-                max_total_num_tokens=self.max_total_num_tokens,
-                pp_rank=self.ps.pp_rank,
-                num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
-                transfer_backend=self.transfer_backend,
-            )
+            (
+                self.disagg_decode_prealloc_queue,
+                self.disagg_decode_transfer_queue,
+            ) = create_decode_transfer_queues(self, draft_token_to_kv_pool)
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -1156,6 +1128,28 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+
+        if (
+            self.server_args.enable_decode_migration
+            and self.disaggregation_mode != DisaggregationMode.DECODE
+        ):
+            if not hasattr(self, "req_to_metadata_buffer_idx_allocator"):
+                buffer_size = self.max_running_requests * 2
+                self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                    buffer_size
+                )
+                self.disagg_metadata_buffers = MetadataBuffers(
+                    buffer_size,
+                    hidden_size=16,
+                    hidden_states_dtype=torch.float32,
+                    custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                )
+            (
+                self.disagg_decode_prealloc_queue,
+                self.disagg_decode_transfer_queue,
+            ) = create_decode_transfer_queues(
+                self, draft_token_to_kv_pool, enable_radix_cache=True
+            )
 
         # Init mm receiver for EPD disaggregation mode
         if (
@@ -1472,7 +1466,10 @@ class Scheduler(
         ] = deque()
 
         def pop_and_process():
-            # Process the results of the last batch
+            # Migration may resolve the outstanding result before parking a
+            # request. Preserve the normal overlap loop without processing it twice.
+            if self._decode_migration_overlap_result_processed:
+                return
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
@@ -1521,6 +1518,7 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+            self._decode_migration_overlap_result_processed = False
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
@@ -1706,6 +1704,9 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_decode_migration_reqs=lambda: (
+                record.req for record in self.decode_migration_transfers.values()
+            ),
         )
 
     def init_kv_events_publisher(self) -> None:
@@ -1781,6 +1782,11 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
+            maybe_park_decode_migration_at_boundary=(
+                self.maybe_park_decode_migration_at_boundary
+                if self.server_args.enable_decode_migration
+                else None
+            ),
         )
 
     def init_req_max_new_tokens(self, req):
@@ -3395,6 +3401,7 @@ class Scheduler(
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
+            and not self.decode_migration_transfers
             and self._pp_microbatches_drained()
         )
 

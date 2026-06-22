@@ -1,115 +1,100 @@
 # Decode-to-Decode Migration Roadmap
 
-## Scope
+## Ownership
 
-SGLang provides the engine-side transaction for moving a live decode request
-between ordinary workers. Dynamo chooses the source, destination, and trigger;
-SGLang owns exact request quiescence, KV transfer, destination admission, and
+Dynamo selects workers and decides when to migrate. SGLang owns request-local
+parking, the exact KV frontier, NIXL transfer, destination admission, and
 cleanup.
 
 Every worker started with `--enable-decode-migration` can send and receive.
-Fast and slow are Dynamo scheduling taints, not SGLang worker roles.
+`decode/fast`, `decode/slow`, and benchmark-specific roles are Dynamo taints,
+not SGLang engine modes.
 
-## Current Transaction
+## Current One-Shot Flow
 
-The one-shot prototype uses SGLang's decode-side NIXL path:
+1. Dynamo selects and reserves a destination.
+2. Dynamo arms the source with a sequence-length trigger and the destination's
+   bootstrap address, opaque room, and explicit rank metadata.
+3. The normal overlap result path detects the trigger and removes only that
+   request from scheduling.
+4. SGLang exports the requested committed/logical frontier. If overlap execution
+   advanced internally beyond the trigger, unstreamed extra results are excluded
+   from the exported KV and token state.
+5. The destination arms its continuation receiver and reports any cached prefix.
+6. NIXL transfers only the missing committed KV range.
+7. Dynamo attaches the destination stream, activates the destination, and commits
+   the source after valid destination output.
 
-1. The destination reserves a migration record and opaque bootstrap room.
-2. The source pauses at a scheduler boundary and captures the exact request
-   frontier.
-3. The destination arms a continuation receiver with explicit source rank and
-   frontier data.
-4. NIXL transfers the missing committed KV range.
-5. After the destination produces valid output, Dynamo activates it and commits
-   the source.
+The source retains the parked request and KV until commit or cancellation, but
+there is no resume-after-failed-handoff protocol. Failure aborts the transaction
+and performs cleanup.
 
-The source retains its request row, KV pages, radix ownership, sampling state,
-and pending token until `commit`, `resume`, or `cancel`. Before commit, a failed
-handoff can therefore resume the original request.
+## Required Invariants
 
-The worker control operations are:
+- The engine is never paused globally.
+- Overlap scheduling remains enabled.
+- Unrelated requests and independent migrations continue running.
+- The exported frontier is numeric and exact; stream chunk boundaries do not
+  define KV ownership.
+- The destination receives committed KV plus exactly one pending sampled token.
+- Tokens already emitted by the source are never replayed.
+- Requests that finish before parking are not migrated.
+- Cancellation releases request rows, KV pages, metadata buffers, receivers,
+  senders, and Dynamo reservation state.
+- Source and destination model, page size, dtype, KV layout, PP layout, and
+  transfer protocol must be compatible.
 
-- `migration_prepare`: reserve, then arm the destination continuation.
-- `migration_sync`: describe the source or quiesce it for transfer.
-- `migration_finalize`: activate/abort the destination or
-  commit/resume/cancel the source.
+## Validation Status
 
-The destination reports its cached prefix, so the source transfers only the
-missing committed range. A cold destination receives prompt and generated KV;
-a warmed destination can receive only the delta.
+Focused tests cover frontier construction, overlap overshoot, destination
+admission, stream intervals, finish races, cancellation, rollback, and cleanup.
+The source/destination test set passes 17/17 tests; Dynamo migration tests pass
+24/24.
 
-## Correctness Rules
+Live validation includes TP1 -> TP1, TP4 -> TP1, MLA transfer, and TP2 -> TP1.
+The current static Qwen3-32B confirmation completed 256/256 measured migrations
+at an exact 307/308 frontier with overlap enabled.
 
-1. The source is authoritative until destination output is valid and source
-   commit succeeds.
-2. KV ownership uses numeric token frontiers, not streamed chunk boundaries.
-3. The destination starts from the sampled pending token after receiving all
-   committed KV.
-4. Source tokens committed but not emitted are forwarded exactly once.
-5. Destination replay of already emitted tokens is trimmed by position.
-6. A request carrying a finish reason is never migrated.
-7. Destination receive admission must preserve the KV allocation established by
-   transfer preparation; it must not perform a second radix match.
-8. Cancellation and rollback release request rows, KV pages, transfer state,
-   receiver state, and reservations.
+The confirmed local Pareto point compares pure TP4 with TP2 -> TP1 migration:
 
-## Prototype Limits
+```text
+Pure TP4:       1.300 req/s/GPU, P95 TTFNT 7.646 s
+TP2 -> TP1:     1.692 req/s/GPU, P95 TTFNT 7.424 s
+```
 
-- Exact quiescence requires `--disable-overlap-schedule`.
-- Quiescence pauses the source scheduler and allows one active source migration
-  per worker. Dynamo serializes concurrent migrations per source rank.
-- Transfer is one-shot.
-- Destination reservation is advisory handler state, not a hard KV lease.
-- Live coverage is DP=1; multi-DP routing still needs validation.
-- Speculative decoding, beam search, multiple return sequences, guided decoding,
-  multimodal continuation state, and sessions are unsupported.
-- Source and destination must have compatible model, page size, KV layout and
-  dtype, PP layout, and transfer protocol. Heterogeneous TP works only through a
-  supported NIXL direct or staging layout.
+See `measurement_plan.md` and `measurement_results_qwen3_32b.md`.
 
-## Upstream Work
-
-### Per-request parking
-
-Replace the scheduler-wide pause with an engine-owned parked state for one
-request. Unrelated requests and independent migrations must continue while the
-parked request retains all decode and KV ownership.
+## Next Engineering Steps
 
 ### Hard destination leases
 
-Reserve request-pool and KV capacity before source quiescence. Leases need a
-capacity grant, destination rank, compatibility fingerprint, TTL, and
-idempotent reserve/grow/arm/activate/abort transitions.
+Replace advisory reservation state with request-pool and KV-capacity leases.
+Leases need capacity, rank, compatibility fingerprint, TTL, and idempotent
+reserve/grow/arm/activate/abort transitions.
 
-### Incremental synchronization
+### Incremental KV synchronization
 
-Reuse one destination lease and migration ID. Copy monotonically increasing
-stable ranges while source decode continues, then park the source and copy only
-the final delta at the trigger. The existing activation, stream reconciliation,
-and commit protocol should remain unchanged.
+Reuse the same destination lease, migration ID, bootstrap room, and explicit rank
+mapping. While source decode continues, copy monotonically increasing stable KV
+ranges. At the trigger, park the request and transfer only the final delta. The
+current activation, stream reconciliation, and commit protocol should remain
+unchanged.
 
 ### Compatibility and DP
 
-Publish cache-layout capabilities and reject incompatible pairs before
-quiescence. Add multi-DP tests proving that control RPCs and NIXL handshakes
-reach the selected rank.
+Publish cache-layout capabilities and reject incompatible pairs before arming the
+source. Add multi-DP tests proving that control RPCs and NIXL handshakes reach the
+selected rank.
 
-### Observability and fault injection
+### Fault injection and observability
 
-Record phase latency, token ranges, bytes/pages, terminal outcomes, and cleanup.
-Add failures for allocation, transfer timeout, lost control responses, worker
-loss, lease expiry, and rank mismatch.
+Add phase timings, byte/page counts, lease age, and terminal-state metrics. Test
+allocation failure, transfer timeout, lost control responses, worker loss,
+lease expiry, cancellation at every phase, and rank mismatch.
 
-## Validation
+### Production policy
 
-Focused tests cover frontier construction, radix ownership, destination
-admission, stream intervals 1 and 4, finish races, cancellation, rollback, and
-cleanup. Live tests cover Qwen3-0.6B TP1-to-TP1 and Qwen3-8B TP4-to-TP1 through
-the heterogeneous-TP staging path.
-
-A 200-sample Qwen3-8B GSM8K run at temperature 1.0 and 32K context completed
-200/200 migrations with no busy rejection, rollback, invalid response, or
-length truncation. Accuracy was 96.0% without migration and 96.5% with
-migration; the paired McNemar exact test gave `p=1.0`.
-
-Performance evaluation is defined in `measurement_plan.md`.
+Use measured reasoning/visible token distributions to choose fast/slow GPU
+allocations. Pre-reserve only when predicted boundary timing and KV headroom make
+it worthwhile. Incremental transfer is justified only when its TTFNT reduction
+exceeds added transfer traffic and reserved-KV cost.

@@ -1598,13 +1598,14 @@ class PrepareDecodeMigrationReqInput(BaseReq):
     bootstrap_port: int
     bootstrap_room: int
     output_tokens_seen: int = 0
+    target_sequence_length: Optional[int] = None
 
 
 @dataclass
 class PrepareDecodeMigrationReqOutput(BaseReq):
     migration_id: str
     success: bool
-    status: Literal["prepared", "finished", "not_found", "busy", "error"]
+    status: Literal["armed", "prepared", "finished", "not_found", "busy", "error"]
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None

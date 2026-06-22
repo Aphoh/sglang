@@ -1723,6 +1723,49 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         pass
 
 
+def create_decode_transfer_queues(
+    scheduler: Scheduler,
+    draft_token_to_kv_pool: Optional[KVCache],
+    *,
+    enable_radix_cache: Optional[bool] = None,
+) -> tuple[DecodePreallocQueue, DecodeTransferQueue]:
+    """Create the standard decode preallocation and transfer queues."""
+    transfer_queue = DecodeTransferQueue(
+        gloo_group=scheduler.attn_tp_cpu_group,
+        req_to_metadata_buffer_idx_allocator=(
+            scheduler.req_to_metadata_buffer_idx_allocator
+        ),
+        tp_rank=scheduler.ps.tp_rank,
+        metadata_buffers=scheduler.disagg_metadata_buffers,
+        scheduler=scheduler,
+        tree_cache=scheduler.tree_cache,
+    )
+    prealloc_queue = DecodePreallocQueue(
+        req_to_token_pool=scheduler.req_to_token_pool,
+        token_to_kv_pool_allocator=scheduler.token_to_kv_pool_allocator,
+        draft_token_to_kv_pool=draft_token_to_kv_pool,
+        req_to_metadata_buffer_idx_allocator=(
+            scheduler.req_to_metadata_buffer_idx_allocator
+        ),
+        metadata_buffers=scheduler.disagg_metadata_buffers,
+        scheduler=scheduler,
+        transfer_queue=transfer_queue,
+        tree_cache=scheduler.tree_cache,
+        gloo_group=scheduler.attn_tp_cpu_group,
+        tp_rank=scheduler.ps.tp_rank,
+        tp_size=scheduler.ps.tp_size,
+        dp_size=scheduler.server_args.dp_size,
+        gpu_id=scheduler.ps.gpu_id,
+        bootstrap_port=scheduler.server_args.disaggregation_bootstrap_port,
+        max_total_num_tokens=scheduler.max_total_num_tokens,
+        pp_rank=scheduler.ps.pp_rank,
+        num_reserved_decode_tokens=scheduler.server_args.num_reserved_decode_tokens,
+        transfer_backend=scheduler.transfer_backend,
+        enable_radix_cache=enable_radix_cache,
+    )
+    return prealloc_queue, transfer_queue
+
+
 class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
@@ -1781,10 +1824,11 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 batch_result = None
 
-            # Process the last batch
+            # Process the last batch unless migration already resolved it.
             if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                if not self._decode_migration_overlap_result_processed:
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.on_idle()
 
@@ -1794,6 +1838,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+            self._decode_migration_overlap_result_processed = False
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch

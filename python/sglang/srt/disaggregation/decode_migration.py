@@ -1,13 +1,8 @@
-"""Transactional source-side support for live decode-to-decode migration.
+"""Request-local support for live decode-to-decode migration.
 
-The destination reuses SGLang's normal disaggregated-decode receiver. The source
-is quiesced, exposes an exact committed KV range through the existing P/D sender,
-and retains ownership until an explicit commit arrives.
-
-The first prototype uses the scheduler's in-place engine pause as its quiescence
-barrier. This is intentionally coarse, but keeps request and KV state untouched
-for rollback. The transfer record is range-based so a later per-request pause and
-incremental delta sender can reuse the same lifecycle.
+The destination reuses SGLang's disaggregated-decode receiver. The source
+resolves any outstanding overlap result, removes only the target request from
+scheduling, and retains its KV until one-way finalization.
 """
 
 from __future__ import annotations
@@ -17,35 +12,27 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Optional
 
-import torch
-
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_migration_state import (
     build_decode_migration_frontier,
 )
+from sglang.srt.disaggregation.prefill import create_prefill_kv_manager
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
-    MetadataBuffers,
-    ReqToMetadataIdxAllocator,
-    TransferBackend,
     get_kv_class,
-    is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
-    setup_state_kv_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.managers.io_struct import (
     FinalizeDecodeMigrationReqInput,
     FinalizeDecodeMigrationReqOutput,
     PrepareDecodeMigrationReqInput,
     PrepareDecodeMigrationReqOutput,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.mem_cache.common import kv_to_page_indices, release_kv_cache
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.mem_cache.common import kv_to_page_indices
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base import BaseKVManager, BaseKVSender
@@ -62,6 +49,8 @@ class DecodeMigrationTransfer:
     metadata_buffer_index: int
     bootstrap_room: int
     committed_len: int
+    logical_len: int
+    output_tokens_seen: int
     pending_input_ids: list[int]
     created_at: float
     transfer_start: int = 0
@@ -69,6 +58,7 @@ class DecodeMigrationTransfer:
     send_started: bool = False
     status: str = "bootstrapping"
     error: Optional[str] = None
+    source_released: bool = False
 
 
 class SchedulerDecodeMigrationMixin:
@@ -77,145 +67,32 @@ class SchedulerDecodeMigrationMixin:
     def init_decode_migration(self: "Scheduler") -> None:
         self.decode_migration_transfers: Dict[str, DecodeMigrationTransfer] = {}
         self.decode_migration_by_rid: Dict[str, str] = {}
+        self.decode_migration_arms: Dict[str, PrepareDecodeMigrationReqInput] = {}
+        self.decode_migration_arm_by_rid: Dict[str, str] = {}
         self._decode_migration_kv_manager: Optional[BaseKVManager] = None
+        self._decode_migration_overlap_result_processed = False
         if not self.server_args.enable_decode_migration:
             return
-        if not hasattr(self, "req_to_metadata_buffer_idx_allocator"):
-            buffer_size = self.max_running_requests * 2
-            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
-                buffer_size
-            )
-            self.disagg_metadata_buffers = MetadataBuffers(
-                buffer_size,
-                hidden_size=16,
-                hidden_states_dtype=torch.float32,
-                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
-            )
-        # A migration-capable worker may be either endpoint regardless of its
-        # ordinary serving mode. Reuse the normal decode receiver queues instead
-        # of requiring the whole worker to run in PD decode mode.
-        self._init_decode_migration_receiver()
-
-        # Fail startup early on transfer-backend incompatibility and avoid
-        # constructing/registering the NIXL manager while a request is paused.
+        # Fail startup early on transfer-backend incompatibility.
         self._get_decode_migration_kv_manager()
 
-    def _init_decode_migration_receiver(self: "Scheduler") -> None:
-        if self.disagg_decode_prealloc_queue is not None:
-            return
-
-        draft_token_to_kv_pool, _ = kv_cache_builder.get_draft_kv_pool(
-            draft_worker=self.draft_worker,
-            spec_algorithm=self.spec_algorithm,
-            server_args=self.server_args,
-        )
-        self.disagg_decode_transfer_queue = DecodeTransferQueue(
-            gloo_group=self.attn_tp_cpu_group,
-            req_to_metadata_buffer_idx_allocator=(
-                self.req_to_metadata_buffer_idx_allocator
-            ),
-            tp_rank=self.ps.tp_rank,
-            metadata_buffers=self.disagg_metadata_buffers,
-            scheduler=self,
-            tree_cache=self.tree_cache,
-        )
-        self.disagg_decode_prealloc_queue = DecodePreallocQueue(
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            draft_token_to_kv_pool=draft_token_to_kv_pool,
-            req_to_metadata_buffer_idx_allocator=(
-                self.req_to_metadata_buffer_idx_allocator
-            ),
-            metadata_buffers=self.disagg_metadata_buffers,
-            scheduler=self,
-            transfer_queue=self.disagg_decode_transfer_queue,
-            tree_cache=self.tree_cache,
-            gloo_group=self.attn_tp_cpu_group,
-            tp_rank=self.ps.tp_rank,
-            tp_size=self.ps.tp_size,
-            dp_size=self.server_args.dp_size,
-            gpu_id=self.ps.gpu_id,
-            bootstrap_port=self.server_args.disaggregation_bootstrap_port,
-            max_total_num_tokens=self.max_total_num_tokens,
-            pp_rank=self.ps.pp_rank,
-            num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
-            transfer_backend=self.transfer_backend,
-            # Aggregated workers have a normal prefix cache. Match it during
-            # receive preallocation so imported KV never duplicates a prefix
-            # that admission later marks as protected.
-            enable_radix_cache=True,
-        )
-
     def _get_decode_migration_kv_manager(self: "Scheduler") -> "BaseKVManager":
-        if self._decode_migration_kv_manager is not None:
-            return self._decode_migration_kv_manager
-
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            manager = self.disagg_prefill_bootstrap_queue.kv_manager
-            self._decode_migration_kv_manager = manager
-            return manager
-
-        if not self.server_args.enable_decode_migration:
-            raise RuntimeError("Decode migration is not enabled")
-
-        token_to_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
-        transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
-        )
-        kv_args_class = get_kv_class(transfer_backend, KVClassType.KVARGS)
-        kv_args = kv_args_class()
-        kv_args.engine_rank = self.ps.tp_rank
-        kv_args.pp_rank = self.ps.pp_rank
-        kv_args.system_dp_rank = self.ps.dp_rank
-        kv_args.prefill_start_layer = token_to_kv_pool.start_layer
-        kv_args.prefill_end_layer = getattr(token_to_kv_pool, "end_layer", None)
-        kv_args.mla_compression_ratios = None
-
-        (
-            kv_args.kv_data_ptrs,
-            kv_args.kv_data_lens,
-            kv_args.kv_item_lens,
-        ) = token_to_kv_pool.get_contiguous_buf_infos()
-        if not is_mla_backend(token_to_kv_pool):
-            kv_args.kv_head_num = token_to_kv_pool.head_num
-            kv_args.total_kv_head_num = self.model_config.get_total_num_kv_heads()
-        kv_args.page_size = token_to_kv_pool.page_size
-        (
-            kv_args.aux_data_ptrs,
-            kv_args.aux_data_lens,
-            kv_args.aux_item_lens,
-        ) = self.disagg_metadata_buffers.get_buf_infos()
-        kv_args.ib_device = self.server_args.disaggregation_ib_device
-        kv_args.gpu_id = self.ps.gpu_id
-        setup_state_kv_args(
-            kv_args,
-            token_to_kv_pool,
-            total_kv_layers=self.model_config.num_hidden_layers,
-            req_to_token_pool=self.req_to_token_pool,
-        )
-
-        manager_class = get_kv_class(transfer_backend, KVClassType.MANAGER)
-        manager = manager_class(
-            kv_args,
-            DisaggregationMode.PREFILL,
-            self.server_args,
-            is_mla_backend(token_to_kv_pool),
-        )
-        if (
-            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-            and hasattr(manager, "set_kv_buffer_tensors")
-            and not is_mla_backend(token_to_kv_pool)
-        ):
-            kv_pool = token_to_kv_pool
-            if hasattr(kv_pool, "full_kv_pool"):
-                kv_pool = kv_pool.full_kv_pool
-            if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
-                manager.set_kv_buffer_tensors(
-                    kv_pool.k_buffer, kv_pool.v_buffer, kv_pool.page_size
+        if self._decode_migration_kv_manager is None:
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self._decode_migration_kv_manager = (
+                    self.disagg_prefill_bootstrap_queue.kv_manager
                 )
-
-        self._decode_migration_kv_manager = manager
-        return manager
+            else:
+                self._decode_migration_kv_manager = create_prefill_kv_manager(
+                    token_to_kv_pool=(self.token_to_kv_pool_allocator.get_kvcache()),
+                    draft_token_to_kv_pool=None,
+                    metadata_buffers=self.disagg_metadata_buffers,
+                    transfer_backend=self.transfer_backend,
+                    scheduler=self,
+                    tp_rank=self.ps.tp_rank,
+                    pp_rank=self.ps.pp_rank,
+                )
+        return self._decode_migration_kv_manager
 
     def process_decode_migration_receives(self: "Scheduler") -> None:
         """Advance destination handshakes on non-PD-decode workers."""
@@ -286,18 +163,27 @@ class SchedulerDecodeMigrationMixin:
         self.running_batch.batch_is_full = False
 
     def abort_decode_migration_receive(self: "Scheduler", recv_req) -> None:
-        """Abort destination handshakes when the scheduler is not in decode mode."""
-        if (
-            not self.server_args.enable_decode_migration
-            or self.disaggregation_mode == DisaggregationMode.DECODE
-        ):
+        """Abort matching destination handshakes and parked source requests."""
+        if not self.server_args.enable_decode_migration:
             return
-        for decode_req in self.disagg_decode_prealloc_queue.queue:
-            if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                decode_req.kv_receiver.abort()
-        for decode_req in self.disagg_decode_transfer_queue.queue:
-            if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                decode_req.kv_receiver.abort()
+        if self.disaggregation_mode != DisaggregationMode.DECODE:
+            for decode_req in self.disagg_decode_prealloc_queue.queue:
+                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                    decode_req.kv_receiver.abort()
+            for decode_req in self.disagg_decode_transfer_queue.queue:
+                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                    decode_req.kv_receiver.abort()
+
+        for migration_id, record in list(self.decode_migration_transfers.items()):
+            if recv_req.abort_all or record.req.rid.startswith(recv_req.rid):
+                self._release_decode_migration_source(record)
+                self._release_decode_migration_transport(record)
+                self.decode_migration_transfers.pop(migration_id, None)
+                self.decode_migration_by_rid.pop(record.req.rid, None)
+
+        for migration_id, arm in list(self.decode_migration_arms.items()):
+            if recv_req.abort_all or arm.rid.startswith(recv_req.rid):
+                self._clear_decode_migration_arm(migration_id, arm.rid)
 
     def _find_decode_migration_req(self: "Scheduler", rid: str) -> Optional[Req]:
         for req in self.running_batch.reqs:
@@ -306,35 +192,118 @@ class SchedulerDecodeMigrationMixin:
         logger.debug("Decode migration request lookup missed rid=%s", rid)
         return None
 
+    @staticmethod
+    def _prepare_failure(
+        recv_req: PrepareDecodeMigrationReqInput,
+        status: str,
+        error: Optional[str] = None,
+        **state,
+    ) -> PrepareDecodeMigrationReqOutput:
+        return PrepareDecodeMigrationReqOutput(
+            rid=recv_req.rid,
+            migration_id=recv_req.migration_id,
+            success=False,
+            status=status,
+            error=error,
+            **state,
+        )
+
+    def _resolve_decode_migration_overlap_result(self: "Scheduler") -> None:
+        """Resolve the outstanding overlap result once before request parking."""
+        if not self.enable_overlap or not self.result_queue:
+            return
+        if len(self.result_queue) != 1:
+            raise RuntimeError(
+                f"Expected at most one outstanding overlap result, got "
+                f"{len(self.result_queue)}"
+            )
+        batch, result = self.result_queue.popleft()
+        self.process_batch_result(batch, result)
+        self._decode_migration_overlap_result_processed = True
+
+    @staticmethod
+    def _filter_req_from_batch(batch: Optional[ScheduleBatch], req: Req) -> bool:
+        if batch is None or all(candidate is not req for candidate in batch.reqs):
+            return False
+        keep_indices = [
+            i for i, candidate in enumerate(batch.reqs) if candidate is not req
+        ]
+        batch.filter_batch(keep_indices=keep_indices)
+        if batch.decoding_reqs is not None:
+            batch.decoding_reqs = [
+                candidate for candidate in batch.decoding_reqs if candidate is not req
+            ]
+        batch.batch_is_full = False
+        return True
+
+    def _park_decode_migration_req(self: "Scheduler", req: Req) -> None:
+        req.is_decode_migration_source_parked = True
+        removed = self._filter_req_from_batch(self.running_batch, req)
+        if self.last_batch is not self.running_batch:
+            self._filter_req_from_batch(self.last_batch, req)
+        if (
+            self.cur_batch is not None
+            and self.cur_batch is not self.running_batch
+            and self.cur_batch is not self.last_batch
+        ):
+            self._filter_req_from_batch(self.cur_batch, req)
+        if not removed:
+            raise RuntimeError("Request left the running decode batch before migration")
+
+    def _clear_decode_migration_arm(
+        self: "Scheduler", migration_id: str, rid: str
+    ) -> None:
+        self.decode_migration_arms.pop(migration_id, None)
+        if self.decode_migration_arm_by_rid.get(rid) == migration_id:
+            self.decode_migration_arm_by_rid.pop(rid, None)
+
+    def maybe_park_decode_migration_at_boundary(self: "Scheduler", req: Req) -> bool:
+        migration_id = self.decode_migration_arm_by_rid.get(req.rid)
+        if migration_id is None:
+            return False
+        arm = self.decode_migration_arms.get(migration_id)
+        if arm is None:
+            self.decode_migration_arm_by_rid.pop(req.rid, None)
+            return False
+        if req.finished() or req.to_finish is not None:
+            self._clear_decode_migration_arm(migration_id, req.rid)
+            return False
+        target = arm.target_sequence_length
+        logical_len = len(req.origin_input_ids) + len(req.output_ids)
+        if target is None or logical_len < target:
+            return False
+
+        self._clear_decode_migration_arm(migration_id, req.rid)
+        output = self._prepare_decode_migration_now(arm, req=req, resolve_overlap=False)
+        if not output.success:
+            logger.error(
+                "Failed to park armed decode migration rid=%s migration_id=%s "
+                "status=%s error=%s",
+                req.rid,
+                migration_id,
+                output.status,
+                output.error,
+            )
+            return False
+        return True
+
+    def _release_decode_migration_source(
+        self: "Scheduler", record: DecodeMigrationTransfer
+    ) -> None:
+        if record.source_released:
+            return
+        if record.req.req_pool_idx is not None:
+            release_kv_cache(record.req, self.tree_cache, is_insert=False)
+        record.source_released = True
+
     def prepare_decode_migration(
         self: "Scheduler", recv_req: PrepareDecodeMigrationReqInput
     ) -> PrepareDecodeMigrationReqOutput:
-        if self.enable_overlap:
-            return PrepareDecodeMigrationReqOutput(
-                rid=recv_req.rid,
-                migration_id=recv_req.migration_id,
-                success=False,
-                status="error",
-                error=(
-                    "Decode migration prototype requires "
-                    "--disable-overlap-schedule for an exact quiescence frontier"
-                ),
-            )
         if not self.server_args.enable_decode_migration:
-            return PrepareDecodeMigrationReqOutput(
-                rid=recv_req.rid,
-                migration_id=recv_req.migration_id,
-                success=False,
-                status="error",
-                error="Decode migration requires --enable-decode-migration",
-            )
-        if self._engine_paused and not self.decode_migration_transfers:
-            return PrepareDecodeMigrationReqOutput(
-                rid=recv_req.rid,
-                migration_id=recv_req.migration_id,
-                success=False,
-                status="busy",
-                error="The engine is paused by another control operation",
+            return self._prepare_failure(
+                recv_req,
+                "error",
+                "Decode migration requires --enable-decode-migration",
             )
 
         existing = self.decode_migration_by_rid.get(recv_req.rid)
@@ -342,42 +311,96 @@ class SchedulerDecodeMigrationMixin:
             record = self.decode_migration_transfers.get(existing)
             if existing == recv_req.migration_id and record is not None:
                 return self._prepared_output(recv_req, record)
-            return PrepareDecodeMigrationReqOutput(
-                rid=recv_req.rid,
-                migration_id=recv_req.migration_id,
-                success=False,
-                status="busy",
-                error=f"Request already has active migration {existing}",
-            )
-        if self.decode_migration_transfers:
-            return PrepareDecodeMigrationReqOutput(
-                rid=recv_req.rid,
-                migration_id=recv_req.migration_id,
-                success=False,
-                status="busy",
-                error="The coarse-pause prototype supports one migration at a time",
+            return self._prepare_failure(
+                recv_req, "busy", f"Request already has active migration {existing}"
             )
 
-        # The control message is processed between scheduler iterations. Pausing
-        # here leaves the live request and all KV allocations untouched.
-        self._engine_paused = True
+        armed = self.decode_migration_arm_by_rid.get(recv_req.rid)
+        if armed is not None and armed != recv_req.migration_id:
+            return self._prepare_failure(
+                recv_req, "busy", f"Request already has armed migration {armed}"
+            )
+
         req = self._find_decode_migration_req(recv_req.rid)
-        if req is None:
-            self._engine_paused = False
+        target = recv_req.target_sequence_length
+        logical_len = (
+            len(req.origin_input_ids) + len(req.output_ids) if req is not None else 0
+        )
+        if target is not None and target > logical_len:
+            if target <= 0:
+                return self._prepare_failure(
+                    recv_req, "error", "target_sequence_length must be positive"
+                )
+            self.decode_migration_arms[recv_req.migration_id] = recv_req
+            self.decode_migration_arm_by_rid[recv_req.rid] = recv_req.migration_id
+            logger.info(
+                "Armed decode migration rid=%s migration_id=%s target=%d current=%d",
+                recv_req.rid,
+                recv_req.migration_id,
+                target,
+                logical_len,
+            )
             return PrepareDecodeMigrationReqOutput(
                 rid=recv_req.rid,
                 migration_id=recv_req.migration_id,
-                success=False,
-                status="not_found",
-                error="Request is not in the running decode batch",
+                success=True,
+                status="armed",
+                bootstrap_host=recv_req.bootstrap_host,
+                bootstrap_port=recv_req.bootstrap_port,
+                bootstrap_room=recv_req.bootstrap_room,
+                logical_len=logical_len,
+                output_tokens_seen=recv_req.output_tokens_seen,
+                source_dp_rank=self.ps.dp_rank or 0,
+            )
+
+        if armed == recv_req.migration_id:
+            arm = self.decode_migration_arms[armed]
+            return PrepareDecodeMigrationReqOutput(
+                rid=recv_req.rid,
+                migration_id=recv_req.migration_id,
+                success=True,
+                status="armed",
+                bootstrap_host=arm.bootstrap_host,
+                bootstrap_port=arm.bootstrap_port,
+                bootstrap_room=arm.bootstrap_room,
+                logical_len=logical_len,
+                output_tokens_seen=arm.output_tokens_seen,
+                source_dp_rank=self.ps.dp_rank or 0,
+            )
+
+        return self._prepare_decode_migration_now(recv_req, req=req)
+
+    def _prepare_decode_migration_now(
+        self: "Scheduler",
+        recv_req: PrepareDecodeMigrationReqInput,
+        *,
+        req: Optional[Req] = None,
+        resolve_overlap: bool = True,
+    ) -> PrepareDecodeMigrationReqOutput:
+
+        if resolve_overlap:
+            try:
+                self._resolve_decode_migration_overlap_result()
+            except Exception as exc:
+                logger.exception(
+                    "Failed to resolve overlap result for rid=%s migration_id=%s",
+                    recv_req.rid,
+                    recv_req.migration_id,
+                )
+                return self._prepare_failure(
+                    recv_req, "error", f"Failed to resolve source frontier: {exc}"
+                )
+
+        if req is None:
+            req = self._find_decode_migration_req(recv_req.rid)
+        if req is None:
+            return self._prepare_failure(
+                recv_req, "not_found", "Request is not in the running decode batch"
             )
         if req.finished() or req.to_finish is not None:
-            self._engine_paused = False
-            return PrepareDecodeMigrationReqOutput(
-                rid=recv_req.rid,
-                migration_id=recv_req.migration_id,
-                success=False,
-                status="finished",
+            return self._prepare_failure(
+                recv_req,
+                "finished",
                 prompt_len=len(req.origin_input_ids),
                 logical_len=len(req.origin_input_ids) + len(req.output_ids),
                 output_tokens_seen=recv_req.output_tokens_seen,
@@ -386,6 +409,31 @@ class SchedulerDecodeMigrationMixin:
         prompt_ids = list(req.origin_input_ids)
         output_ids = list(req.output_ids)
         committed_len = req.kv_committed_len
+        actual_logical_len = len(prompt_ids) + len(output_ids)
+        target = recv_req.target_sequence_length
+        if target is not None:
+            if target <= len(prompt_ids):
+                return self._prepare_failure(
+                    recv_req,
+                    "error",
+                    "target_sequence_length must extend beyond the prompt",
+                    prompt_len=len(prompt_ids),
+                    committed_len=committed_len,
+                    logical_len=actual_logical_len,
+                    output_tokens_seen=recv_req.output_tokens_seen,
+                )
+            if target > actual_logical_len or target - 1 > committed_len:
+                return self._prepare_failure(
+                    recv_req,
+                    "error",
+                    "Source has not reached the requested migration frontier",
+                    prompt_len=len(prompt_ids),
+                    committed_len=committed_len,
+                    logical_len=actual_logical_len,
+                    output_tokens_seen=recv_req.output_tokens_seen,
+                )
+            output_ids = output_ids[: target - len(prompt_ids)]
+            committed_len = target - 1
         try:
             frontier = build_decode_migration_frontier(
                 prompt_ids,
@@ -394,39 +442,28 @@ class SchedulerDecodeMigrationMixin:
                 recv_req.output_tokens_seen,
             )
         except ValueError as exc:
-            self._engine_paused = False
-            return PrepareDecodeMigrationReqOutput(
-                rid=recv_req.rid,
-                migration_id=recv_req.migration_id,
-                success=False,
-                status="error",
+            return self._prepare_failure(
+                recv_req,
+                "error",
+                str(exc),
                 prompt_len=len(prompt_ids),
                 committed_len=committed_len,
                 logical_len=len(prompt_ids) + len(output_ids),
                 output_tokens_seen=recv_req.output_tokens_seen,
-                error=str(exc),
             )
 
         if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
-            self._engine_paused = False
-            return PrepareDecodeMigrationReqOutput(
-                rid=recv_req.rid,
-                migration_id=recv_req.migration_id,
-                success=False,
-                status="error",
-                error="No metadata buffer is available for migration",
+            return self._prepare_failure(
+                recv_req, "error", "No metadata buffer is available for migration"
             )
-
         room = recv_req.bootstrap_room
         if room <= 0:
-            self._engine_paused = False
-            return PrepareDecodeMigrationReqOutput(
-                rid=recv_req.rid,
-                migration_id=recv_req.migration_id,
-                success=False,
-                status="error",
-                error="bootstrap_room must be an opaque positive integer",
+            return self._prepare_failure(
+                recv_req,
+                "error",
+                "bootstrap_room must be an opaque positive integer",
             )
+
         metadata_index = -1
         sender = None
         try:
@@ -434,14 +471,11 @@ class SchedulerDecodeMigrationMixin:
             sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
             sender = sender_class(
                 mgr=manager,
-                bootstrap_addr=(
-                    f"{recv_req.bootstrap_host}:{recv_req.bootstrap_port}"
-                ),
+                bootstrap_addr=f"{recv_req.bootstrap_host}:{recv_req.bootstrap_port}",
                 bootstrap_room=room,
                 dest_tp_ranks=[self.ps.tp_rank],
                 pp_rank=self.ps.pp_rank,
             )
-
             allocated_index = self.req_to_metadata_buffer_idx_allocator.alloc()
             assert allocated_index is not None
             metadata_index = allocated_index
@@ -450,23 +484,21 @@ class SchedulerDecodeMigrationMixin:
             )
             self.disagg_metadata_buffers.cached_tokens[metadata_index].zero_()
             self.disagg_metadata_buffers.bootstrap_room[metadata_index][0] = room
+            self._park_decode_migration_req(req)
         except Exception as exc:
             if sender is not None:
                 sender.clear()
             if metadata_index >= 0:
                 self.req_to_metadata_buffer_idx_allocator.free(metadata_index)
-            self._engine_paused = False
+            if all(candidate is not req for candidate in self.running_batch.reqs):
+                release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.exception(
                 "Failed to prepare decode migration rid=%s migration_id=%s",
                 recv_req.rid,
                 recv_req.migration_id,
             )
-            return PrepareDecodeMigrationReqOutput(
-                rid=recv_req.rid,
-                migration_id=recv_req.migration_id,
-                success=False,
-                status="error",
-                error=f"Failed to create migration transfer: {exc}",
+            return self._prepare_failure(
+                recv_req, "error", f"Failed to create migration transfer: {exc}"
             )
 
         record = DecodeMigrationTransfer(
@@ -476,6 +508,8 @@ class SchedulerDecodeMigrationMixin:
             metadata_buffer_index=metadata_index,
             bootstrap_room=room,
             committed_len=committed_len,
+            logical_len=frontier.logical_len,
+            output_tokens_seen=frontier.output_tokens_seen,
             pending_input_ids=frontier.pending_input_ids,
             created_at=time.monotonic(),
             transfer_end=committed_len,
@@ -485,11 +519,12 @@ class SchedulerDecodeMigrationMixin:
 
         logger.info(
             "Prepared decode migration rid=%s migration_id=%s committed=%d "
-            "logical=%d seen=%d room=%d",
+            "logical=%d actual_logical=%d seen=%d room=%d",
             recv_req.rid,
             recv_req.migration_id,
             committed_len,
             frontier.logical_len,
+            actual_logical_len,
             frontier.output_tokens_seen,
             room,
         )
@@ -519,11 +554,14 @@ class SchedulerDecodeMigrationMixin:
         record: DecodeMigrationTransfer,
     ) -> PrepareDecodeMigrationReqOutput:
         req = record.req
-        logical_ids = list(req.origin_input_ids) + list(req.output_ids)
+        logical_ids = (list(req.origin_input_ids) + list(req.output_ids))[
+            : record.logical_len
+        ]
         committed_input_ids = logical_ids[: record.committed_len]
         prompt_len = len(req.origin_input_ids)
         committed_output_count = max(0, record.committed_len - prompt_len)
-        seen = min(max(0, recv_req.output_tokens_seen), len(req.output_ids))
+        output_ids = logical_ids[prompt_len:]
+        seen = record.output_tokens_seen
         return PrepareDecodeMigrationReqOutput(
             rid=recv_req.rid,
             migration_id=recv_req.migration_id,
@@ -534,12 +572,12 @@ class SchedulerDecodeMigrationMixin:
             bootstrap_room=record.bootstrap_room,
             committed_input_ids=committed_input_ids,
             pending_input_ids=record.pending_input_ids,
-            unforwarded_committed_output_ids=list(req.output_ids)[
+            unforwarded_committed_output_ids=output_ids[
                 min(seen, committed_output_count) : committed_output_count
             ],
             prompt_len=prompt_len,
             committed_len=record.committed_len,
-            logical_len=len(logical_ids),
+            logical_len=record.logical_len,
             output_tokens_seen=seen,
             source_dp_rank=self.ps.dp_rank or 0,
         )
@@ -630,9 +668,7 @@ class SchedulerDecodeMigrationMixin:
             self.disagg_metadata_buffers.bootstrap_room[
                 record.metadata_buffer_index
             ].zero_()
-            self.req_to_metadata_buffer_idx_allocator.free(
-                record.metadata_buffer_index
-            )
+            self.req_to_metadata_buffer_idx_allocator.free(record.metadata_buffer_index)
             record.metadata_buffer_index = -1
 
     def _fail_decode_migration(
@@ -647,13 +683,31 @@ class SchedulerDecodeMigrationMixin:
         record.status = "failed"
         record.error = error
         self._release_decode_migration_transport(record)
-        # Before commit, the source remains authoritative and can resume safely.
-        self._engine_paused = False
+        self._release_decode_migration_source(record)
 
     def finalize_decode_migration(
         self: "Scheduler", recv_req: FinalizeDecodeMigrationReqInput
     ) -> FinalizeDecodeMigrationReqOutput:
         record = self.decode_migration_transfers.get(recv_req.migration_id)
+        armed = self.decode_migration_arms.get(recv_req.migration_id)
+        if record is None and armed is not None and armed.rid == recv_req.rid:
+            if recv_req.action == "cancel":
+                self._clear_decode_migration_arm(recv_req.migration_id, recv_req.rid)
+                return FinalizeDecodeMigrationReqOutput(
+                    rid=recv_req.rid,
+                    migration_id=recv_req.migration_id,
+                    action=recv_req.action,
+                    success=True,
+                    transfer_status="unknown",
+                )
+            return FinalizeDecodeMigrationReqOutput(
+                rid=recv_req.rid,
+                migration_id=recv_req.migration_id,
+                action=recv_req.action,
+                success=False,
+                transfer_status="unknown",
+                error="Migration source is armed but not yet parked",
+            )
         if record is None or record.req.rid != recv_req.rid:
             return FinalizeDecodeMigrationReqOutput(
                 rid=recv_req.rid,
@@ -674,19 +728,20 @@ class SchedulerDecodeMigrationMixin:
                 transfer_status=status,
                 error="Destination cannot commit before source transfer completes",
             )
+        if recv_req.action == "resume":
+            return FinalizeDecodeMigrationReqOutput(
+                rid=recv_req.rid,
+                migration_id=recv_req.migration_id,
+                action=recv_req.action,
+                success=False,
+                transfer_status=status,
+                error="Source resumption is unsupported after request quiescence",
+            )
 
         self._release_decode_migration_transport(record)
+        self._release_decode_migration_source(record)
         self.decode_migration_transfers.pop(recv_req.migration_id, None)
         self.decode_migration_by_rid.pop(recv_req.rid, None)
-
-        if recv_req.action == "resume":
-            self._engine_paused = False
-        else:
-            # Reuse the normal scheduler finish path so all request/KV/cache
-            # accounting remains centralized. The source stream is no longer
-            # forwarded after commit, so its cancellation chunk is internal.
-            record.req.to_finish = FINISH_ABORT()
-            self._engine_paused = False
 
         logger.info(
             "Finalized decode migration rid=%s migration_id=%s action=%s status=%s",

@@ -54,6 +54,7 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    get_decode_migration_reqs: Callable
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -176,22 +177,27 @@ class SchedulerInvariantChecker:
 
         full_uncached = 0
         swa_uncached = 0
-        for batch in batches:
-            for req in batch.reqs:
-                assert req.kv_committed_freed == req.kv_overallocated_freed
-                if req.kv_committed_freed or req.req_pool_idx is None:
-                    continue
+        requests = [req for batch in batches for req in batch.reqs]
+        requests.extend(self.get_decode_migration_reqs())
+        seen = set()
+        for req in requests:
+            if id(req) in seen:
+                continue
+            seen.add(id(req))
+            assert req.kv_committed_freed == req.kv_overallocated_freed
+            if req.kv_committed_freed or req.req_pool_idx is None:
+                continue
 
-                allocated_len = req.kv_allocated_len
-                if self.page_size > 1:
-                    allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.cache_protected_len % self.page_size == 0
+            allocated_len = req.kv_allocated_len
+            if self.page_size > 1:
+                allocated_len = ceil_align(allocated_len, self.page_size)
+                assert req.cache_protected_len % self.page_size == 0
 
-                full_uncached += allocated_len - req.cache_protected_len
-                if self.is_hybrid_swa:
-                    swa_uncached += allocated_len - max(
-                        req.cache_protected_len, req.swa_evicted_seqlen
-                    )
+            full_uncached += allocated_len - req.cache_protected_len
+            if self.is_hybrid_swa:
+                swa_uncached += allocated_len - max(
+                    req.cache_protected_len, req.swa_evicted_seqlen
+                )
 
         return full_uncached, swa_uncached
 
