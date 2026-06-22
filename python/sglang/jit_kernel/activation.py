@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch.nn.functional as F
 
 from sglang.jit_kernel.utils import (
     cache_once,
@@ -80,6 +81,26 @@ def _run_activation_filtered_inplace(
     module.run_activation_filtered(input_2d, out_2d, expert_ids, expert_step, op_name)
 
 
+def _run_activation_native(
+    op_name: str, input: torch.Tensor, out: torch.Tensor
+) -> None:
+    hidden_size = input.shape[-1] // 2
+    gate = input[..., :hidden_size].float()
+    up = input[..., hidden_size:]
+    if op_name == "silu":
+        activated = F.silu(gate)
+    elif op_name == "gelu":
+        activated = F.gelu(gate, approximate="none")
+    else:
+        activated = F.gelu(gate, approximate="tanh")
+    out.copy_(activated.to(dtype=input.dtype) * up)
+
+
+def _supports_vectorized_activation(input: torch.Tensor, hidden_size: int) -> bool:
+    vector_bytes = 32 if get_jit_cuda_arch().major >= 10 else 16
+    return hidden_size % (vector_bytes // input.element_size()) == 0
+
+
 def run_activation(
     op_name: str,
     input: torch.Tensor,
@@ -98,6 +119,10 @@ def run_activation(
     hidden_size = input.shape[-1] // 2
     if out is None:
         out = input.new_empty(*input.shape[:-1], hidden_size)
+    if expert_ids is None and not _supports_vectorized_activation(input, hidden_size):
+        _run_activation_native(op_name, input, out)
+        return out
+
     if expert_ids is None:
         _run_activation_inplace(op_name, input, out)
     else:
