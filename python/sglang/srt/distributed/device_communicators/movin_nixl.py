@@ -1,5 +1,4 @@
 import logging
-import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -7,14 +6,6 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    if value not in ("0", "1"):
-        raise ValueError(f"{name} must be 0 or 1, got {value!r}")
-    return value == "1"
 
 
 @dataclass(frozen=True)
@@ -29,7 +20,9 @@ class MovinCollectiveConfig:
 
     @classmethod
     def from_env(cls) -> "MovinCollectiveConfig":
-        backend = os.environ.get("SGLANG_TP_ALL_REDUCE_BACKEND") or None
+        from sglang.srt.environ import envs
+
+        backend = envs.SGLANG_TP_ALL_REDUCE_BACKEND.get() or None
         if backend not in (None, "flashinfer", "movin_nixl"):
             raise ValueError(
                 "SGLANG_TP_ALL_REDUCE_BACKEND must be flashinfer or movin_nixl "
@@ -37,21 +30,14 @@ class MovinCollectiveConfig:
             )
         config = cls(
             all_reduce_backend=backend,
-            enable_all_gather=_env_flag("SGLANG_MOVIN_NIXL_ENABLE_ALLGATHER"),
-            all_reduce_max_elems=int(
-                os.environ.get("SGLANG_MOVIN_NIXL_MAX_ELEMS", "65536")
+            enable_all_gather=envs.SGLANG_MOVIN_NIXL_ENABLE_ALLGATHER.get(),
+            all_reduce_max_elems=envs.SGLANG_MOVIN_NIXL_MAX_ELEMS.get(),
+            all_gather_max_elems=envs.SGLANG_MOVIN_NIXL_ALLGATHER_MAX_ELEMS.get(),
+            checkpointable=envs.SGLANG_CRIU_SUSPEND_DEVICE_PROCESS_GROUP.get(),
+            force_nixl_after_restore=(
+                envs.SGLANG_MOVIN_FORCE_NIXL_ALLREDUCE_AFTER_RESTORE.get()
             ),
-            all_gather_max_elems=int(
-                os.environ.get(
-                    "SGLANG_MOVIN_NIXL_ALLGATHER_MAX_ELEMS",
-                    "262144",
-                )
-            ),
-            checkpointable=_env_flag("SGLANG_CRIU_SUSPEND_DEVICE_PROCESS_GROUP"),
-            force_nixl_after_restore=_env_flag(
-                "SGLANG_MOVIN_FORCE_NIXL_ALLREDUCE_AFTER_RESTORE"
-            ),
-            restore_probe=_env_flag("SGLANG_MOVIN_RESTORE_PROBE"),
+            restore_probe=envs.SGLANG_MOVIN_RESTORE_PROBE.get(),
         )
         if config.all_reduce_max_elems <= 0:
             raise ValueError("SGLANG_MOVIN_NIXL_MAX_ELEMS must be positive")
@@ -70,6 +56,12 @@ def create_movin_collectives(
     if group_name not in ("tp", "attention_tp"):
         return None
     config = config or MovinCollectiveConfig.from_env()
+    if (
+        config.all_reduce_backend is None
+        and not config.enable_all_gather
+        and not config.checkpointable
+    ):
+        return None
 
     from movin import (
         CollectiveManager,
@@ -105,7 +97,15 @@ def create_movin_collectives(
             restore_probe=config.restore_probe,
         )
 
-    if all_reduce is None and all_gather is None:
+    participants = {}
+    if config.checkpointable:
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            get_flashinfer_checkpoint_participants,
+        )
+
+        participants = get_flashinfer_checkpoint_participants(group_name)
+
+    if all_reduce is None and all_gather is None and not participants:
         return None
     logger.info(
         "Movin collectives enabled for %s: all_reduce=%s all_gather=%s",
@@ -113,4 +113,8 @@ def create_movin_collectives(
         type(all_reduce).__name__ if all_reduce is not None else "disabled",
         type(all_gather).__name__ if all_gather is not None else "disabled",
     )
-    return CollectiveManager(all_reduce=all_reduce, all_gather=all_gather)
+    return CollectiveManager(
+        all_reduce=all_reduce,
+        all_gather=all_gather,
+        participants=participants,
+    )

@@ -10,6 +10,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 
 _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
@@ -40,13 +41,11 @@ class PrefillDelayer:
         self,
         dp_size: int,
         attn_tp_size: int,
-        cpu_group,
+        tp_group: "GroupCoordinator",
         server_args,
         max_delay_passes: int,
         token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
-        device: Optional["torch.device"] = "cpu",
-        device_group=None,
     ):
         self._max_delay_passes = max_delay_passes
         self._token_usage_low_watermark = token_usage_low_watermark
@@ -79,14 +78,11 @@ class PrefillDelayer:
             or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
         )
         if use_nccl:
-            assert (
-                device_group is not None
-            ), "device_group is required when using NCCL for PrefillDelayer all-gather"
-            self._gather_group = device_group
-            self._gather_device = device
+            self._gather_device = tp_group.device
         else:
-            self._gather_group = cpu_group
             self._gather_device = "cpu"
+        self._tp_group = tp_group
+        self._gather_on_device = use_nccl
 
         # Fields packed per rank into the all-gather tensor: prefillable,
         # token_watermark_force_allow, running_batch, max_prefill_bs,
@@ -302,7 +298,11 @@ class PrefillDelayer:
         torch.distributed.all_gather_into_tensor(
             self._global_info_buffer.flatten(),
             local_info,
-            group=self._gather_group,
+            group=(
+                self._tp_group.device_group
+                if self._gather_on_device
+                else self._tp_group.cpu_group
+            ),
         )
         tp0_info = self._global_info_buffer[:, 0, :]
         return tp0_info

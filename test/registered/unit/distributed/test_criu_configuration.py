@@ -1,9 +1,22 @@
+import importlib.util
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from sglang.srt.distributed.criu_process_groups import (
-    validate_checkpoint_configuration,
+MODULE_PATH = (
+    Path(__file__).parents[4]
+    / "python/sglang/srt/distributed/criu_process_groups.py"
+)
+SPEC = importlib.util.spec_from_file_location("sglang_criu_process_groups_test", MODULE_PATH)
+assert SPEC is not None and SPEC.loader is not None
+MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
+SPEC.loader.exec_module(MODULE)
+validate_checkpoint_configuration = MODULE.validate_checkpoint_configuration
+validate_checkpoint_collective_coverage = (
+    MODULE.validate_checkpoint_collective_coverage
 )
 
 
@@ -19,6 +32,7 @@ def make_server_args(**overrides):
         "disaggregation_mode": "null",
         "enable_hierarchical_cache": False,
         "hicache_storage_backend": None,
+        "enable_hisparse": False,
         "disable_radix_cache": True,
         "disable_custom_all_reduce": True,
         "enable_symm_mem": False,
@@ -44,6 +58,7 @@ def test_dense_tp_configuration_is_supported():
         ("moe_a2a_backend", "flashinfer", "MoE all-to-all"),
         ("disaggregation_mode", "decode", "PD disaggregation"),
         ("enable_hierarchical_cache", True, "hierarchical cache"),
+        ("enable_hisparse", True, "HiSparse"),
         ("disable_radix_cache", False, "radix cache"),
         ("disable_custom_all_reduce", False, "custom all-reduce"),
     ],
@@ -70,3 +85,37 @@ def test_moe_models_are_rejected(hf_values):
             make_server_args(),
             make_model_config(**hf_values),
         )
+
+
+@pytest.mark.parametrize(
+    "manager",
+    [
+        None,
+        SimpleNamespace(has_all_reduce=True, has_all_gather=False),
+        SimpleNamespace(has_all_reduce=False, has_all_gather=True),
+    ],
+)
+def test_checkpoint_requires_complete_tp_collective_coverage(manager):
+    group = SimpleNamespace(
+        group_name="tp",
+        world_size=2,
+        unique_name="tp:0",
+        movin_collectives=manager,
+    )
+
+    with pytest.raises(RuntimeError, match="missing checkpointable coverage"):
+        validate_checkpoint_collective_coverage([group])
+
+
+def test_checkpoint_accepts_complete_tp_collective_coverage():
+    group = SimpleNamespace(
+        group_name="tp",
+        world_size=2,
+        unique_name="tp:0",
+        movin_collectives=SimpleNamespace(
+            has_all_reduce=True,
+            has_all_gather=True,
+        ),
+    )
+
+    validate_checkpoint_collective_coverage([group])

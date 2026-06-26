@@ -36,7 +36,11 @@ class TorchDistributedCommBackend(CommBackend):
     def bcast(self, data, root: int = 0):
         obj_list = [data]
         # broadcast_object_list mutates obj_list in-place
-        dist.broadcast_object_list(obj_list, src=root, group=self._group)
+        dist.broadcast_object_list(
+            obj_list,
+            group=self._group,
+            group_src=root,
+        )
         return obj_list[0]
 
     def Split(self, color: int, key: int):

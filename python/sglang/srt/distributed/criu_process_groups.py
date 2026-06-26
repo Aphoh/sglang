@@ -5,10 +5,14 @@ import gc
 import time
 import weakref
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 
 @dataclass(frozen=True)
@@ -19,23 +23,68 @@ class SuspendedDeviceProcessGroup:
     store_path: str
 
 
+@dataclass(frozen=True)
+class CpuProcessGroupSpec:
+    """Immutable recipe used for initial CPU-group creation and renewal."""
+
+    group_ranks: tuple[tuple[int, ...], ...]
+    torch_distributed_backend: str | torch.distributed.Backend
+    gloo_timeout: timedelta
+    model_parallel_timeout: timedelta | None
+    recovered_rank: bool
+
+    def create_group(
+        self,
+        ranks: tuple[int, ...] | list[int],
+    ) -> tuple[torch.distributed.ProcessGroup, torch.Tensor]:
+        active_ranks = torch.ones(len(ranks), dtype=torch.int32)
+        if "mooncake" in str(self.torch_distributed_backend):
+            from mooncake.ep import MooncakeBackendOptions
+
+            group = torch.distributed.new_group(
+                list(ranks),
+                backend="mooncake-cpu",
+                pg_options=MooncakeBackendOptions(
+                    active_ranks,
+                    self.recovered_rank,
+                ),
+                timeout=self.model_parallel_timeout,
+            )
+        else:
+            group = torch.distributed.new_group(
+                list(ranks),
+                backend="gloo",
+                timeout=self.gloo_timeout,
+            )
+        return group, active_ranks
+
+    def create_for_rank(
+        self,
+        rank: int,
+    ) -> tuple[torch.distributed.ProcessGroup, torch.Tensor]:
+        active_group = None
+        active_ranks = None
+        for ranks in self.group_ranks:
+            group, group_active_ranks = self.create_group(ranks)
+            if rank in ranks:
+                active_group = group
+                active_ranks = group_active_ranks
+        if active_group is None or active_ranks is None:
+            raise RuntimeError(f"Rank {rank} has no configured CPU subgroup")
+        return active_group, active_ranks
+
+
+@dataclass
+class GroupCheckpointState:
+    owns_device_group: bool = False
+    device_group_is_cpu_alias: bool = False
+    device_group_suspended: bool = False
+    cpu_group_suspended: bool = False
+    cpu_group_generation: int = 0
+
+
 _suspended_device_group: SuspendedDeviceProcessGroup | None = None
 _device_group_generation = 0
-_registered_groups: weakref.WeakValueDictionary[str, Any] = (
-    weakref.WeakValueDictionary()
-)
-
-
-def register_group(group: Any) -> None:
-    _registered_groups[group.unique_name] = group
-
-
-def unregister_group(group: Any) -> None:
-    _registered_groups.pop(group.unique_name, None)
-
-
-def registered_groups() -> list[Any]:
-    return list(_registered_groups.values())
 
 
 def _model_uses_moe(model_config: Any) -> bool:
@@ -76,6 +125,7 @@ def validate_checkpoint_configuration(
             server_args.enable_hierarchical_cache
             or server_args.hicache_storage_backend is not None,
         ),
+        ("HiSparse", server_args.enable_hisparse),
         ("radix cache", not server_args.disable_radix_cache),
         ("custom all-reduce", not server_args.disable_custom_all_reduce),
         ("symmetric memory", server_args.enable_symm_mem),
@@ -91,8 +141,9 @@ def validate_checkpoint_configuration(
         )
 
 
-def validate_checkpoint_topology(groups: Iterable[Any]) -> None:
+def validate_checkpoint_topology(groups: Iterable[GroupCoordinator]) -> None:
     """Reject process groups that the dense-TP checkpoint path cannot renew."""
+    groups = tuple(groups)
     if not torch.distributed.is_initialized():
         raise RuntimeError("Default process group is not initialized")
     default_group = torch.distributed.group.WORLD
@@ -101,8 +152,8 @@ def validate_checkpoint_topology(groups: Iterable[Any]) -> None:
         device_group = group.device_group
         if (
             device_group is not None
-            and group._owns_device_group
-            and not group._device_group_is_cpu_alias
+            and group._checkpoint_state.owns_device_group
+            and not group._checkpoint_state.device_group_is_cpu_alias
             and device_group is not default_group
         ):
             unsupported.append(group.unique_name)
@@ -112,12 +163,33 @@ def validate_checkpoint_topology(groups: Iterable[Any]) -> None:
             f"CPU-only singleton groups; owned device subgroups are unsupported: "
             f"{unsupported}"
         )
+    validate_checkpoint_collective_coverage(groups)
     for group in groups:
         group.validate_checkpoint_lifecycle()
 
 
+def validate_checkpoint_collective_coverage(
+    groups: Iterable[GroupCoordinator],
+) -> None:
+    """Require graph-safe implementations for every TP collective operation."""
+    missing = []
+    for group in groups:
+        if group.group_name != "tp" or group.world_size <= 1:
+            continue
+        collectives = group.movin_collectives
+        if collectives is None or not collectives.has_all_reduce:
+            missing.append(f"{group.unique_name}: all-reduce")
+        if collectives is None or not collectives.has_all_gather:
+            missing.append(f"{group.unique_name}: all-gather")
+    if missing:
+        raise RuntimeError(
+            "CRIU checkpoint mode cannot use raw process-group collectives; "
+            f"missing checkpointable coverage: {missing}"
+        )
+
+
 def suspend_device_process_group(
-    groups: Iterable[Any],
+    groups: Iterable[GroupCoordinator],
     *,
     enabled: bool,
     store_base: str | None,
@@ -153,7 +225,7 @@ def suspend_device_process_group(
     for group in groups:
         if group.device_group is default_group:
             group.device_group = None
-            group._device_group_suspended = True
+            group._checkpoint_state.device_group_suspended = True
             rebound += 1
     if rebound == 0:
         raise RuntimeError("No SGLang groups borrow the default process group")
@@ -191,9 +263,9 @@ def wait_for_process_group_teardown(timeout: float = 120.0) -> None:
 
 
 def resume_device_process_group(
-    groups: Iterable[Any],
+    groups: Iterable[GroupCoordinator],
     *,
-    timeout,
+    timeout: timedelta | None,
     pg_options_factory: Callable[[], Any],
 ) -> None:
     global _suspended_device_group
@@ -215,17 +287,18 @@ def resume_device_process_group(
     default_group = torch.distributed.group.WORLD
     rebound = 0
     for group in groups:
-        if group._device_group_suspended:
+        if group._checkpoint_state.device_group_suspended:
             group.device_group = default_group
-            group._device_group_suspended = False
+            group._checkpoint_state.device_group_suspended = False
             rebound += 1
     if rebound == 0:
         raise RuntimeError("No SGLang groups were rebound to the new process group")
     _suspended_device_group = None
 
 
-def suspend_cpu_group(group: Any) -> None:
-    if group._cpu_group_suspended:
+def suspend_cpu_group(group: GroupCoordinator) -> None:
+    state = group._checkpoint_state
+    if state.cpu_group_suspended:
         return
     cpu_group = group.cpu_group
     if cpu_group is None:
@@ -234,7 +307,7 @@ def suspend_cpu_group(group: Any) -> None:
     if group.mq_broadcaster is not None:
         group.mq_broadcaster.close()
         group.mq_broadcaster = None
-    if group._device_group_is_cpu_alias:
+    if state.device_group_is_cpu_alias:
         group.device_group = None
     group.cpu_group = None
     group._set_communicator_cpu_group(None)
@@ -256,48 +329,25 @@ def suspend_cpu_group(group: Any) -> None:
             f"CPU group {group.unique_name} is still referenced after shutdown: "
             f"{referrer_types}"
         )
-    group._cpu_group_suspended = True
+    state.cpu_group_suspended = True
 
 
-def resume_cpu_group(group: Any, *, model_parallel_timeout) -> None:
-    if not group._cpu_group_suspended:
+def resume_cpu_group(group: GroupCoordinator) -> None:
+    state = group._checkpoint_state
+    if not state.cpu_group_suspended:
         return
-
-    active_cpu_group = None
-    for ranks in group._group_ranks:
-        active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
-        if "mooncake" in group._torch_distributed_backend:
-            from mooncake.ep import MooncakeBackendOptions
-
-            cpu_group = torch.distributed.new_group(
-                ranks,
-                backend="mooncake-cpu",
-                pg_options=MooncakeBackendOptions(
-                    active_ranks_cpu,
-                    group._recovered_rank,
-                ),
-                timeout=model_parallel_timeout,
-            )
-        else:
-            cpu_group = torch.distributed.new_group(
-                ranks,
-                backend="gloo",
-                timeout=group._gloo_timeout,
-            )
-        if group.rank in ranks:
-            active_cpu_group = cpu_group
-            group.active_ranks_cpu = active_ranks_cpu
-
-    if active_cpu_group is None:
-        raise RuntimeError(f"Rank {group.rank} has no subgroup in {group.unique_name}")
+    active_cpu_group, active_ranks_cpu = group._cpu_group_spec.create_for_rank(
+        group.rank
+    )
+    group.active_ranks_cpu = active_ranks_cpu
     group.cpu_group = active_cpu_group
-    if group._device_group_is_cpu_alias:
+    if state.device_group_is_cpu_alias:
         group.device_group = active_cpu_group
     group._set_communicator_cpu_group(active_cpu_group)
     if (
         group.use_message_queue_broadcaster
         and group.world_size > 1
-        and not group._recovered_rank
+        and not group._cpu_group_spec.recovered_rank
     ):
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
             MessageQueue,
@@ -308,5 +358,5 @@ def resume_cpu_group(group: Any, *, model_parallel_timeout) -> None:
             1 << 22,
             6,
         )
-    group._cpu_group_suspended = False
-    group._cpu_group_generation += 1
+    state.cpu_group_suspended = False
+    state.cpu_group_generation += 1

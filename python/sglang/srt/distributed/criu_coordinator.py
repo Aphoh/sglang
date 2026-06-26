@@ -47,11 +47,15 @@ class CriuCheckpointCoordinator:
         self._checkpoint_rpc_generation = 0
         self._checkpoint_generation = 0
         if envs.SGLANG_CRIU_SUSPEND_DEVICE_PROCESS_GROUP.get():
+            if not envs.SGLANG_CRIU_DEVICE_STORE.get():
+                raise RuntimeError(
+                    "SGLANG_CRIU_DEVICE_STORE is required in CRIU checkpoint mode"
+                )
             from sglang.srt.distributed.criu_process_groups import (
-                registered_groups,
                 validate_checkpoint_configuration,
                 validate_checkpoint_topology,
             )
+            from sglang.srt.distributed.parallel_state import registered_groups
 
             validate_checkpoint_configuration(server_args, model_config)
             validate_checkpoint_topology(registered_groups())
@@ -78,12 +82,12 @@ class CriuCheckpointCoordinator:
 
     def prepare(self) -> None:
         from sglang.srt.distributed.parallel_state import (
+            registered_groups,
             suspend_cpu_process_groups,
             suspend_device_process_group,
             wait_for_process_group_teardown,
         )
         from sglang.srt.distributed.criu_process_groups import (
-            registered_groups,
             validate_checkpoint_topology,
         )
 
@@ -260,13 +264,7 @@ class CriuCheckpointCoordinator:
             time.sleep(0.01)
 
     def _collective_sets(self):
-        from sglang.srt.layers.flashinfer_comm_fusion import (
-            get_flashinfer_collective_manager,
-        )
-
-        flashinfer_collectives = get_flashinfer_collective_manager()
-        seen = {id(flashinfer_collectives)}
-        yield flashinfer_collectives
+        seen = set()
         for group in self.groups:
             collectives = getattr(group, "movin_collectives", None)
             if collectives is not None and id(collectives) not in seen:
@@ -285,7 +283,7 @@ def receive_restore_request(
         raise RuntimeError(
             "SGLANG_CRIU_DEVICE_STORE is required while CPU groups are suspended"
         )
-    generation = tp_group._cpu_group_generation + 1
+    generation = tp_group.cpu_group_generation + 1
     resume_path = Path(f"{store_base}.{generation}.resume")
     resume_req = None
     if tp_group.is_first_rank and recv_from_rpc is not None:

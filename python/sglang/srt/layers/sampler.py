@@ -68,9 +68,7 @@ _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.tp_sync_group = get_tp_group().device_group
-        if is_dp_attention_enabled():
-            self.tp_sync_group = get_attention_tp_group().device_group
+        self._sync_on_attention_tp = is_dp_attention_enabled()
 
         self.rl_on_policy_target = get_global_server_args().rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
@@ -390,8 +388,16 @@ class Sampler(nn.Module):
             torch.distributed.all_reduce(
                 batch_next_token_ids,
                 op=dist.ReduceOp.MIN,
-                group=self.tp_sync_group,
+                group=self._tp_sync_group(),
             )
+
+    def _tp_sync_group(self):
+        coordinator = (
+            get_attention_tp_group()
+            if self._sync_on_attention_tp
+            else get_tp_group()
+        )
+        return coordinator.device_group
 
     def compute_logprobs_only(
         self,

@@ -6,63 +6,65 @@ Run with:
 """
 
 import os
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
 
-from sglang.srt.distributed.parallel_state import (
-    GroupCoordinator,
-    _register_group,
-    resume_cpu_process_groups,
-    resume_device_process_group,
-    suspend_cpu_process_groups,
-    suspend_device_process_group,
-    wait_for_process_group_teardown,
+from sglang.srt.distributed.criu_coordinator import (
+    CheckpointState,
+    CriuCheckpointCoordinator,
 )
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 
-class FakeMovinCollectives:
+class FakeCheckpointCollectives:
+    has_all_reduce = True
+    has_all_gather = True
+
     def __init__(self, control_group):
         self.control_group = control_group
+        self.detached = False
+
+    def capture(self):
+        return nullcontext()
+
+    def prepare_checkpoint(self) -> None:
+        assert self.control_group is not None
+        self.detached = True
+
+    def restore_after_checkpoint(self) -> None:
+        assert self.control_group is not None
+        assert self.detached
+        self.detached = False
 
     def set_control_group(self, control_group) -> None:
         self.control_group = control_group
 
+    def status(self):
+        return {"fake": [0, 0, 0]}
 
-def make_cpu_only_coordinator(cpu_group) -> GroupCoordinator:
-    coordinator = GroupCoordinator.__new__(GroupCoordinator)
-    coordinator.unique_name = "cpu-lifecycle-test:0"
-    coordinator.rank = dist.get_rank()
-    coordinator.world_size = dist.get_world_size()
-    coordinator.group_name = "cpu-lifecycle-test"
-    coordinator.cpu_group = cpu_group
-    coordinator.device_group = dist.group.WORLD
-    coordinator._owns_device_group = False
-    coordinator._device_group_is_cpu_alias = False
-    coordinator._device_group_suspended = False
-    coordinator._group_ranks = [list(range(dist.get_world_size()))]
-    coordinator._torch_distributed_backend = "gloo"
-    coordinator._gloo_timeout = torch.distributed.default_pg_timeout
-    coordinator._recovered_rank = False
-    coordinator._cpu_group_suspended = False
-    coordinator._cpu_group_generation = 0
-    coordinator.use_message_queue_broadcaster = False
-    coordinator.mq_broadcaster = None
+    def close(self) -> None:
+        self.control_group = None
 
-    for name in (
-        "pynccl_comm",
-        "pymscclpp_comm",
-        "ca_comm",
-        "qr_comm",
-        "torch_symm_mem_comm",
-        "hpu_communicator",
-        "xpu_communicator",
-        "npu_communicator",
-    ):
-        setattr(coordinator, name, None)
-    coordinator.movin_collectives = FakeMovinCollectives(cpu_group)
-    _register_group(coordinator)
-    return coordinator
+
+def make_cpu_only_coordinator(local_rank: int) -> GroupCoordinator:
+    return GroupCoordinator(
+        group_ranks=[list(range(dist.get_world_size()))],
+        local_rank=local_rank,
+        torch_distributed_backend="gloo",
+        use_pynccl=False,
+        use_pymscclpp=False,
+        use_custom_allreduce=False,
+        use_torch_symm_mem_all_reduce=False,
+        use_hpu_communicator=False,
+        use_xpu_communicator=False,
+        use_npu_communicator=False,
+        group_name="tp",
+        device_group_override=dist.group.WORLD,
+        create_device_group=False,
+    )
 
 
 def assert_cpu_collective(coordinator: GroupCoordinator, cycle: int) -> None:
@@ -70,6 +72,32 @@ def assert_cpu_collective(coordinator: GroupCoordinator, cycle: int) -> None:
     dist.all_reduce(value, group=coordinator.cpu_group)
     expected = sum(range(dist.get_world_size())) + cycle * dist.get_world_size()
     assert value.item() == expected
+
+
+def make_checkpoint_coordinator(group: GroupCoordinator):
+    server_args = SimpleNamespace(
+        pp_size=1,
+        dp_size=1,
+        ep_size=1,
+        moe_dp_size=1,
+        attn_cp_size=1,
+        enable_dp_attention=False,
+        moe_a2a_backend="none",
+        disaggregation_mode="null",
+        enable_hierarchical_cache=False,
+        hicache_storage_backend=None,
+        enable_hisparse=False,
+        disable_radix_cache=True,
+        disable_custom_all_reduce=True,
+        enable_symm_mem=False,
+    )
+    model_config = SimpleNamespace(hf_text_config=SimpleNamespace())
+    return CriuCheckpointCoordinator(
+        device=group.device,
+        groups=[group],
+        server_args=server_args,
+        model_config=model_config,
+    )
 
 
 def main() -> None:
@@ -81,7 +109,12 @@ def main() -> None:
         f"/tmp/sglang-cpu-lifecycle-{os.environ['MASTER_PORT']}"
     )
 
-    coordinator = make_cpu_only_coordinator(dist.new_group(backend="gloo"))
+    coordinator = make_cpu_only_coordinator(local_rank)
+    coordinator.movin_collectives.close()
+    coordinator.movin_collectives = FakeCheckpointCollectives(
+        coordinator.cpu_group
+    )
+    checkpoint = make_checkpoint_coordinator(coordinator)
     graph_value = torch.zeros(1, device="cuda")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -93,26 +126,23 @@ def main() -> None:
         torch.cuda.synchronize()
         assert graph_value.item() == cycle + 1
 
-        suspend_cpu_process_groups()
+        checkpoint.prepare()
+        assert checkpoint.state is CheckpointState.PREPARED
         assert coordinator.cpu_group is None
-        assert coordinator.movin_collectives.control_group is None
-        suspend_device_process_group()
-        wait_for_process_group_teardown()
         assert not dist.is_initialized()
         assert coordinator.device_group is None
 
-        resume_device_process_group()
+        checkpoint.restore()
+        assert checkpoint.state is CheckpointState.READY
         assert dist.is_initialized()
         assert coordinator.device_group is dist.group.WORLD
-        resume_cpu_process_groups()
-        assert (
-            coordinator.cpu_group is coordinator.movin_collectives.control_group
-        )
-        assert coordinator._cpu_group_generation == cycle + 1
+        assert coordinator.cpu_group_generation == cycle + 1
+        assert coordinator.movin_collectives.control_group is coordinator.cpu_group
+        assert not coordinator.movin_collectives.detached
         dist.barrier()
 
     assert_cpu_collective(coordinator, 4)
-    coordinator.suspend_cpu_group()
+    coordinator.destroy()
     dist.destroy_process_group()
 
 

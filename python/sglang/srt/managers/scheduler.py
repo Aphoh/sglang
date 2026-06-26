@@ -1005,8 +1005,7 @@ class Scheduler(
                 self.prefill_delayer = PrefillDelayer(
                     dp_size=self.ps.dp_size,
                     attn_tp_size=self.ps.attn_tp_size,
-                    cpu_group=self.tp_cpu_group,
-                    device_group=self.tp_group.device_group,
+                    tp_group=self.tp_group,
                     server_args=self.server_args,
                     metrics_collector=(
                         self.metrics_collector
@@ -1015,7 +1014,6 @@ class Scheduler(
                     ),
                     max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
                     token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
-                    device=self.tp_group.device,
                 )
 
         # NOTE: preemption is enabled by default for priority scheduling.
@@ -3683,11 +3681,19 @@ class Scheduler(
             exec = e
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
 
-        success, consensus_error = self.criu_checkpoint.converge_rpc_result(
-            recv_req.method,
-            success=success,
-            error="" if exec is None else str(exec),
-        )
+        try:
+            success, consensus_error = self.criu_checkpoint.converge_rpc_result(
+                recv_req.method,
+                success=success,
+                error="" if exec is None else str(exec),
+            )
+        except Exception as consensus_exception:
+            success = False
+            consensus_error = str(consensus_exception)
+            logger.exception(
+                "Failed to converge checkpoint RPC result for %s",
+                recv_req.method,
+            )
         if consensus_error:
             exec = RuntimeError(consensus_error)
         if self.criu_checkpoint.should_barrier_after_rpc(

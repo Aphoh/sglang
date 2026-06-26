@@ -13,6 +13,7 @@ cuda_checkpoint_helper=${CUDA_CHECKPOINT_HELPER_BIN:-/usr/local/bin/cuda-checkpo
 cuda_device_map=${SGLANG_CRIU_DEVICE_MAP:-}
 source_gpu_uuids=${SGLANG_CRIU_SOURCE_GPU_UUIDS:-}
 restore_gpu_uuids=${SGLANG_CRIU_RESTORE_GPU_UUIDS:-${source_gpu_uuids}}
+host_tools="${sglang_root}/examples/experimental/criu/criu_host_tools.py"
 mkdir -p "${state_root}"
 state_dir=$(mktemp -d "${state_root%/}/run.XXXXXX")
 run_dir="${state_dir}/run"
@@ -21,10 +22,24 @@ plugin_dir="${state_dir}/plugins"
 dist_store="${run_dir}/torch-dist-store"
 mkdir -p "${run_dir}" "${images_dir}" "${plugin_dir}"
 
+expected_movin_commit=$(
+  "${python_bin}" "${host_tools}" pinned-movin-commit \
+    "${sglang_root}/python/pyproject.toml"
+)
+actual_movin_commit=$(git -C "${movin_root}" rev-parse HEAD)
+if [[ "${actual_movin_commit}" != "${expected_movin_commit}" ]]; then
+  echo "Movin checkout ${actual_movin_commit} does not match pin ${expected_movin_commit}" >&2
+  exit 1
+fi
+if [[ -n "$(git -C "${movin_root}" status --porcelain)" ]]; then
+  echo "Movin checkout must be clean for a reproducible run" >&2
+  exit 1
+fi
 "${uv_bin}" pip install --system --break-system-packages --no-deps \
-  --editable "${movin_root}"
+  --editable "${movin_root}" \
+  --editable "${sglang_root}/python"
 MOVIN_DEPS_DIR="${movin_deps_dir}" "${python_bin}" -m movin.build_deps
-"${python_bin}" -c 'import movin; print("movin package:", movin.__file__)'
+"${python_bin}" -c 'import importlib.metadata as m, movin, sglang; assert m.version("flashinfer-python") == "0.6.12"; assert m.version("flashinfer-cubin") == "0.6.12"; print("movin package:", movin.__file__); print("sglang package:", sglang.__file__)'
 
 cc -O2 -Wall -Wextra -Werror -shared -fPIC \
   "${movin_root}/examples/cuda_checkpoint/nvidiactl_criu_plugin.c" \
@@ -39,7 +54,6 @@ controller_log="${state_dir}/controller.log"
   cd "${sglang_root}"
   exec /usr/local/sbin/cuda-checkpoint --launch-job \
     env \
-      PYTHONPATH="${sglang_root}/python${PYTHONPATH:+:${PYTHONPATH}}" \
       NCCL_IB_DISABLE=1 \
       UCX_TLS=cuda_ipc,cuda_copy,sm,self \
       UV_USE_IO_URING=0 \
@@ -95,61 +109,11 @@ wait_for_file() {
 capture_worker_gpu_residency() {
   local phase=$1
   local expected_gpu_uuids=$2
-  python3 - \
+  "${python_bin}" "${host_tools}" record-gpu-residency \
     "${phase}" \
     "${run_dir}/worker-pids.json" \
     "${expected_gpu_uuids}" \
-    "${run_dir}/gpu-migration.json" <<'PY'
-import json
-import subprocess
-import sys
-from pathlib import Path
-
-phase = sys.argv[1]
-worker_path = Path(sys.argv[2])
-expected = {value for value in sys.argv[3].split(",") if value}
-output_path = Path(sys.argv[4])
-workers = {int(pid) for pid in json.loads(worker_path.read_text())}
-residency = {pid: set() for pid in workers}
-
-rows = subprocess.check_output(
-    [
-        "nvidia-smi",
-        "--query-compute-apps=gpu_uuid,pid",
-        "--format=csv,noheader,nounits",
-    ],
-    text=True,
-).splitlines()
-for row in rows:
-    gpu_uuid, raw_pid = (value.strip() for value in row.split(",", 1))
-    pid = int(raw_pid)
-    if pid in residency:
-        residency[pid].add(gpu_uuid)
-
-cpu_only_workers = sorted(
-    pid for pid, gpu_uuids in residency.items() if not gpu_uuids
-)
-observed = set().union(*residency.values()) if residency else set()
-if observed != expected:
-    raise RuntimeError(
-        f"{phase} GPU residency mismatch: expected={sorted(expected)}, "
-        f"observed={sorted(observed)}, cpu_only_workers={cpu_only_workers}, "
-        f"workers={{{', '.join(f'{pid}: {sorted(values)}' for pid, values in sorted(residency.items()))}}}"
-    )
-
-payload = json.loads(output_path.read_text()) if output_path.exists() else {}
-payload[phase] = {
-    "cpu_only_worker_pids": cpu_only_workers,
-    "expected_gpu_uuids": sorted(expected),
-    "worker_gpu_uuids": {
-        str(pid): sorted(gpu_uuids) for pid, gpu_uuids in sorted(residency.items())
-    },
-}
-temporary = output_path.with_suffix(".tmp")
-temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-temporary.replace(output_path)
-print(json.dumps({phase: payload[phase]}, sort_keys=True), flush=True)
-PY
+    "${run_dir}/gpu-migration.json"
 }
 
 wait_for_worker_gpu_residency() {
@@ -172,14 +136,25 @@ wait_for_file "${run_dir}/job-ready" "SGLang checkpoint barrier"
 controller_pid=$(<"${run_dir}/controller-pid")
 
 process_start_time() {
-  python3 - "$1" <<'PY'
-import sys
-from pathlib import Path
-
-stat = Path(f"/proc/{sys.argv[1]}/stat").read_text()
-print(stat.rsplit(")", 1)[1].split()[19])
-PY
+  "${python_bin}" "${host_tools}" process-start-time "$1"
 }
+
+wait_for_process_exit() {
+  local pid=$1
+  local start_time=$2
+  local deadline=$((SECONDS + timeout_seconds))
+  local current
+  while current=$(process_start_time "${pid}" 2>/dev/null) \
+      && [[ "${current}" == "${start_time}" ]]; do
+    if (( SECONDS >= deadline )); then
+      echo "timed out waiting for restored controller ${pid} to exit" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+controller_start_time=$(process_start_time "${controller_pid}")
 
 locked=()
 checkpointed=()
@@ -221,45 +196,8 @@ cleanup() {
 trap cleanup EXIT
 
 mapfile -t process_tree_pids < <(
-    python3 - "${controller_pid}" "${run_dir}/worker-pids.json" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-root = int(sys.argv[1])
-workers = [int(pid) for pid in json.loads(Path(sys.argv[2]).read_text())]
-children: dict[int, list[int]] = {}
-for status_path in Path("/proc").glob("[0-9]*/status"):
-    try:
-        fields = {}
-        for line in status_path.read_text().splitlines():
-            key, separator, value = line.partition(":")
-            if separator:
-                fields[key] = value.strip()
-        pid = int(fields["Pid"])
-        parent = int(fields["PPid"])
-    except (OSError, KeyError, ValueError):
-        continue
-    children.setdefault(parent, []).append(pid)
-for child_pids in children.values():
-    child_pids.sort()
-
-seen: set[int] = set()
-def emit_subtree(pid: int) -> None:
-    if pid in seen:
-        return
-    seen.add(pid)
-    print(pid)
-    for child in children.get(pid, ()):
-        emit_subtree(child)
-
-seen.add(root)
-print(root)
-for worker in workers:
-    emit_subtree(worker)
-for child in children.get(root, ()):
-    emit_subtree(child)
-PY
+    "${python_bin}" "${host_tools}" process-tree \
+      "${controller_pid}" "${run_dir}/worker-pids.json"
 )
 
 cuda_pids=()
@@ -286,29 +224,8 @@ if [[ -n "${cuda_device_map}" ]]; then
     exit 1
   fi
   mapfile -t cuda_migration_pids < <(
-    python3 - "${source_gpu_uuids}" "${cuda_pids[@]}" <<'PY'
-import subprocess
-import sys
-
-source_gpu_uuids = {value for value in sys.argv[1].split(",") if value}
-cuda_pids = {int(value) for value in sys.argv[2:]}
-resident_pids = set()
-rows = subprocess.check_output(
-    [
-        "nvidia-smi",
-        "--query-compute-apps=gpu_uuid,pid",
-        "--format=csv,noheader,nounits",
-    ],
-    text=True,
-).splitlines()
-for row in rows:
-    gpu_uuid, raw_pid = (value.strip() for value in row.split(",", 1))
-    pid = int(raw_pid)
-    if pid in cuda_pids and gpu_uuid in source_gpu_uuids:
-        resident_pids.add(pid)
-for pid in sorted(resident_pids):
-    print(pid)
-PY
+    "${python_bin}" "${host_tools}" migration-pids \
+      "${source_gpu_uuids}" "${cuda_pids[@]}"
   )
   if [[ ${#cuda_migration_pids[@]} -eq 0 ]]; then
     echo "no CUDA checkpoint PID is resident on the source GPUs" >&2
@@ -379,6 +296,7 @@ fi
 printf 'restored\n' >"${run_dir}/phase.tmp"
 mv "${run_dir}/phase.tmp" "${run_dir}/phase"
 wait_for_file "${run_dir}/passed" "post-restore generation"
+wait_for_process_exit "${controller_pid}" "${controller_start_time}"
 
 cat "${controller_log}"
 cat "${run_dir}/gsm8k-result.json"

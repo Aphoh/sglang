@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import torch
 
 MODULE_PATH = (
-    Path(__file__).parents[3]
+    Path(__file__).parents[4]
     / "python/sglang/srt/distributed/device_communicators/movin_nixl.py"
 )
 SPEC = importlib.util.spec_from_file_location("sglang_movin_nixl_test", MODULE_PATH)
@@ -24,9 +24,30 @@ class FakeBackend:
 
 
 class FakeManager:
-    def __init__(self, *, all_reduce=None, all_gather=None):
+    def __init__(self, *, all_reduce=None, all_gather=None, participants=None):
         self.all_reduce_backend = all_reduce
         self.all_gather_backend = all_gather
+        self.participants = participants or {}
+
+
+def test_disabled_config_does_not_import_movin(monkeypatch):
+    monkeypatch.setitem(sys.modules, "movin", None)
+    config = MovinCollectiveConfig(
+        all_reduce_backend=None,
+        enable_all_gather=False,
+        all_reduce_max_elems=1,
+        all_gather_max_elems=1,
+        checkpointable=False,
+        force_nixl_after_restore=False,
+        restore_probe=False,
+    )
+
+    assert create_movin_collectives(
+        object(),
+        torch.device("cpu"),
+        "tp",
+        config,
+    ) is None
 
 
 def test_create_movin_collectives_uses_unified_manager(monkeypatch):
@@ -36,6 +57,16 @@ def test_create_movin_collectives_uses_unified_manager(monkeypatch):
         TorchDistributedSymmetricAllGather=FakeBackend,
     )
     monkeypatch.setitem(sys.modules, "movin", fake_movin)
+    checkpoint_participants = {"flashinfer_attention": object()}
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.layers.flashinfer_comm_fusion",
+        SimpleNamespace(
+            get_flashinfer_checkpoint_participants=(
+                lambda group_name: checkpoint_participants
+            )
+        ),
+    )
     group = object()
     device = torch.device("cuda", 3)
     config = MovinCollectiveConfig(
@@ -67,6 +98,47 @@ def test_create_movin_collectives_uses_unified_manager(monkeypatch):
         "max_elems": 262144,
         "restore_probe": True,
     }
+    assert manager.participants is checkpoint_participants
+
+
+def test_checkpoint_only_config_still_creates_lifecycle_manager(monkeypatch):
+    fake_movin = SimpleNamespace(
+        CollectiveManager=FakeManager,
+        TorchDistributedNixlAllReduce=FakeBackend,
+        TorchDistributedSymmetricAllGather=FakeBackend,
+    )
+    participant = object()
+    monkeypatch.setitem(sys.modules, "movin", fake_movin)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.layers.flashinfer_comm_fusion",
+        SimpleNamespace(
+            get_flashinfer_checkpoint_participants=lambda group_name: {
+                "workspace": participant
+            }
+        ),
+    )
+    config = MovinCollectiveConfig(
+        all_reduce_backend=None,
+        enable_all_gather=False,
+        all_reduce_max_elems=1,
+        all_gather_max_elems=1,
+        checkpointable=True,
+        force_nixl_after_restore=False,
+        restore_probe=False,
+    )
+
+    manager = create_movin_collectives(
+        object(),
+        torch.device("cpu"),
+        "tp",
+        config,
+    )
+
+    assert isinstance(manager, FakeManager)
+    assert manager.all_reduce_backend is None
+    assert manager.all_gather_backend is None
+    assert manager.participants == {"workspace": participant}
 
 
 def test_create_movin_collectives_ignores_non_tp_groups(monkeypatch):

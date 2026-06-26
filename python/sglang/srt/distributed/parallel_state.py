@@ -43,6 +43,10 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.criu_process_groups import (
+    CpuProcessGroupSpec,
+    GroupCheckpointState,
+)
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -152,18 +156,27 @@ _groups: Dict[str, Callable[[], Optional["GroupCoordinator"]]] = {}
 
 
 def _register_group(group: "GroupCoordinator") -> None:
-    from sglang.srt.distributed.criu_process_groups import register_group
-
     _groups[group.unique_name] = weakref.ref(group)
-    register_group(group)
+
+
+def registered_groups() -> list["GroupCoordinator"]:
+    groups = []
+    stale_names = []
+    for name, group_ref in _groups.items():
+        group = group_ref()
+        if group is None:
+            stale_names.append(name)
+        else:
+            groups.append(group)
+    for name in stale_names:
+        _groups.pop(name, None)
+    return groups
 
 
 def suspend_device_process_group() -> None:
     from sglang.srt.distributed.criu_process_groups import (
         suspend_device_process_group as suspend,
     )
-
-    from sglang.srt.distributed.criu_process_groups import registered_groups
 
     suspend(
         registered_groups(),
@@ -185,8 +198,6 @@ def resume_device_process_group() -> None:
         resume_device_process_group as resume,
     )
 
-    from sglang.srt.distributed.criu_process_groups import registered_groups
-
     resume(
         registered_groups(),
         timeout=_MODEL_PARALLEL_GROUP_TIMEOUT,
@@ -195,18 +206,18 @@ def resume_device_process_group() -> None:
 
 
 def suspend_cpu_process_groups() -> None:
-    from sglang.srt.distributed.criu_process_groups import registered_groups
+    from sglang.srt.distributed.criu_process_groups import suspend_cpu_group
 
     for group in registered_groups():
-        group.suspend_cpu_group()
+        suspend_cpu_group(group)
     gc.collect()
 
 
 def resume_cpu_process_groups() -> None:
-    from sglang.srt.distributed.criu_process_groups import registered_groups
+    from sglang.srt.distributed.criu_process_groups import resume_cpu_group
 
     for group in registered_groups():
-        group.resume_cpu_group()
+        resume_cpu_group(group)
 
 
 @register_custom_op(mutates_args=["tensor"])
@@ -334,15 +345,14 @@ class GroupCoordinator:
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
-        self._owns_device_group = False
-        self._device_group_is_cpu_alias = False
-        self._device_group_suspended = False
-        self._group_ranks = [list(ranks) for ranks in group_ranks]
-        self._torch_distributed_backend = torch_distributed_backend
-        self._gloo_timeout = gloo_timeout
-        self._recovered_rank = recovered_rank
-        self._cpu_group_suspended = False
-        self._cpu_group_generation = 0
+        self._checkpoint_state = GroupCheckpointState()
+        self._cpu_group_spec = CpuProcessGroupSpec(
+            group_ranks=tuple(tuple(ranks) for ranks in group_ranks),
+            torch_distributed_backend=torch_distributed_backend,
+            gloo_timeout=gloo_timeout,
+            model_parallel_timeout=_MODEL_PARALLEL_GROUP_TIMEOUT,
+            recovered_rank=recovered_rank,
+        )
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
         if is_cuda_alike():
@@ -362,7 +372,6 @@ class GroupCoordinator:
 
         for ranks in group_ranks:
             active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
-            active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
@@ -378,12 +387,6 @@ class GroupCoordinator:
                     )
                 else:
                     device_group = None
-                cpu_group = torch.distributed.new_group(
-                    ranks,
-                    backend="mooncake-cpu",
-                    pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank),
-                    timeout=subgroup_timeout,
-                )
             else:
                 pg_options = get_torch_distributed_pg_options(group_name)
                 if device_group_override is not None:
@@ -397,21 +400,19 @@ class GroupCoordinator:
                     )
                 else:
                     device_group = None
-                # a group with `gloo` backend, to allow direct coordination
-                # between processes through the CPU.
-                cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo", timeout=gloo_timeout
-                )
+            cpu_group, active_ranks_cpu = self._cpu_group_spec.create_group(ranks)
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
                 self.rank_in_group = ranks.index(self.rank)
                 self.device_group = device_group or cpu_group
                 self.cpu_group = cpu_group
-                self._owns_device_group = (
+                self._checkpoint_state.owns_device_group = (
                     device_group_override is None and create_device_group
                 )
-                self._device_group_is_cpu_alias = device_group is None
+                self._checkpoint_state.device_group_is_cpu_alias = (
+                    device_group is None
+                )
                 self.active_ranks = active_ranks
                 self.active_ranks_cpu = active_ranks_cpu
 
@@ -572,6 +573,10 @@ class GroupCoordinator:
     def first_rank(self):
         """Return the global rank of the first process in the group"""
         return self.ranks[0]
+
+    @property
+    def cpu_group_generation(self) -> int:
+        return self._checkpoint_state.cpu_group_generation
 
     @property
     def last_rank(self):
@@ -1614,10 +1619,8 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
-        from sglang.srt.distributed.criu_process_groups import unregister_group
-
-        unregister_group(self)
-        if self.device_group is not None and self._owns_device_group:
+        _groups.pop(self.unique_name, None)
+        if self.device_group is not None and self._checkpoint_state.owns_device_group:
             torch.distributed.destroy_process_group(self.device_group)
         self.device_group = None
         if self.cpu_group is not None:
@@ -1664,20 +1667,6 @@ class GroupCoordinator:
                 f"group {self.unique_name} owns communicators without a "
                 f"checkpoint lifecycle: {unsupported}"
             )
-
-    def suspend_cpu_group(self) -> None:
-        from sglang.srt.distributed.criu_process_groups import suspend_cpu_group
-
-        suspend_cpu_group(self)
-
-    def resume_cpu_group(self) -> None:
-        from sglang.srt.distributed.criu_process_groups import resume_cpu_group
-
-        resume_cpu_group(
-            self,
-            model_parallel_timeout=_MODEL_PARALLEL_GROUP_TIMEOUT,
-        )
-
 
 _WORLD: Optional[GroupCoordinator] = None
 

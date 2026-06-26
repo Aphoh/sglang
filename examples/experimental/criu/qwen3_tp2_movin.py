@@ -307,8 +307,9 @@ def main() -> None:
         (args.rendezvous / "gsm8k-result.json").write_text(
             json.dumps(gsm8k_result, indent=2, sort_keys=True) + "\n"
         )
-        (args.rendezvous / "passed").touch()
     engine.shutdown()
+    if args.rendezvous is not None:
+        (args.rendezvous / "passed").touch()
 
 
 if __name__ == "__main__":

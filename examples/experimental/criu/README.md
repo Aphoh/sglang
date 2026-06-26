@@ -38,6 +38,11 @@ CUDA processes resident on source GPUs. `SGLANG_CRIU_SOURCE_GPU_UUIDS` and
 `SGLANG_CRIU_RESTORE_GPU_UUIDS` enable strict NVML residency checks around the
 checkpoint.
 
+Before launch, the runner verifies that the mounted Movin checkout is clean and
+exactly matches SGLang's immutable `criu` extra pin. It installs both mounted
+packages as editable packages without a `PYTHONPATH` overlay. The image pins
+FlashInfer Python and cubin packages to 0.6.12, matching `python/pyproject.toml`.
+
 The CRIU `nvidiactl` plugin compiled by the runner only reopens
 `/dev/nvidiactl` descriptors. It does not checkpoint CUDA state.
 
@@ -58,11 +63,14 @@ uv pip install -e './python[criu]'
 The Movin recipe instead mounts an exact Movin checkout and records both git
 commits in the experiment provenance.
 
-## Reference Result
+## Historical Reference Result
 
-The June 14, 2026 reference run used two NVIDIA B200 GPUs, driver 595.58.03,
-CUDA 13.0.1, PyTorch 2.11.0+cu130, FlashInfer 0.6.11.post1, NIXL 1.1.0, and
-CRIU commit `00b4a49`.
+The June 14, 2026 run below predates the current FlashInfer 0.6.12 package pin;
+it used two NVIDIA B200 GPUs, driver 595.58.03, CUDA 13.0.1, PyTorch
+2.11.0+cu130, FlashInfer 0.6.11.post1, NIXL 1.1.0, and CRIU commit `00b4a49`.
+It is retained only as historical context, not as validation of the current
+dependency set. A current run writes its exact before/after result to
+`gsm8k-result.json`.
 
 | Metric | Before checkpoint | After restore |
 |---|---:|---:|
@@ -75,4 +83,4 @@ All 200 predictions and generated texts were identical.
 
 Checkpoint mode rejects unsupported configurations before detaching resources.
 The validated scope excludes PP, DP, MoE all-to-all, disaggregation, HiCache,
-radix-cache checkpointing, and owned non-WORLD device subgroups.
+HiSparse, radix-cache checkpointing, and owned non-WORLD device subgroups.

@@ -1,7 +1,7 @@
 import inspect
 import logging
 from contextlib import contextmanager
-from typing import Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 
@@ -232,8 +232,8 @@ def _preflight_check_workspace_memory(
 
 
 class FlashInferWorkspaceManager:
-    def __init__(self, *, use_attn_tp_group: bool):
-        self.use_attn_tp_group = use_attn_tp_group
+    def __init__(self, *, coordinator_provider: Callable[[], Any]):
+        self._coordinator_provider = coordinator_provider
         self.workspace = None
         self.world_size = None
         self.rank = None
@@ -296,31 +296,37 @@ class FlashInferWorkspaceManager:
                 # Pin the symmetric-memory rendezvous to the actual subgroup.
                 # Older FlashInfer releases only support comm_backend.
                 kwargs["group"] = device_group
-            comm_backend = None
-            if (
-                _flashinfer_create_workspace_supports_comm_backend
-                and device_group is not None
-                and cpu_group is not None
-            ):
-                from movin import TorchDistributedHandleBackend
-
-                comm_backend = TorchDistributedHandleBackend(cpu_group)
-                kwargs["comm_backend"] = comm_backend
-
             checkpointable = envs.SGLANG_CRIU_SUSPEND_DEVICE_PROCESS_GROUP.get()
             if checkpointable:
-                if comm_backend is None:
+                if (
+                    not _flashinfer_create_workspace_supports_comm_backend
+                    or cpu_group is None
+                ):
                     raise RuntimeError(
                         "Checkpointable FlashInfer workspaces require a CPU "
                         "communication backend"
                     )
-                from movin import CheckpointableFlashInferWorkspace
+                from movin import (
+                    CheckpointableFlashInferWorkspace,
+                    TorchDistributedHandleBackend,
+                )
 
+                comm_backend = TorchDistributedHandleBackend(cpu_group)
+                kwargs["comm_backend"] = comm_backend
                 self.checkpoint = CheckpointableFlashInferWorkspace()
                 with self.checkpoint.allocation_context(comm_backend, rank):
                     self.workspace = create_workspace(**kwargs)
                 self.checkpoint.bind(self.workspace, rank)
             else:
+                if (
+                    _flashinfer_create_workspace_supports_comm_backend
+                    and cpu_group is not None
+                ):
+                    from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
+                        TorchDistributedCommBackend,
+                    )
+
+                    kwargs["comm_backend"] = TorchDistributedCommBackend(cpu_group)
                 self.workspace = create_workspace(**kwargs)
         except Exception as e:
             _flashinfer_allreduce_unavailable = True
@@ -397,9 +403,11 @@ class FlashInferWorkspaceManager:
         if not self.criu_detached:
             return
         if device_group is None or cpu_group is None:
-            coordinator = self._current_coordinator()
-            device_group = coordinator.device_group
-            cpu_group = coordinator.cpu_group
+            coordinator = self._coordinator_provider()
+            if device_group is None:
+                device_group = coordinator.device_group
+            if cpu_group is None:
+                cpu_group = coordinator.cpu_group
         self.checkpoint.set_control_group(cpu_group)
         self.checkpoint.restore_after_checkpoint()
         self.group = (device_group, cpu_group)
@@ -408,18 +416,13 @@ class FlashInferWorkspaceManager:
     def restore_after_checkpoint(self) -> None:
         self.restore_after_criu()
 
-    def status(self) -> None:
-        return None
+    def status(self) -> list[int] | None:
+        if self.checkpoint is None:
+            return None
+        return self.checkpoint.status()
 
     def close(self) -> None:
         self.cleanup()
-
-    def _current_coordinator(self):
-        if self.use_attn_tp_group:
-            return get_attn_tp_group()
-        if get_moe_expert_parallel_world_size() > 1:
-            return get_moe_ep_group()
-        return get_moe_tp_group()
 
     def cleanup(self):
         """Clean up workspace"""
@@ -442,13 +445,18 @@ class FlashInferWorkspaceManager:
         self.checkpoint = None
 
 
+def _get_moe_workspace_coordinator():
+    if get_moe_expert_parallel_world_size() > 1:
+        return get_moe_ep_group()
+    return get_moe_tp_group()
+
+
 _attn_tp_workspace_manager = FlashInferWorkspaceManager(
-    use_attn_tp_group=True,
+    coordinator_provider=get_attn_tp_group,
 )
 _moe_tp_workspace_manager = FlashInferWorkspaceManager(
-    use_attn_tp_group=False,
+    coordinator_provider=_get_moe_workspace_coordinator,
 )
-_flashinfer_collective_manager = None
 
 
 def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManager:
@@ -467,19 +475,20 @@ def create_flashinfer_raw_allreduce(control_group):
     )
 
 
-def get_flashinfer_collective_manager():
-    """Return the shared lifecycle boundary for FlashInfer workspaces."""
-    global _flashinfer_collective_manager
-    if _flashinfer_collective_manager is None:
-        from movin import CollectiveManager
-
-        _flashinfer_collective_manager = CollectiveManager(
-            participants={
-                "flashinfer_attention": _attn_tp_workspace_manager,
-                "flashinfer_moe": _moe_tp_workspace_manager,
-            }
-        )
-    return _flashinfer_collective_manager
+def get_flashinfer_checkpoint_participants(
+    group_name: str,
+) -> dict[str, FlashInferWorkspaceManager]:
+    """Return workspace lifecycles owned by a process-group coordinator."""
+    if group_name == "tp":
+        return {
+            "flashinfer_attention": _attn_tp_workspace_manager,
+            "flashinfer_moe": _moe_tp_workspace_manager,
+        }
+    if group_name == "attention_tp":
+        return {"flashinfer_attention": _attn_tp_workspace_manager}
+    if group_name in ("moe_ep", "moe_tp"):
+        return {"flashinfer_moe": _moe_tp_workspace_manager}
+    return {}
 
 
 def _sync_allreduce_unavailable_across_tp():
@@ -732,11 +741,6 @@ def pre_initialize_workspaces(
 
 
 def cleanup_flashinfer_workspace():
-    global _flashinfer_collective_manager
-    if _flashinfer_collective_manager is not None:
-        _flashinfer_collective_manager.close()
-        _flashinfer_collective_manager = None
-        return
     _attn_tp_workspace_manager.cleanup()
     if _moe_tp_workspace_manager is not _attn_tp_workspace_manager:
         _moe_tp_workspace_manager.cleanup()

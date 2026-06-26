@@ -71,12 +71,17 @@ class NegotiateTestCase:
 def _run_negotiate_test(rank, test_cases):
     world_size = torch.distributed.get_world_size()
     cpu_group = torch.distributed.new_group(backend="gloo")
+    tp_group = SimpleNamespace(
+        cpu_group=cpu_group,
+        device_group=None,
+        device=torch.device("cpu"),
+    )
 
     for case in test_cases:
         delayer = PrefillDelayer(
             dp_size=world_size,
             attn_tp_size=1,
-            cpu_group=cpu_group,
+            tp_group=tp_group,
             server_args=SimpleNamespace(
                 enable_dp_attention=True,
                 disaggregation_mode="null",

@@ -6,6 +6,7 @@ Run with:
 """
 
 import os
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -32,6 +33,8 @@ def main() -> None:
         cpu_group,
         device,
         "movin-test",
+        checkpointable=True,
+        force_nixl_after_restore=True,
     )
     eager_input = torch.full(
         (2560,), local_rank + 1, dtype=torch.bfloat16, device=device
@@ -53,8 +56,26 @@ def main() -> None:
         assert_result(graph_output, local_rank, iteration)
         dist.barrier(group=cpu_group)
 
-    comm.prepare_criu()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    store_path = Path(f"/tmp/sglang-movin-renew-{os.environ['MASTER_PORT']}")
+    if rank == 0:
+        store_path.unlink(missing_ok=True)
     dist.barrier(group=cpu_group)
+    comm.prepare_criu()
+    comm.set_control_group(None)
+    dist.destroy_process_group(cpu_group)
+    dist.destroy_process_group()
+
+    store = dist.FileStore(str(store_path), world_size)
+    dist.init_process_group(
+        "nccl",
+        store=store,
+        rank=rank,
+        world_size=world_size,
+    )
+    cpu_group = dist.new_group(backend="gloo")
+    comm.set_control_group(cpu_group)
     comm.restore_after_criu()
 
     for iteration in (3, 4):
@@ -67,7 +88,10 @@ def main() -> None:
         dist.barrier(group=cpu_group)
 
     comm.close()
+    dist.destroy_process_group(cpu_group)
     dist.destroy_process_group()
+    if rank == 0:
+        store_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
