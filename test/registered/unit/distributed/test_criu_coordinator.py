@@ -27,7 +27,8 @@ def load_coordinator_module():
     io_module.RpcReqInput = type("RpcReqInput", (), {})
     zmq_module = ModuleType("zmq")
     zmq_module.NOBLOCK = 1
-    zmq_module.ZMQError = RuntimeError
+    zmq_module.ZMQError = type("ZMQError", (Exception,), {})
+    zmq_module.Again = type("Again", (zmq_module.ZMQError,), {})
     stubs = {
         "sglang.srt.environ": environ_module,
         "sglang.srt.managers.io_struct": io_module,
@@ -122,3 +123,52 @@ def test_run_phase_converges_local_failure(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="rank 0: boom"):
         coordinator._run_phase("unit-failure", fail, timeout=1)
+
+
+@pytest.mark.parametrize(
+    ("method", "success", "expected"),
+    [
+        ("ordinary_rpc", True, True),
+        ("ordinary_rpc", False, True),
+        (MODULE.CriuCheckpointCoordinator.PREPARE_RPC, True, False),
+        (MODULE.CriuCheckpointCoordinator.PREPARE_RPC, False, False),
+        (MODULE.CriuCheckpointCoordinator.RESTORE_RPC, True, True),
+        (MODULE.CriuCheckpointCoordinator.RESTORE_RPC, False, False),
+    ],
+)
+def test_rpc_barrier_policy_preserves_ordinary_rpc_barrier(
+    method,
+    success,
+    expected,
+):
+    coordinator = MODULE.CriuCheckpointCoordinator.__new__(
+        MODULE.CriuCheckpointCoordinator
+    )
+    assert coordinator.should_barrier_after_rpc(method, success=success) is expected
+
+
+def test_restore_polling_ignores_only_would_block(tmp_path):
+    ENVS.SGLANG_CRIU_DEVICE_STORE.value = str(tmp_path / "store")
+    tp_group = SimpleNamespace(cpu_group_generation=0, is_first_rank=True)
+    socket = SimpleNamespace(
+        recv_pyobj=lambda flags: (_ for _ in ()).throw(MODULE.zmq.Again())
+    )
+
+    assert MODULE.receive_restore_request(
+        tp_group=tp_group,
+        recv_from_rpc=socket,
+    ) == []
+
+
+def test_restore_polling_propagates_broken_socket(tmp_path):
+    ENVS.SGLANG_CRIU_DEVICE_STORE.value = str(tmp_path / "store")
+    tp_group = SimpleNamespace(cpu_group_generation=0, is_first_rank=True)
+    socket = SimpleNamespace(
+        recv_pyobj=lambda flags: (_ for _ in ()).throw(MODULE.zmq.ZMQError())
+    )
+
+    with pytest.raises(MODULE.zmq.ZMQError):
+        MODULE.receive_restore_request(
+            tp_group=tp_group,
+            recv_from_rpc=socket,
+        )

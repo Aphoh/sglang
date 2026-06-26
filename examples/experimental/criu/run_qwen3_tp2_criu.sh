@@ -304,6 +304,10 @@ printf 'restored\n' >"${run_dir}/phase.tmp"
 mv "${run_dir}/phase.tmp" "${run_dir}/phase"
 wait_for_file "${run_dir}/passed" "post-restore generation"
 wait_for_process_exit "${controller_pid}" "${controller_start_time}"
+if ! wait "${launcher_pid}"; then
+  echo "cuda-checkpoint launcher exited unsuccessfully" >&2
+  exit 1
+fi
 
 cat "${controller_log}"
 cat "${run_dir}/gsm8k-result.json"

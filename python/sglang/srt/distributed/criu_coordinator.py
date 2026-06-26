@@ -184,7 +184,11 @@ class CriuCheckpointCoordinator:
             raise RuntimeError(error)
 
     def should_barrier_after_rpc(self, method: str, *, success: bool) -> bool:
-        return success and method != self.PREPARE_RPC
+        if method == self.PREPARE_RPC:
+            return False
+        if method == self.RESTORE_RPC:
+            return success
+        return True
 
     def converge_rpc_result(
         self,
@@ -289,7 +293,7 @@ def receive_restore_request(
     if tp_group.is_first_rank and recv_from_rpc is not None:
         try:
             resume_req = recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-        except zmq.ZMQError:
+        except zmq.Again:
             pass
         if resume_req is not None:
             if not (
