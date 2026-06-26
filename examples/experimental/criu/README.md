@@ -38,10 +38,13 @@ CUDA processes resident on source GPUs. `SGLANG_CRIU_SOURCE_GPU_UUIDS` and
 `SGLANG_CRIU_RESTORE_GPU_UUIDS` enable strict NVML residency checks around the
 checkpoint.
 
-Before launch, the runner verifies that the mounted Movin checkout is clean and
-exactly matches SGLang's immutable `criu` extra pin. It installs both mounted
-packages as editable packages without a `PYTHONPATH` overlay. The image pins
-FlashInfer Python and cubin packages to 0.6.12, matching `python/pyproject.toml`.
+Before launch, the runner verifies that the mounted Movin checkout is clean,
+descends from SGLang's immutable `criu` extra pin, and has byte-identical
+package/build inputs (`pyproject.toml`, `uv.lock`, `python/`, and `kernels/`).
+This permits newer recipe-only commits without changing installed code. It
+installs both mounted packages as editable packages without a `PYTHONPATH`
+overlay. The image pins FlashInfer Python and cubin packages to 0.6.12,
+matching `python/pyproject.toml`.
 
 The CRIU `nvidiactl` plugin compiled by the runner only reopens
 `/dev/nvidiactl` descriptors. It does not checkpoint CUDA state.

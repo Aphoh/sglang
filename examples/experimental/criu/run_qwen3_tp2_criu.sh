@@ -28,13 +28,20 @@ expected_movin_commit=$(
 )
 actual_movin_commit=$(git -C "${movin_root}" rev-parse HEAD)
 if [[ "${actual_movin_commit}" != "${expected_movin_commit}" ]]; then
-  echo "Movin checkout ${actual_movin_commit} does not match pin ${expected_movin_commit}" >&2
-  exit 1
+  if ! git -C "${movin_root}" merge-base --is-ancestor \
+      "${expected_movin_commit}" "${actual_movin_commit}" \
+      || ! git -C "${movin_root}" diff --quiet \
+        "${expected_movin_commit}" "${actual_movin_commit}" -- \
+        pyproject.toml uv.lock python kernels; then
+    echo "Movin package inputs differ from pin ${expected_movin_commit}" >&2
+    exit 1
+  fi
 fi
 if [[ -n "$(git -C "${movin_root}" status --porcelain)" ]]; then
   echo "Movin checkout must be clean for a reproducible run" >&2
   exit 1
 fi
+echo "Movin package pin: ${expected_movin_commit}; checkout: ${actual_movin_commit}"
 "${uv_bin}" pip install --system --break-system-packages --no-deps \
   --editable "${movin_root}" \
   --editable "${sglang_root}/python"
