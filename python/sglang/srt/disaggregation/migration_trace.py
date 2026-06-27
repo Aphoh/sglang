@@ -31,7 +31,7 @@ def trace_scheduler(
     migration_id: Optional[str] = None,
     **fields,
 ) -> None:
-    """Emit a machine-readable migration event from one TP rank per DP group.
+    """Emit a machine-readable migration event from each owning scheduler rank.
 
     Wall time joins logs across the frontend and worker pods. Local durations
     should use the monotonic timing fields included in the event payload.
@@ -40,8 +40,6 @@ def trace_scheduler(
     if not enabled():
         return
     parallel_state = scheduler.ps
-    if getattr(parallel_state, "tp_rank", 0) != 0:
-        return
     logger.info(
         "decode_migration_trace role=%s stage=%s rid=%s migration_id=%s "
         "wall_time_ns=%d mono_time_ns=%d dp_rank=%s tp_rank=%s fields=%s",
