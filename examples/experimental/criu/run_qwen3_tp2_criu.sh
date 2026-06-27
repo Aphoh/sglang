@@ -22,23 +22,30 @@ plugin_dir="${state_dir}/plugins"
 dist_store="${run_dir}/torch-dist-store"
 mkdir -p "${run_dir}" "${images_dir}" "${plugin_dir}"
 
-expected_movin_commit=$(
-  "${python_bin}" "${host_tools}" pinned-movin-commit \
-    "${sglang_root}/python/pyproject.toml"
-)
-actual_movin_commit=$(git -C "${movin_root}" rev-parse HEAD)
-if [[ "${actual_movin_commit}" != "${expected_movin_commit}" ]]; then
-  if ! git -C "${movin_root}" merge-base --is-ancestor \
-      "${expected_movin_commit}" "${actual_movin_commit}" \
-      || ! git -C "${movin_root}" diff --quiet \
-        "${expected_movin_commit}" "${actual_movin_commit}" -- \
-        pyproject.toml uv.lock python kernels; then
-    echo "Movin package inputs differ from pin ${expected_movin_commit}" >&2
+expected_movin_commit=${MOVIN_EXPECTED_COMMIT:-}
+actual_movin_commit=${MOVIN_ACTUAL_COMMIT:-}
+if [[ -z "${expected_movin_commit}" || -z "${actual_movin_commit}" ]]; then
+  expected_movin_commit=$(
+    "${python_bin}" "${host_tools}" pinned-movin-commit \
+      "${sglang_root}/python/pyproject.toml"
+  )
+  actual_movin_commit=$(git -C "${movin_root}" rev-parse HEAD)
+  if [[ "${actual_movin_commit}" != "${expected_movin_commit}" ]]; then
+    if ! git -C "${movin_root}" merge-base --is-ancestor \
+        "${expected_movin_commit}" "${actual_movin_commit}" \
+        || ! git -C "${movin_root}" diff --quiet \
+          "${expected_movin_commit}" "${actual_movin_commit}" -- \
+          pyproject.toml uv.lock python kernels; then
+      echo "Movin package inputs differ from pin ${expected_movin_commit}" >&2
+      exit 1
+    fi
+  fi
+  if [[ -n "$(git -C "${movin_root}" status --porcelain)" ]]; then
+    echo "Movin checkout must be clean for a reproducible run" >&2
     exit 1
   fi
-fi
-if [[ -n "$(git -C "${movin_root}" status --porcelain)" ]]; then
-  echo "Movin checkout must be clean for a reproducible run" >&2
+elif [[ "${MOVIN_PACKAGE_INPUTS_VALIDATED:-}" != 1 ]]; then
+  echo "Host-provided Movin commits require validated package inputs" >&2
   exit 1
 fi
 echo "Movin package pin: ${expected_movin_commit}; checkout: ${actual_movin_commit}"
