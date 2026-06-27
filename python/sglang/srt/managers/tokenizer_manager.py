@@ -63,13 +63,13 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     EmbeddingReqInput,
+    FinalizeDecodeMigrationReqInput,
+    FinalizeDecodeMigrationReqOutput,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
-    FinalizeDecodeMigrationReqInput,
-    FinalizeDecodeMigrationReqOutput,
     PauseGenerationReqInput,
     PrepareDecodeMigrationReqInput,
     PrepareDecodeMigrationReqOutput,
@@ -415,7 +415,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
-        self.decode_migration_futures: Dict[str, asyncio.Future] = {}
+        self.decode_migration_futures: Dict[Tuple[str, int], asyncio.Future] = {}
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -1671,37 +1671,50 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
 
+    def _decode_migration_waiter_key(self, obj) -> Tuple[str, int]:
+        dp_rank = obj.routed_dp_rank
+        if dp_rank is None:
+            if self.server_args.dp_size > 1:
+                raise ValueError(
+                    "Decode migration controls require routed_dp_rank when dp_size > 1"
+                )
+            dp_rank = 0
+        if dp_rank < 0 or dp_rank >= self.server_args.dp_size:
+            raise ValueError(
+                f"routed_dp_rank={dp_rank} out of range "
+                f"[0, {self.server_args.dp_size})"
+            )
+        return obj.migration_id, dp_rank
+
     async def prepare_decode_migration(
         self, obj: PrepareDecodeMigrationReqInput
     ) -> PrepareDecodeMigrationReqOutput:
         self.auto_create_handle_loop()
-        if obj.migration_id in self.decode_migration_futures:
-            raise RuntimeError(
-                f"Migration waiter already exists for {obj.migration_id}"
-            )
+        key = self._decode_migration_waiter_key(obj)
+        if key in self.decode_migration_futures:
+            raise RuntimeError(f"Migration waiter already exists for {key}")
         future = asyncio.get_running_loop().create_future()
-        self.decode_migration_futures[obj.migration_id] = future
+        self.decode_migration_futures[key] = future
         try:
             await self.send_to_scheduler.send_pyobj(obj)
             return await asyncio.wait_for(future, timeout=10.0)
         finally:
-            self.decode_migration_futures.pop(obj.migration_id, None)
+            self.decode_migration_futures.pop(key, None)
 
     async def finalize_decode_migration(
         self, obj: FinalizeDecodeMigrationReqInput
     ) -> FinalizeDecodeMigrationReqOutput:
         self.auto_create_handle_loop()
-        if obj.migration_id in self.decode_migration_futures:
-            raise RuntimeError(
-                f"Migration waiter already exists for {obj.migration_id}"
-            )
+        key = self._decode_migration_waiter_key(obj)
+        if key in self.decode_migration_futures:
+            raise RuntimeError(f"Migration waiter already exists for {key}")
         future = asyncio.get_running_loop().create_future()
-        self.decode_migration_futures[obj.migration_id] = future
+        self.decode_migration_futures[key] = future
         try:
             await self.send_to_scheduler.send_pyobj(obj)
             return await asyncio.wait_for(future, timeout=10.0)
         finally:
-            self.decode_migration_futures.pop(obj.migration_id, None)
+            self.decode_migration_futures.pop(key, None)
 
     async def update_weights_from_disk(
         self,
@@ -2723,11 +2736,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             future.set_result(recv_obj.session_id if recv_obj.success else None)
 
     def _handle_decode_migration_output(self, recv_obj):
-        future = self.decode_migration_futures.get(recv_obj.migration_id)
+        key = (recv_obj.migration_id, recv_obj.source_dp_rank)
+        future = self.decode_migration_futures.get(key)
         if future is None:
             logger.warning(
-                "Decode migration response arrived after waiter cleanup: %s",
+                "Decode migration response has no matching waiter: %s rank=%d",
                 recv_obj.migration_id,
+                recv_obj.source_dp_rank,
             )
             return
         if not future.done():

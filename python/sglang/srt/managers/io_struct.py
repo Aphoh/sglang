@@ -1600,6 +1600,8 @@ class PrepareDecodeMigrationReqInput(BaseReq):
     output_tokens_seen: int = 0
     target_sequence_length: Optional[int] = None
 
+    routed_dp_rank: Optional[int] = None
+
 
 @dataclass
 class PrepareDecodeMigrationReqOutput(BaseReq):
@@ -1627,6 +1629,8 @@ class FinalizeDecodeMigrationReqInput(BaseReq):
     migration_id: str
     action: Literal["commit", "resume", "cancel"]
 
+    routed_dp_rank: Optional[int] = None
+
     def __post_init__(self):
         allowed = ["commit", "resume", "cancel"]
         if self.action not in allowed:
@@ -1644,6 +1648,7 @@ class FinalizeDecodeMigrationReqOutput(BaseReq):
     transfer_status: Literal[
         "bootstrapping", "transferring", "transferred", "failed", "unknown"
     ] = "unknown"
+    source_dp_rank: int = 0
     error: Optional[str] = None
 
 

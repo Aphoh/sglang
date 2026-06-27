@@ -192,8 +192,8 @@ class SchedulerDecodeMigrationMixin:
         logger.debug("Decode migration request lookup missed rid=%s", rid)
         return None
 
-    @staticmethod
     def _prepare_failure(
+        self: "Scheduler",
         recv_req: PrepareDecodeMigrationReqInput,
         status: str,
         error: Optional[str] = None,
@@ -204,6 +204,7 @@ class SchedulerDecodeMigrationMixin:
             migration_id=recv_req.migration_id,
             success=False,
             status=status,
+            source_dp_rank=self.ps.dp_rank or 0,
             error=error,
             **state,
         )
@@ -699,6 +700,7 @@ class SchedulerDecodeMigrationMixin:
                     action=recv_req.action,
                     success=True,
                     transfer_status="unknown",
+                    source_dp_rank=self.ps.dp_rank or 0,
                 )
             return FinalizeDecodeMigrationReqOutput(
                 rid=recv_req.rid,
@@ -706,6 +708,7 @@ class SchedulerDecodeMigrationMixin:
                 action=recv_req.action,
                 success=False,
                 transfer_status="unknown",
+                source_dp_rank=self.ps.dp_rank or 0,
                 error="Migration source is armed but not yet parked",
             )
         if record is None or record.req.rid != recv_req.rid:
@@ -715,6 +718,7 @@ class SchedulerDecodeMigrationMixin:
                 action=recv_req.action,
                 success=False,
                 transfer_status="unknown",
+                source_dp_rank=self.ps.dp_rank or 0,
                 error="Migration generation is not active",
             )
 
@@ -726,6 +730,7 @@ class SchedulerDecodeMigrationMixin:
                 action=recv_req.action,
                 success=False,
                 transfer_status=status,
+                source_dp_rank=self.ps.dp_rank or 0,
                 error="Destination cannot commit before source transfer completes",
             )
         if recv_req.action == "resume":
@@ -735,6 +740,7 @@ class SchedulerDecodeMigrationMixin:
                 action=recv_req.action,
                 success=False,
                 transfer_status=status,
+                source_dp_rank=self.ps.dp_rank or 0,
                 error="Source resumption is unsupported after request quiescence",
             )
 
@@ -756,4 +762,5 @@ class SchedulerDecodeMigrationMixin:
             action=recv_req.action,
             success=True,
             transfer_status=status,
+            source_dp_rank=self.ps.dp_rank or 0,
         )

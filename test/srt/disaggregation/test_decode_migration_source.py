@@ -1,7 +1,8 @@
+import asyncio
 import unittest
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import torch
 
@@ -9,8 +10,11 @@ from sglang.srt.disaggregation.decode_migration import SchedulerDecodeMigrationM
 from sglang.srt.disaggregation.utils import DisaggregationMode, KVClassType
 from sglang.srt.managers.io_struct import (
     FinalizeDecodeMigrationReqInput,
+    FinalizeDecodeMigrationReqOutput,
     PrepareDecodeMigrationReqInput,
+    PrepareDecodeMigrationReqOutput,
 )
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 
 class _Batch:
@@ -65,7 +69,7 @@ class _Sender:
 
 
 class _Scheduler(SchedulerDecodeMigrationMixin):
-    def __init__(self, reqs, *, overlap=False):
+    def __init__(self, reqs, *, overlap=False, dp_rank=0):
         self.server_args = SimpleNamespace(enable_decode_migration=True)
         self.disaggregation_mode = DisaggregationMode.NULL
         self.enable_overlap = overlap
@@ -85,7 +89,7 @@ class _Scheduler(SchedulerDecodeMigrationMixin):
             bootstrap_room=torch.zeros((8, 1), dtype=torch.int64),
         )
         self.transfer_backend = object()
-        self.ps = SimpleNamespace(tp_rank=0, pp_rank=0, dp_rank=0)
+        self.ps = SimpleNamespace(tp_rank=0, pp_rank=0, dp_rank=dp_rank)
         self.tree_cache = object()
         self.process_batch_result = MagicMock()
 
@@ -220,6 +224,29 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         self.assertEqual(output.logical_len, 4)
         self.assertEqual(output.output_tokens_seen, 2)
 
+    def test_control_responses_report_actual_dp_rank(self):
+        req = _Req("request", output_ids=[20])
+        scheduler = _Scheduler([req], dp_rank=3)
+        prepared = scheduler.prepare_decode_migration(
+            _prepare(
+                "request",
+                "migration",
+                17,
+                target_sequence_length=8,
+            )
+        )
+
+        self.assertTrue(prepared.success)
+        self.assertEqual(prepared.source_dp_rank, 3)
+
+        finalized = scheduler.finalize_decode_migration(
+            FinalizeDecodeMigrationReqInput(
+                rid="request", migration_id="migration", action="cancel"
+            )
+        )
+        self.assertTrue(finalized.success)
+        self.assertEqual(finalized.source_dp_rank, 3)
+
     def test_cancel_disarms_before_boundary(self):
         req = _Req("request", output_ids=[20])
         scheduler = _Scheduler([req])
@@ -326,6 +353,75 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         )
         self.assertEqual(scheduler.decode_migration_transfers, {})
         self.assertEqual(scheduler.decode_migration_by_rid, {})
+
+
+class DecodeMigrationWaiterRoutingTests(unittest.IsolatedAsyncioTestCase):
+    def manager(self):
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.server_args = SimpleNamespace(dp_size=4)
+        manager.decode_migration_futures = {}
+        manager.auto_create_handle_loop = MagicMock()
+        manager.send_to_scheduler = SimpleNamespace(send_pyobj=AsyncMock())
+        return manager
+
+    async def test_waiters_ignore_responses_from_other_dp_ranks(self):
+        manager = self.manager()
+        prepare = _prepare("request", "migration", 17)
+        prepare.routed_dp_rank = 3
+        prepare_task = asyncio.create_task(manager.prepare_decode_migration(prepare))
+        await asyncio.sleep(0)
+
+        manager._handle_decode_migration_output(
+            PrepareDecodeMigrationReqOutput(
+                rid="request",
+                migration_id="migration",
+                success=True,
+                status="prepared",
+                source_dp_rank=0,
+            )
+        )
+        self.assertFalse(prepare_task.done())
+
+        expected_prepare = PrepareDecodeMigrationReqOutput(
+            rid="request",
+            migration_id="migration",
+            success=True,
+            status="prepared",
+            source_dp_rank=3,
+        )
+        manager._handle_decode_migration_output(expected_prepare)
+        self.assertIs(await prepare_task, expected_prepare)
+
+        finalize = FinalizeDecodeMigrationReqInput(
+            rid="request",
+            migration_id="migration",
+            action="commit",
+            routed_dp_rank=3,
+        )
+        finalize_task = asyncio.create_task(manager.finalize_decode_migration(finalize))
+        await asyncio.sleep(0)
+
+        manager._handle_decode_migration_output(
+            FinalizeDecodeMigrationReqOutput(
+                rid="request",
+                migration_id="migration",
+                action="commit",
+                success=True,
+                source_dp_rank=0,
+            )
+        )
+        self.assertFalse(finalize_task.done())
+
+        expected_finalize = FinalizeDecodeMigrationReqOutput(
+            rid="request",
+            migration_id="migration",
+            action="commit",
+            success=True,
+            source_dp_rank=3,
+        )
+        manager._handle_decode_migration_output(expected_finalize)
+        self.assertIs(await finalize_task, expected_finalize)
+        self.assertEqual(manager.decode_migration_futures, {})
 
 
 if __name__ == "__main__":

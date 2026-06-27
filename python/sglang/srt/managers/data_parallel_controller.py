@@ -33,6 +33,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    FinalizeDecodeMigrationReqInput,
+    PrepareDecodeMigrationReqInput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -258,6 +260,14 @@ class DataParallelController:
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateReqInput, self.dispatching_with_trace),
+                (
+                    PrepareDecodeMigrationReqInput,
+                    self.send_routed_control_message,
+                ),
+                (
+                    FinalizeDecodeMigrationReqInput,
+                    self.send_routed_control_message,
+                ),
                 (TokenizedEmbeddingReqInput, self.dispatching_with_trace),
                 (BatchTokenizedGenerateReqInput, self.dispatch_batch_generate),
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
@@ -600,6 +610,11 @@ class DataParallelController:
             self.workers[req.routed_dp_rank].send_pyobj(req)
             return True
         return False
+
+    def send_routed_control_message(self, req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        self.send_control_message(req)
 
     def round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):

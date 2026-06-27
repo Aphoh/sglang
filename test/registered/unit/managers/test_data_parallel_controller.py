@@ -27,6 +27,10 @@ from sglang.srt.managers.data_parallel_controller import (
     DPBudget,
     LoadBalanceMethod,
 )
+from sglang.srt.managers.io_struct import (
+    FinalizeDecodeMigrationReqInput,
+    PrepareDecodeMigrationReqInput,
+)
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -206,6 +210,36 @@ class TestRoundRobinScheduler(CustomTestCase):
         # Subsequent round-robin req still lands on worker 0
         ctl.round_robin_scheduler(_req())
         ctl.workers[0].send_pyobj.assert_called_once()
+
+
+class TestRoutedMigrationControl(CustomTestCase):
+    def test_prepare_and_finalize_target_nonzero_dp_ranks(self):
+        controller = _make_controller(dp_size=4)
+        controller.init_dispatcher()
+
+        prepare = PrepareDecodeMigrationReqInput(
+            rid="request",
+            migration_id="migration",
+            bootstrap_host="127.0.0.1",
+            bootstrap_port=8998,
+            bootstrap_room=17,
+            routed_dp_rank=3,
+        )
+        controller._request_dispatcher(prepare)
+        controller.workers[3].send_pyobj.assert_called_once_with(prepare)
+        for rank in (0, 1, 2):
+            controller.workers[rank].send_pyobj.assert_not_called()
+
+        finalize = FinalizeDecodeMigrationReqInput(
+            rid="request",
+            migration_id="migration",
+            action="commit",
+            routed_dp_rank=2,
+        )
+        controller._request_dispatcher(finalize)
+        controller.workers[2].send_pyobj.assert_called_once_with(finalize)
+        for rank in (0, 1):
+            controller.workers[rank].send_pyobj.assert_not_called()
 
 
 class TestFollowBootstrapRoomScheduler(CustomTestCase):
