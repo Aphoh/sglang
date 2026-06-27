@@ -28,8 +28,8 @@ dependencies = [
   "distro",
   "einops",
   "fastapi",
-  "flashinfer_python[cu13]==0.6.12", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.12",
+  "flashinfer_python[cu13] @ git+https://github.com/Aphoh/flashinfer.git@86e3f6f49883c0995037a267b802951e889443f1",
+  "flashinfer_cubin==0.6.13",
   "gguf",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",

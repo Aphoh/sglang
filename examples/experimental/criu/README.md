@@ -1,8 +1,10 @@
 # Qwen3 TP2 CUDA graph checkpoint and restore
 
-This branch adds a scoped dense-TP checkpoint lifecycle to SGLang and uses
-[`movin`](https://github.com/NVIDIA-dev/warnold-movin) for checkpointable
-collective workspaces.
+This branch adds a scoped dense-TP checkpoint lifecycle to SGLang. It uses
+[`movin`](https://github.com/NVIDIA-dev/warnold-movin) for lifecycle
+coordination and a pinned
+[`Aphoh/flashinfer`](https://github.com/Aphoh/flashinfer/commit/86e3f6f49883c0995037a267b802951e889443f1)
+build for checkpointable TRT-LLM all-reduce and symmetric all-gather.
 
 The authoritative, pinned reproduction lives in Movin:
 
@@ -12,7 +14,7 @@ The authoritative, pinned reproduction lives in Movin:
 
 - Qwen3-8B BF16, TP2
 - FlashInfer TRT-LLM raw and fused all-reduce
-- Movin symmetric-VMM BF16 all-gather
+- FlashInfer symmetric-VMM BF16 all-gather
 - restartable Gloo control groups
 - one decode graph captured before checkpoint and replayed after restore
 
@@ -43,8 +45,9 @@ descends from SGLang's immutable `criu` extra pin, and has byte-identical
 package/build inputs (`pyproject.toml`, `uv.lock`, `python/`, and `kernels/`).
 This permits newer recipe-only commits without changing installed code. It
 installs both mounted packages as editable packages without a `PYTHONPATH`
-overlay. The image pins FlashInfer Python and cubin packages to 0.6.12,
-matching `python/pyproject.toml`.
+overlay. The image builds FlashInfer Python 0.6.13 from the immutable combined
+collectives commit and pairs it with `flashinfer-cubin==0.6.13`, matching
+`python/pyproject.toml`.
 
 The CRIU `nvidiactl` plugin compiled by the runner only reopens
 `/dev/nvidiactl` descriptors. It does not checkpoint CUDA state.

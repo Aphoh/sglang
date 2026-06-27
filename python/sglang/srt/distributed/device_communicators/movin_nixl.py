@@ -1,4 +1,5 @@
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -6,6 +7,114 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+
+def _is_weak_contiguous(tensor: torch.Tensor) -> bool:
+    expected_stride = 1
+    for size, stride in zip(reversed(tensor.shape), reversed(tensor.stride())):
+        if size > 1 and stride != expected_stride:
+            return False
+        expected_stride *= size
+    return True
+
+
+class FlashInferSymmetricAllGather:
+    """SGLang adapter for FlashInfer's checkpointable symmetric all-gather."""
+
+    def __init__(
+        self,
+        group: Any,
+        device: torch.device,
+        group_name: str,
+        *,
+        max_elems: int,
+        restore_probe: bool = False,
+    ):
+        from flashinfer.comm import SymmetricAllGatherWorkspace
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
+            TorchDistributedCommBackend,
+        )
+
+        self.control_group = group
+        self.device = device
+        self.group_name = group_name
+        self.restore_probe = restore_probe
+        self.workspace = SymmetricAllGatherWorkspace(
+            max_elems=max_elems,
+            world_size=group.size(),
+            rank=group.rank(),
+            comm_backend=TorchDistributedCommBackend(group),
+            dtype=torch.bfloat16,
+        )
+
+    @contextmanager
+    def capture(self):
+        yield
+
+    def should_all_gather(
+        self,
+        input_: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> bool:
+        return (
+            input_.dim() > 0
+            and input_.dtype == self.workspace.dtype
+            and input_.device == self.device
+            and _is_weak_contiguous(input_)
+            and input_.numel() <= self.workspace.max_elems
+            and (
+                output is None
+                or (
+                    output.dtype == input_.dtype
+                    and output.device == input_.device
+                    and output.is_contiguous()
+                    and output.numel() == input_.numel() * self.workspace.world_size
+                )
+            )
+        )
+
+    def all_gather(
+        self,
+        input_: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.should_all_gather(input_, output):
+            raise RuntimeError("FlashInfer all-gather does not support this input")
+        return self.workspace.all_gather(input_.contiguous(), output)
+
+    def prepare_checkpoint(self) -> None:
+        self.workspace.prepare_checkpoint()
+
+    def set_control_group(self, group: Any) -> None:
+        self.control_group = group
+
+    def restore_after_checkpoint(self) -> None:
+        if self.control_group is None:
+            raise RuntimeError("FlashInfer all-gather has no restored control group")
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
+            TorchDistributedCommBackend,
+        )
+
+        self.workspace.restore_after_checkpoint(
+            TorchDistributedCommBackend(self.control_group)
+        )
+        if self.restore_probe:
+            self._run_restore_probe()
+
+    def status(self) -> list[int]:
+        return self.workspace.status()
+
+    def close(self) -> None:
+        self.workspace.destroy()
+
+    def _run_restore_probe(self) -> None:
+        input_ = torch.zeros(8, dtype=self.workspace.dtype, device=self.device)
+        output = self.workspace.all_gather(input_)
+        torch.cuda.synchronize(self.device)
+        if torch.count_nonzero(output).item():
+            raise RuntimeError("restored FlashInfer all-gather probe was nonzero")
+        status = self.workspace.status()
+        if status[1:] != [0, 0, 0]:
+            raise RuntimeError(f"FlashInfer all-gather failed: {status}")
 
 
 @dataclass(frozen=True)
@@ -66,7 +175,6 @@ def create_movin_collectives(
     from movin import (
         CollectiveManager,
         TorchDistributedNixlAllReduce,
-        TorchDistributedSymmetricAllGather,
     )
 
     all_reduce = None
@@ -89,7 +197,7 @@ def create_movin_collectives(
 
     all_gather = None
     if config.enable_all_gather:
-        all_gather = TorchDistributedSymmetricAllGather(
+        all_gather = FlashInferSymmetricAllGather(
             group=group,
             device=device,
             group_name=group_name,

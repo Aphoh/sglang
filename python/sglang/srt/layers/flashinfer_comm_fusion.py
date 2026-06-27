@@ -242,7 +242,7 @@ class FlashInferWorkspaceManager:
         self.hidden_dim = None
         self.dtype = None
         self.initialized = False
-        self.checkpoint = None
+        self.checkpointable = False
 
     @contextmanager
     def capture(self):
@@ -306,17 +306,26 @@ class FlashInferWorkspaceManager:
                         "Checkpointable FlashInfer workspaces require a CPU "
                         "communication backend"
                     )
-                from movin import (
-                    CheckpointableFlashInferWorkspace,
-                    TorchDistributedHandleBackend,
+                from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
+                    TorchDistributedCommBackend,
                 )
 
-                comm_backend = TorchDistributedHandleBackend(cpu_group)
+                comm_backend = TorchDistributedCommBackend(cpu_group)
                 kwargs["comm_backend"] = comm_backend
-                self.checkpoint = CheckpointableFlashInferWorkspace()
-                with self.checkpoint.allocation_context(comm_backend, rank):
-                    self.workspace = create_workspace(**kwargs)
-                self.checkpoint.bind(self.workspace, rank)
+                self.workspace = create_workspace(**kwargs)
+                if not all(
+                    hasattr(self.workspace, method)
+                    for method in (
+                        "prepare_checkpoint",
+                        "restore_after_checkpoint",
+                        "checkpoint_detached",
+                    )
+                ):
+                    raise RuntimeError(
+                        "Installed FlashInfer lacks checkpointable TRT-LLM "
+                        "all-reduce workspace support"
+                    )
+                self.checkpointable = True
             else:
                 if (
                     _flashinfer_create_workspace_supports_comm_backend
@@ -376,16 +385,19 @@ class FlashInferWorkspaceManager:
 
     @property
     def criu_detached(self) -> bool:
-        return self.checkpoint is not None and self.checkpoint.detached
+        return bool(
+            self.workspace is not None
+            and getattr(self.workspace, "checkpoint_detached", False)
+        )
 
     def prepare_checkpoint(self) -> None:
         if not self.initialized or self.workspace is None:
             return
-        if self.checkpoint is None:
+        if not self.checkpointable:
             raise RuntimeError(
                 "FlashInfer workspace was not created with checkpointable memory"
             )
-        self.checkpoint.prepare_checkpoint()
+        self.workspace.prepare_checkpoint()
         self.group = (None, None)
         logger.info("Detached FlashInfer TRT-LLM workspace for CRIU")
 
@@ -408,8 +420,11 @@ class FlashInferWorkspaceManager:
                 device_group = coordinator.device_group
             if cpu_group is None:
                 cpu_group = coordinator.cpu_group
-        self.checkpoint.set_control_group(cpu_group)
-        self.checkpoint.restore_after_checkpoint()
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
+            TorchDistributedCommBackend,
+        )
+
+        self.workspace.restore_after_checkpoint(TorchDistributedCommBackend(cpu_group))
         self.group = (device_group, cpu_group)
         logger.info("Restored FlashInfer TRT-LLM workspace after CRIU")
 
@@ -417,9 +432,7 @@ class FlashInferWorkspaceManager:
         self.restore_after_criu()
 
     def status(self) -> list[int] | None:
-        if self.checkpoint is None:
-            return None
-        return self.checkpoint.status()
+        return None
 
     def close(self) -> None:
         self.cleanup()
@@ -440,9 +453,7 @@ class FlashInferWorkspaceManager:
         self.max_token_num = None
         self.hidden_dim = None
         self.dtype = None
-        if self.checkpoint is not None:
-            self.checkpoint.reset()
-        self.checkpoint = None
+        self.checkpointable = False
 
 
 def _get_moe_workspace_coordinator():

@@ -42,21 +42,24 @@ def test_disabled_config_does_not_import_movin(monkeypatch):
         restore_probe=False,
     )
 
-    assert create_movin_collectives(
-        object(),
-        torch.device("cpu"),
-        "tp",
-        config,
-    ) is None
+    assert (
+        create_movin_collectives(
+            object(),
+            torch.device("cpu"),
+            "tp",
+            config,
+        )
+        is None
+    )
 
 
 def test_create_movin_collectives_uses_unified_manager(monkeypatch):
     fake_movin = SimpleNamespace(
         CollectiveManager=FakeManager,
         TorchDistributedNixlAllReduce=FakeBackend,
-        TorchDistributedSymmetricAllGather=FakeBackend,
     )
     monkeypatch.setitem(sys.modules, "movin", fake_movin)
+    monkeypatch.setattr(MODULE, "FlashInferSymmetricAllGather", FakeBackend)
     checkpoint_participants = {"flashinfer_attention": object()}
     monkeypatch.setitem(
         sys.modules,
@@ -105,7 +108,6 @@ def test_checkpoint_only_config_still_creates_lifecycle_manager(monkeypatch):
     fake_movin = SimpleNamespace(
         CollectiveManager=FakeManager,
         TorchDistributedNixlAllReduce=FakeBackend,
-        TorchDistributedSymmetricAllGather=FakeBackend,
     )
     participant = object()
     monkeypatch.setitem(sys.modules, "movin", fake_movin)
