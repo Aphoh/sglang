@@ -712,6 +712,9 @@ class Req(ReqDllmMixin):
         self.kv_allocated_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        # This request already owns a complete KV layout and must enter decode
+        # through the prebuilt admission path rather than ordinary prefill.
+        self.has_prebuilt_kv = False
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids

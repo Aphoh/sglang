@@ -17,9 +17,9 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.managers.schedule_batch import (
-    Req,
-    ScheduleBatch,
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.scheduler_components.result_disposition import (
+    ResultDispositionHandler,
 )
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
@@ -79,23 +79,12 @@ class SchedulerBatchResultProcessor:
     output_streamer: "SchedulerOutputStreamer"
     abort_request: Callable
     maybe_park_decode_migration_at_boundary: Optional[Callable] = None
+    result_disposition: ResultDispositionHandler = ResultDispositionHandler()
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
-        # Request migration can admit a transferred prebuilt batch on an
-        # otherwise aggregated worker. Reject every other non-decode caller.
-        assert self.disaggregation_mode == DisaggregationMode.DECODE or (
-            self.server_args.enable_decode_migration
-            and all(
-                getattr(req, "is_decode_migration_destination", False)
-                for req in batch.reqs
-            )
-        )
         use_free_group = (
             self.server_args.disaggregation_decode_enable_radix_cache
-            or any(
-                getattr(req, "is_decode_migration_destination", False)
-                for req in batch.reqs
-            )
+            or any(req.has_prebuilt_kv for req in batch.reqs)
         )
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()
@@ -196,6 +185,7 @@ class SchedulerBatchResultProcessor:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        discarded_result_reqs: list[Req] = []
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -231,11 +221,10 @@ class SchedulerBatchResultProcessor:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if (
-                    req.finished()
-                    or req.is_retracted
-                    or getattr(req, "is_decode_migration_source_parked", False)
-                ):
+                discarded_result = self.result_disposition.should_discard(req)
+                if req.finished() or req.is_retracted or discarded_result:
+                    if discarded_result:
+                        discarded_result_reqs.append(req)
                     # decode req in mixed batch or retracted req
                     continue
 
@@ -351,13 +340,19 @@ class SchedulerBatchResultProcessor:
                     req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self.output_streamer.stream_output(
-            batch.reqs, batch.return_logprob, skip_stream_req
+        stream_reqs = self.result_disposition.without_discarded(
+            batch.reqs, discarded_result_reqs
         )
+        if stream_reqs:
+            self.output_streamer.stream_output(
+                stream_reqs, batch.return_logprob, skip_stream_req
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
-            batch=batch,
+            batch=self.result_disposition.batch_without_discarded(
+                batch, discarded_result_reqs
+            ),
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
@@ -656,6 +651,7 @@ class SchedulerBatchResultProcessor:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+        discarded_result_reqs: list[Req] = []
 
         # Spec V1 handles output_ids, update_finish_state, grammar, and reasoning tokens
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
@@ -664,7 +660,8 @@ class SchedulerBatchResultProcessor:
         for i, req in enumerate(batch.reqs):
             req: Req
 
-            if getattr(req, "is_decode_migration_source_parked", False):
+            if self.result_disposition.should_discard(req):
+                discarded_result_reqs.append(req)
                 continue
 
             if (self.enable_overlap or self.enable_overlap_mlx) and (
@@ -737,15 +734,23 @@ class SchedulerBatchResultProcessor:
                     req=req, next_token_id=next_token_id, batch=batch
                 )
 
-        self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        stream_reqs = self.result_disposition.without_discarded(
+            batch.reqs, discarded_result_reqs
+        )
+        if stream_reqs:
+            self.output_streamer.stream_output(stream_reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
+
+        self.metrics_reporter.num_generated_tokens -= len(discarded_result_reqs)
 
         self.metrics_reporter.forward_ct_decode = (
             self.metrics_reporter.forward_ct_decode + 1
         ) % (1 << 30)
         self.metrics_reporter.report_decode_stats(
             can_run_cuda_graph,
-            running_batch=batch,
+            running_batch=self.result_disposition.batch_without_discarded(
+                batch, discarded_result_reqs
+            ),
             num_correct_drafts=result.num_correct_drafts,
         )
 

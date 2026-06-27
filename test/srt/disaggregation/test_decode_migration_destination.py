@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.disaggregation.decode_migration import SchedulerDecodeMigrationMixin
+from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 
@@ -12,6 +12,7 @@ from sglang.srt.managers.scheduler import Scheduler
 class _FakeBatch:
     def __init__(self, reqs):
         self.reqs = reqs
+        self.batch_is_full = True
 
     def prepare_for_prebuilt(self):
         pass
@@ -32,7 +33,10 @@ class DecodeMigrationDestinationAdmissionTests(unittest.TestCase):
         running_batch.batch_size.return_value = 0
         running_batch.is_empty.return_value = True
         return SimpleNamespace(
-            server_args=SimpleNamespace(enable_decode_migration=True),
+            server_args=SimpleNamespace(
+                enable_decode_migration=True,
+                disaggregation_decode_enable_radix_cache=False,
+            ),
             disaggregation_mode=DisaggregationMode.NULL,
             waiting_queue=[req],
             req_to_token_pool=SimpleNamespace(size=4),
@@ -43,23 +47,31 @@ class DecodeMigrationDestinationAdmissionTests(unittest.TestCase):
             spec_algorithm=object(),
             max_running_requests=4,
             running_batch=running_batch,
+            chunked_req=None,
             future_map={},
+            grammar_manager=SimpleNamespace(
+                has_waiting_grammars=lambda: False,
+            ),
+            enable_priority_scheduling=False,
+            enable_hisparse=False,
             batch_result_processor=SimpleNamespace(
                 process_batch_result_prebuilt=MagicMock()
             ),
         )
 
     @patch(
-        "sglang.srt.disaggregation.decode_migration.set_time_batch",
+        "sglang.srt.disaggregation.decode.set_time_batch",
         autospec=True,
     )
     @patch(
-        "sglang.srt.disaggregation.decode_migration.ScheduleBatch.init_new",
+        "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
         autospec=True,
     )
-    def test_preserves_preallocated_radix_prefix(self, init_new, _set_time_batch):
+    def test_migration_uses_shared_prebuilt_admission_path(
+        self, init_new, _set_time_batch
+    ):
         req = SimpleNamespace(
-            is_decode_migration_destination=True,
+            has_prebuilt_kv=True,
             last_node=object(),
             kv_committed_len=12,
             prefix_indices=torch.arange(4),
@@ -67,11 +79,16 @@ class DecodeMigrationDestinationAdmissionTests(unittest.TestCase):
             set_extend_input_len=MagicMock(),
             fill_len=0,
         )
+        ordinary_req = SimpleNamespace(has_prebuilt_kv=False)
         scheduler = self._scheduler(req)
+        scheduler.waiting_queue.append(ordinary_req)
         batch = _FakeBatch([req])
         init_new.return_value = batch
 
-        SchedulerDecodeMigrationMixin.admit_ready_decode_migrations(scheduler)
+        new_batch = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+            scheduler, prebuilt_kv_only=True
+        )
+        SchedulerDisaggregationDecodeMixin.admit_prebuilt_batch(scheduler, new_batch)
 
         req.init_next_round_input.assert_called_once_with(None)
         self.assertEqual(req.fill_len, 12)
@@ -80,20 +97,21 @@ class DecodeMigrationDestinationAdmissionTests(unittest.TestCase):
             batch
         )
         self.assertIs(scheduler.running_batch, batch)
+        self.assertEqual(scheduler.waiting_queue, [ordinary_req])
 
     @patch(
-        "sglang.srt.disaggregation.decode_migration.set_time_batch",
+        "sglang.srt.disaggregation.decode.set_time_batch",
         autospec=True,
     )
     @patch(
-        "sglang.srt.disaggregation.decode_migration.ScheduleBatch.init_new",
+        "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
         autospec=True,
     )
     def test_preserves_full_transfer_when_no_radix_prefix_was_matched(
         self, init_new, _set_time_batch
     ):
         req = SimpleNamespace(
-            is_decode_migration_destination=True,
+            has_prebuilt_kv=True,
             last_node=None,
             kv_committed_len=12,
             prefix_indices=torch.empty(0, dtype=torch.int64),
@@ -104,7 +122,10 @@ class DecodeMigrationDestinationAdmissionTests(unittest.TestCase):
         scheduler = self._scheduler(req)
         init_new.return_value = _FakeBatch([req])
 
-        SchedulerDecodeMigrationMixin.admit_ready_decode_migrations(scheduler)
+        new_batch = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+            scheduler, prebuilt_kv_only=True
+        )
+        SchedulerDisaggregationDecodeMixin.admit_prebuilt_batch(scheduler, new_batch)
 
         req.init_next_round_input.assert_called_once_with(None)
 
@@ -145,6 +166,38 @@ class DecodeMigrationReceiverInitializationTests(unittest.TestCase):
         create_queues.assert_called_once_with(scheduler, None, enable_radix_cache=True)
         self.assertIs(scheduler.disagg_decode_prealloc_queue, prealloc_queue)
         self.assertIs(scheduler.disagg_decode_transfer_queue, transfer_queue)
+
+
+class DecodeMigrationDestinationTimeoutTests(unittest.TestCase):
+    @patch("sglang.srt.managers.scheduler.release_kv_cache")
+    @patch("sglang.srt.managers.scheduler.time.perf_counter", return_value=20)
+    @patch(
+        "sglang.srt.managers.scheduler.envs.SGLANG_REQ_WAITING_TIMEOUT.get",
+        return_value=10,
+    )
+    def test_waiting_timeout_releases_prebuilt_destination_kv(
+        self, _timeout, _clock, release_kv_cache
+    ):
+        req = MagicMock(
+            rid="destination",
+            has_prebuilt_kv=True,
+            time_stats=SimpleNamespace(wait_queue_entry_time=1),
+        )
+        tree_cache = object()
+        scheduler = SimpleNamespace(
+            waiting_queue=[req],
+            enable_hicache_storage=False,
+            disaggregation_mode=DisaggregationMode.NULL,
+            tree_cache=tree_cache,
+            ipc_channels=SimpleNamespace(
+                send_to_tokenizer=SimpleNamespace(send_output=MagicMock())
+            ),
+        )
+
+        Scheduler._abort_on_waiting_timeout(scheduler)
+
+        self.assertEqual(scheduler.waiting_queue, [])
+        release_kv_cache.assert_called_once_with(req, tree_cache)
 
 
 if __name__ == "__main__":

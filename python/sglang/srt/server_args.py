@@ -955,6 +955,7 @@ class ServerArgs:
         self._validate_prefill_only_disable_kv_cache_args()
 
         if self.model_path.lower() in ["none", "dummy"]:
+            self._validate_decode_migration()
             # Skip for dummy models
             return
 
@@ -1034,6 +1035,7 @@ class ServerArgs:
 
         # Handle data parallelism.
         self._handle_data_parallelism()
+        self._validate_decode_migration()
 
         # Re-apply after model-specific defaults resolve attention_backend so
         # canonical CP mirrors to the right legacy runtime aliases.
@@ -1115,6 +1117,19 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+    def _validate_decode_migration(self):
+        if (
+            self.enable_decode_migration
+            and self.enable_dp_attention
+            and self.dp_size > 1
+            and not self.enable_dp_attention_local_control_broadcast
+        ):
+            raise ValueError(
+                "--enable-decode-migration with --enable-dp-attention and "
+                "--dp-size > 1 requires "
+                "--enable-dp-attention-local-control-broadcast"
+            )
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""

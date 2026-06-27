@@ -96,6 +96,28 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertIn("('nixl', 'mooncake')", str(context.exception))
         self.assertIn("'fake'", str(context.exception))
 
+    def test_decode_migration_requires_local_dp_control_broadcast(self):
+        with self.assertRaisesRegex(
+            ValueError, "enable-dp-attention-local-control-broadcast"
+        ):
+            ServerArgs(
+                model_path="dummy",
+                enable_decode_migration=True,
+                enable_dp_attention=True,
+                dp_size=2,
+            )
+
+    def test_decode_migration_allows_local_dp_control_broadcast(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_decode_migration=True,
+            enable_dp_attention=True,
+            enable_dp_attention_local_control_broadcast=True,
+            dp_size=2,
+        )
+
+        self.assertTrue(server_args.enable_decode_migration)
+
 
 class TestContextParallelServerArgs(CustomTestCase):
     def setUp(self):

@@ -207,6 +207,9 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.managers.scheduler_components.result_disposition import (
+    ResultDispositionHandler,
+)
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -1466,10 +1469,6 @@ class Scheduler(
         ] = deque()
 
         def pop_and_process():
-            # Migration may resolve the outstanding result before parking a
-            # request. Preserve the normal overlap loop without processing it twice.
-            if self._decode_migration_overlap_result_processed:
-                return
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
@@ -1518,7 +1517,6 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
-            self._decode_migration_overlap_result_processed = False
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
@@ -1705,7 +1703,7 @@ class Scheduler(
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
             get_decode_migration_reqs=lambda: (
-                record.req for record in self.decode_migration_transfers.values()
+                record.req for record in self.decode_migrations.transfers()
             ),
         )
 
@@ -1786,6 +1784,13 @@ class Scheduler(
                 self.maybe_park_decode_migration_at_boundary
                 if self.server_args.enable_decode_migration
                 else None
+            ),
+            result_disposition=ResultDispositionHandler(
+                get_disposition=(
+                    self.get_decode_migration_result_disposition
+                    if self.server_args.enable_decode_migration
+                    else None
+                )
             ),
         )
 
@@ -2200,7 +2205,7 @@ class Scheduler(
                 self.server_args.enable_decode_migration
                 and req.bootstrap_room is not None
             ):
-                req.is_decode_migration_destination = True
+                req.has_prebuilt_kv = True
                 self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
                 if not is_retracted:
                     req.time_stats.set_decode_prealloc_queue_entry_time()
@@ -2324,6 +2329,11 @@ class Scheduler(
                     ),
                     req,
                 )
+                if (
+                    self.disaggregation_mode == DisaggregationMode.DECODE
+                    or req.has_prebuilt_kv
+                ):
+                    release_kv_cache(req, self.tree_cache)
                 deleted_reqs.add(req)
 
         if deleted_reqs:
@@ -2531,9 +2541,13 @@ class Scheduler(
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
-        # Destination migrations arrive with their KV already populated. Admit
-        # them as prebuilt decode requests before considering ordinary prefills.
-        self.admit_ready_decode_migrations()
+        # Destination migrations arrive with their KV already populated. They
+        # share the decode disaggregation prebuilt-admission path, while normal
+        # requests continue through ordinary prefill below.
+        if self.server_args.enable_decode_migration:
+            self.admit_prebuilt_batch(
+                self.get_new_prebuilt_batch(prebuilt_kv_only=True)
+            )
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
@@ -2892,6 +2906,30 @@ class Scheduler(
             return self.tp_worker.model_runner.lora_manager.validate_lora_batch(
                 new_lora_set
             )
+
+    def detach_request_from_scheduling(self, req: Req) -> bool:
+        """Remove a request from every scheduler batch that can retain it."""
+        removed_from_running = False
+        seen_batches = set()
+        for batch in (self.running_batch, self.last_batch, self.cur_batch):
+            if batch is None or id(batch) in seen_batches:
+                continue
+            seen_batches.add(id(batch))
+            if all(candidate is not req for candidate in batch.reqs):
+                continue
+            keep_indices = [
+                i for i, candidate in enumerate(batch.reqs) if candidate is not req
+            ]
+            batch.filter_batch(keep_indices=keep_indices)
+            if batch.decoding_reqs is not None:
+                batch.decoding_reqs = [
+                    candidate
+                    for candidate in batch.decoding_reqs
+                    if candidate is not req
+                ]
+            batch.batch_is_full = False
+            removed_from_running |= batch is self.running_batch
+        return removed_from_running
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
@@ -3401,7 +3439,7 @@ class Scheduler(
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
-            and not self.decode_migration_transfers
+            and not self.decode_migrations.has_active_transfers()
             and self._pp_microbatches_drained()
         )
 
@@ -3698,9 +3736,10 @@ class Scheduler(
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
-            # Decode-mode and migrated destination requests already own KV.
-            if self.disaggregation_mode == DisaggregationMode.DECODE or getattr(
-                req, "is_decode_migration_destination", False
+            # Decode-mode and prebuilt-KV requests already own KV.
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                or req.has_prebuilt_kv
             ):
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index

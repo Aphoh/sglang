@@ -1,16 +1,18 @@
 """Request-local support for live decode-to-decode migration.
 
 The destination reuses SGLang's disaggregated-decode receiver. The source
-resolves any outstanding overlap result, removes only the target request from
-scheduling, and retains its KV until one-way finalization.
+removes only the target request from scheduling, retains its KV until one-way
+finalization, and lets normal overlap result processing discard the one stale
+source result that may already be in flight.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Optional
+from dataclasses import dataclass, field, replace
+from enum import Enum
+from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode_migration_state import (
@@ -30,9 +32,11 @@ from sglang.srt.managers.io_struct import (
     PrepareDecodeMigrationReqInput,
     PrepareDecodeMigrationReqOutput,
 )
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.result_disposition import (
+    ResultDisposition,
+)
 from sglang.srt.mem_cache.common import kv_to_page_indices, release_kv_cache
-from sglang.srt.observability.req_time_stats import set_time_batch
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base import BaseKVManager, BaseKVSender
@@ -41,11 +45,31 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class DecodeMigrationState(str, Enum):
+    BOOTSTRAPPING = "bootstrapping"
+    TRANSFERRING = "transferring"
+    TRANSFERRED = "transferred"
+    AWAITING_STALE_RESULT = "awaiting_stale_result"
+
+
+@dataclass
+class ArmedDecodeMigration:
+    request: PrepareDecodeMigrationReqInput
+
+    @property
+    def migration_id(self) -> str:
+        return self.request.migration_id
+
+    @property
+    def rid(self) -> str:
+        return self.request.rid
+
+
 @dataclass
 class DecodeMigrationTransfer:
     migration_id: str
     req: Req
-    sender: "BaseKVSender"
+    sender: "BaseKVSender | None"
     metadata_buffer_index: int
     bootstrap_room: int
     committed_len: int
@@ -56,21 +80,102 @@ class DecodeMigrationTransfer:
     transfer_start: int = 0
     transfer_end: int = 0
     send_started: bool = False
-    status: str = "bootstrapping"
-    error: Optional[str] = None
-    source_released: bool = False
+    state: DecodeMigrationState = DecodeMigrationState.BOOTSTRAPPING
+
+    @property
+    def rid(self) -> str:
+        return self.req.rid
+
+
+@dataclass
+class DecodeMigrationRegistry:
+    """Own source migration lifecycle state indexed by migration and request."""
+
+    _by_migration_id: dict[str, ArmedDecodeMigration | DecodeMigrationTransfer] = field(
+        default_factory=dict
+    )
+    _migration_id_by_rid: dict[str, str] = field(default_factory=dict)
+
+    def get(
+        self, migration_id: str
+    ) -> ArmedDecodeMigration | DecodeMigrationTransfer | None:
+        return self._by_migration_id.get(migration_id)
+
+    def get_for_rid(
+        self, rid: str
+    ) -> ArmedDecodeMigration | DecodeMigrationTransfer | None:
+        migration_id = self._migration_id_by_rid.get(rid)
+        return self.get(migration_id) if migration_id is not None else None
+
+    def arm(self, request: PrepareDecodeMigrationReqInput) -> ArmedDecodeMigration:
+        existing = self.get(request.migration_id)
+        if existing is not None:
+            assert existing.rid == request.rid
+            assert isinstance(existing, ArmedDecodeMigration)
+            return existing
+        assert self.get_for_rid(request.rid) is None
+        arm = ArmedDecodeMigration(request)
+        self._by_migration_id[arm.migration_id] = arm
+        self._migration_id_by_rid[arm.rid] = arm.migration_id
+        return arm
+
+    def activate(self, record: DecodeMigrationTransfer) -> None:
+        existing = self.get(record.migration_id)
+        if existing is not None:
+            assert existing.rid == record.req.rid
+        by_rid = self.get_for_rid(record.req.rid)
+        if by_rid is not None:
+            assert by_rid.migration_id == record.migration_id
+        self._by_migration_id[record.migration_id] = record
+        self._migration_id_by_rid[record.req.rid] = record.migration_id
+
+    def discard(
+        self, migration_id: str
+    ) -> ArmedDecodeMigration | DecodeMigrationTransfer | None:
+        entry = self._by_migration_id.pop(migration_id, None)
+        if (
+            entry is not None
+            and self._migration_id_by_rid.get(entry.rid) == migration_id
+        ):
+            self._migration_id_by_rid.pop(entry.rid, None)
+        return entry
+
+    def arms(self) -> tuple[ArmedDecodeMigration, ...]:
+        return tuple(
+            entry
+            for entry in self._by_migration_id.values()
+            if isinstance(entry, ArmedDecodeMigration)
+        )
+
+    def transfers(self) -> tuple[DecodeMigrationTransfer, ...]:
+        return tuple(
+            entry
+            for entry in self._by_migration_id.values()
+            if isinstance(entry, DecodeMigrationTransfer)
+        )
+
+    def has_active_transfers(self) -> bool:
+        return any(
+            isinstance(entry, DecodeMigrationTransfer)
+            and entry.state != DecodeMigrationState.AWAITING_STALE_RESULT
+            for entry in self._by_migration_id.values()
+        )
+
+    def get_transfer_for_req(self, req: Req) -> DecodeMigrationTransfer | None:
+        entry = self.get_for_rid(req.rid)
+        return (
+            entry
+            if isinstance(entry, DecodeMigrationTransfer) and entry.req is req
+            else None
+        )
 
 
 class SchedulerDecodeMigrationMixin:
     """Scheduler control plane for source-side decode migration."""
 
     def init_decode_migration(self: "Scheduler") -> None:
-        self.decode_migration_transfers: Dict[str, DecodeMigrationTransfer] = {}
-        self.decode_migration_by_rid: Dict[str, str] = {}
-        self.decode_migration_arms: Dict[str, PrepareDecodeMigrationReqInput] = {}
-        self.decode_migration_arm_by_rid: Dict[str, str] = {}
+        self.decode_migrations = DecodeMigrationRegistry()
         self._decode_migration_kv_manager: Optional[BaseKVManager] = None
-        self._decode_migration_overlap_result_processed = False
         if not self.server_args.enable_decode_migration:
             return
         # Fail startup early on transfer-backend incompatibility.
@@ -103,65 +208,6 @@ class SchedulerDecodeMigrationMixin:
             return
         self.process_decode_queue()
 
-    def admit_ready_decode_migrations(self: "Scheduler") -> None:
-        """Merge transferred destination requests without recomputing their KV."""
-        if (
-            not self.server_args.enable_decode_migration
-            or self.disaggregation_mode == DisaggregationMode.DECODE
-        ):
-            return
-
-        ready = [
-            req
-            for req in self.waiting_queue
-            if getattr(req, "is_decode_migration_destination", False)
-        ]
-        if not ready:
-            return
-
-        available = min(self.req_to_token_pool.size, self.max_running_requests)
-        available -= self.running_batch.batch_size()
-        if available <= 0:
-            return
-        selected = ready[:available]
-        selected_ids = {id(req) for req in selected}
-        self.waiting_queue = [
-            req for req in self.waiting_queue if id(req) not in selected_ids
-        ]
-
-        for req in selected:
-            # Decode preallocation already established the complete destination
-            # KV layout, with or without decode-side radix matching. Preserve
-            # that exact ownership state. Re-matching here can observe a prefix
-            # inserted while transfer was in flight and mark transferred indices
-            # as cache-protected even though this request does not own that lock.
-            req.init_next_round_input(None)
-            if req.kv_committed_len is not None:
-                req.fill_len = req.kv_committed_len
-                req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
-        set_time_batch(selected, "set_forward_entry_time")
-
-        batch = ScheduleBatch.init_new(
-            selected,
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            self.tree_cache,
-            self.model_config,
-            self.enable_overlap,
-            self.spec_algorithm,
-        )
-        batch.prepare_for_prebuilt()
-        batch.process_prebuilt(self.server_args, self.future_map)
-        self.batch_result_processor.process_batch_result_prebuilt(batch)
-        batch.filter_batch()
-        if batch.is_empty():
-            return
-        if self.running_batch.is_empty():
-            self.running_batch = batch
-        else:
-            self.running_batch.merge_batch(batch)
-        self.running_batch.batch_is_full = False
-
     def abort_decode_migration_receive(self: "Scheduler", recv_req) -> None:
         """Abort matching destination handshakes and parked source requests."""
         if not self.server_args.enable_decode_migration:
@@ -174,16 +220,13 @@ class SchedulerDecodeMigrationMixin:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     decode_req.kv_receiver.abort()
 
-        for migration_id, record in list(self.decode_migration_transfers.items()):
+        for record in self.decode_migrations.transfers():
             if recv_req.abort_all or record.req.rid.startswith(recv_req.rid):
-                self._release_decode_migration_source(record)
-                self._release_decode_migration_transport(record)
-                self.decode_migration_transfers.pop(migration_id, None)
-                self.decode_migration_by_rid.pop(record.req.rid, None)
+                self._close_decode_migration(record)
 
-        for migration_id, arm in list(self.decode_migration_arms.items()):
+        for arm in self.decode_migrations.arms():
             if recv_req.abort_all or arm.rid.startswith(recv_req.rid):
-                self._clear_decode_migration_arm(migration_id, arm.rid)
+                self.decode_migrations.discard(arm.migration_id)
 
     def _find_decode_migration_req(self: "Scheduler", rid: str) -> Optional[Req]:
         for req in self.running_batch.reqs:
@@ -209,97 +252,114 @@ class SchedulerDecodeMigrationMixin:
             **state,
         )
 
-    def _resolve_decode_migration_overlap_result(self: "Scheduler") -> None:
-        """Resolve the outstanding overlap result once before request parking."""
-        if not self.enable_overlap or not self.result_queue:
-            return
-        if len(self.result_queue) != 1:
-            raise RuntimeError(
-                f"Expected at most one outstanding overlap result, got "
-                f"{len(self.result_queue)}"
-            )
-        batch, result = self.result_queue.popleft()
-        self.process_batch_result(batch, result)
-        self._decode_migration_overlap_result_processed = True
-
-    @staticmethod
-    def _filter_req_from_batch(batch: Optional[ScheduleBatch], req: Req) -> bool:
-        if batch is None or all(candidate is not req for candidate in batch.reqs):
-            return False
-        keep_indices = [
-            i for i, candidate in enumerate(batch.reqs) if candidate is not req
-        ]
-        batch.filter_batch(keep_indices=keep_indices)
-        if batch.decoding_reqs is not None:
-            batch.decoding_reqs = [
-                candidate for candidate in batch.decoding_reqs if candidate is not req
-            ]
-        batch.batch_is_full = False
-        return True
-
     def _park_decode_migration_req(self: "Scheduler", req: Req) -> None:
-        req.is_decode_migration_source_parked = True
-        removed = self._filter_req_from_batch(self.running_batch, req)
-        if self.last_batch is not self.running_batch:
-            self._filter_req_from_batch(self.last_batch, req)
-        if (
-            self.cur_batch is not None
-            and self.cur_batch is not self.running_batch
-            and self.cur_batch is not self.last_batch
-        ):
-            self._filter_req_from_batch(self.cur_batch, req)
-        if not removed:
+        if not self.detach_request_from_scheduling(req):
             raise RuntimeError("Request left the running decode batch before migration")
 
     def _clear_decode_migration_arm(
         self: "Scheduler", migration_id: str, rid: str
     ) -> None:
-        self.decode_migration_arms.pop(migration_id, None)
-        if self.decode_migration_arm_by_rid.get(rid) == migration_id:
-            self.decode_migration_arm_by_rid.pop(rid, None)
+        entry = self.decode_migrations.get(migration_id)
+        if isinstance(entry, ArmedDecodeMigration) and entry.rid == rid:
+            self.decode_migrations.discard(migration_id)
 
     def maybe_park_decode_migration_at_boundary(self: "Scheduler", req: Req) -> bool:
-        migration_id = self.decode_migration_arm_by_rid.get(req.rid)
-        if migration_id is None:
-            return False
-        arm = self.decode_migration_arms.get(migration_id)
-        if arm is None:
-            self.decode_migration_arm_by_rid.pop(req.rid, None)
+        arm = self.decode_migrations.get_for_rid(req.rid)
+        if not isinstance(arm, ArmedDecodeMigration):
             return False
         if req.finished() or req.to_finish is not None:
-            self._clear_decode_migration_arm(migration_id, req.rid)
+            self._clear_decode_migration_arm(arm.migration_id, req.rid)
             return False
-        target = arm.target_sequence_length
+        target = arm.request.target_sequence_length
         logical_len = len(req.origin_input_ids) + len(req.output_ids)
         if target is None or logical_len < target:
             return False
 
-        self._clear_decode_migration_arm(migration_id, req.rid)
-        output = self._prepare_decode_migration_now(arm, req=req, resolve_overlap=False)
+        self.decode_migrations.discard(arm.migration_id)
+        output = self._prepare_decode_migration_now(arm.request, req=req)
         if not output.success:
             logger.error(
                 "Failed to park armed decode migration rid=%s migration_id=%s "
                 "status=%s error=%s",
                 req.rid,
-                migration_id,
+                arm.migration_id,
                 output.status,
                 output.error,
             )
             return False
         return True
 
+    def get_decode_migration_result_disposition(
+        self: "Scheduler", req: Req
+    ) -> ResultDisposition:
+        record = self.decode_migrations.get_transfer_for_req(req)
+        if record is None:
+            return ResultDisposition.PROCESS
+        if record.state == DecodeMigrationState.AWAITING_STALE_RESULT:
+            self._release_decode_migration_source(record)
+            self.decode_migrations.discard(record.migration_id)
+        return ResultDisposition.DISCARD
+
+    def _armed_output(
+        self: "Scheduler",
+        recv_req: PrepareDecodeMigrationReqInput,
+        arm: ArmedDecodeMigration,
+        logical_len: int,
+    ) -> PrepareDecodeMigrationReqOutput:
+        return PrepareDecodeMigrationReqOutput(
+            rid=recv_req.rid,
+            migration_id=arm.migration_id,
+            success=True,
+            status="armed",
+            bootstrap_host=arm.request.bootstrap_host,
+            bootstrap_port=arm.request.bootstrap_port,
+            bootstrap_room=arm.request.bootstrap_room,
+            logical_len=logical_len,
+            output_tokens_seen=arm.request.output_tokens_seen,
+            source_dp_rank=self.ps.dp_rank or 0,
+        )
+
+    def _arm_decode_migration(
+        self: "Scheduler",
+        recv_req: PrepareDecodeMigrationReqInput,
+        logical_len: int,
+    ) -> PrepareDecodeMigrationReqOutput:
+        arm = self.decode_migrations.arm(recv_req)
+        logger.info(
+            "Armed decode migration rid=%s migration_id=%s target=%d current=%d",
+            arm.rid,
+            arm.migration_id,
+            arm.request.target_sequence_length,
+            logical_len,
+        )
+        return self._armed_output(recv_req, arm, logical_len)
+
     def _release_decode_migration_source(
         self: "Scheduler", record: DecodeMigrationTransfer
     ) -> None:
-        if record.source_released:
+        release_kv_cache(record.req, self.tree_cache, is_insert=False)
+        # A parked request no longer belongs to running_batch, so the
+        # scheduler can cache it as full while this transfer still owns
+        # the request-pool slot. Releasing that slot must reopen admission.
+        self.running_batch.batch_is_full = False
+
+    def _close_decode_migration(
+        self: "Scheduler", record: DecodeMigrationTransfer
+    ) -> None:
+        if record.state == DecodeMigrationState.AWAITING_STALE_RESULT:
             return
-        if record.req.req_pool_idx is not None:
-            release_kv_cache(record.req, self.tree_cache, is_insert=False)
-            # A parked request no longer belongs to running_batch, so the
-            # scheduler can cache it as full while this transfer still owns
-            # the request-pool slot. Releasing that slot must reopen admission.
-            self.running_batch.batch_is_full = False
-        record.source_released = True
+        self._release_decode_migration_transport(record)
+        if self._has_queued_decode_migration_result(record.req):
+            record.state = DecodeMigrationState.AWAITING_STALE_RESULT
+            return
+        self._release_decode_migration_source(record)
+        self.decode_migrations.discard(record.migration_id)
+
+    def _has_queued_decode_migration_result(self: "Scheduler", req: Req) -> bool:
+        return self.enable_overlap and any(
+            any(candidate is req for candidate in batch.reqs)
+            for batch, _ in self.result_queue
+        )
 
     def prepare_decode_migration(
         self: "Scheduler", recv_req: PrepareDecodeMigrationReqInput
@@ -310,20 +370,45 @@ class SchedulerDecodeMigrationMixin:
                 "error",
                 "Decode migration requires --enable-decode-migration",
             )
-
-        existing = self.decode_migration_by_rid.get(recv_req.rid)
-        if existing is not None:
-            record = self.decode_migration_transfers.get(existing)
-            if existing == recv_req.migration_id and record is not None:
-                return self._prepared_output(recv_req, record)
+        if not self.spec_algorithm.is_none():
             return self._prepare_failure(
-                recv_req, "busy", f"Request already has active migration {existing}"
+                recv_req,
+                "error",
+                "Decode migration does not support speculative decoding",
             )
 
-        armed = self.decode_migration_arm_by_rid.get(recv_req.rid)
-        if armed is not None and armed != recv_req.migration_id:
+        existing = self.decode_migrations.get_for_rid(recv_req.rid)
+        if isinstance(existing, DecodeMigrationTransfer):
+            if existing.state == DecodeMigrationState.AWAITING_STALE_RESULT:
+                return self._prepare_failure(
+                    recv_req,
+                    "finished",
+                    "Migration source is no longer active",
+                )
+            if existing.migration_id == recv_req.migration_id:
+                return self._prepared_output(recv_req, existing)
             return self._prepare_failure(
-                recv_req, "busy", f"Request already has armed migration {armed}"
+                recv_req,
+                "busy",
+                f"Request already has active migration {existing.migration_id}",
+            )
+
+        if (
+            isinstance(existing, ArmedDecodeMigration)
+            and existing.migration_id != recv_req.migration_id
+        ):
+            return self._prepare_failure(
+                recv_req,
+                "busy",
+                f"Request already has armed migration {existing.migration_id}",
+            )
+
+        same_id = self.decode_migrations.get(recv_req.migration_id)
+        if same_id is not None and same_id.rid != recv_req.rid:
+            return self._prepare_failure(
+                recv_req,
+                "busy",
+                f"Migration id already belongs to request {same_id.rid}",
             )
 
         req = self._find_decode_migration_req(recv_req.rid)
@@ -331,47 +416,27 @@ class SchedulerDecodeMigrationMixin:
         logical_len = (
             len(req.origin_input_ids) + len(req.output_ids) if req is not None else 0
         )
-        if target is not None and target > logical_len:
-            if target <= 0:
-                return self._prepare_failure(
-                    recv_req, "error", "target_sequence_length must be positive"
-                )
-            self.decode_migration_arms[recv_req.migration_id] = recv_req
-            self.decode_migration_arm_by_rid[recv_req.rid] = recv_req.migration_id
-            logger.info(
-                "Armed decode migration rid=%s migration_id=%s target=%d current=%d",
-                recv_req.rid,
-                recv_req.migration_id,
-                target,
-                logical_len,
-            )
-            return PrepareDecodeMigrationReqOutput(
-                rid=recv_req.rid,
-                migration_id=recv_req.migration_id,
-                success=True,
-                status="armed",
-                bootstrap_host=recv_req.bootstrap_host,
-                bootstrap_port=recv_req.bootstrap_port,
-                bootstrap_room=recv_req.bootstrap_room,
-                logical_len=logical_len,
-                output_tokens_seen=recv_req.output_tokens_seen,
-                source_dp_rank=self.ps.dp_rank or 0,
+        if target is not None and target <= 0:
+            return self._prepare_failure(
+                recv_req, "error", "target_sequence_length must be positive"
             )
 
-        if armed == recv_req.migration_id:
-            arm = self.decode_migration_arms[armed]
-            return PrepareDecodeMigrationReqOutput(
-                rid=recv_req.rid,
-                migration_id=recv_req.migration_id,
-                success=True,
-                status="armed",
-                bootstrap_host=arm.bootstrap_host,
-                bootstrap_port=arm.bootstrap_port,
-                bootstrap_room=arm.bootstrap_room,
-                logical_len=logical_len,
-                output_tokens_seen=arm.output_tokens_seen,
-                source_dp_rank=self.ps.dp_rank or 0,
+        if isinstance(existing, ArmedDecodeMigration):
+            return self._armed_output(recv_req, existing, logical_len)
+
+        # The overlap loop accepts controls before it consumes the previous
+        # decode result. That result already advances KV but has not yet added
+        # its sampled token to output_ids, so defer direct preparation to the
+        # next normal result frontier.
+        if req is not None and self._has_queued_decode_migration_result(req):
+            recv_req = replace(
+                recv_req,
+                target_sequence_length=max(logical_len + 1, target or 0),
             )
+            target = recv_req.target_sequence_length
+
+        if target is not None and target > logical_len:
+            return self._arm_decode_migration(recv_req, logical_len)
 
         return self._prepare_decode_migration_now(recv_req, req=req)
 
@@ -380,22 +445,7 @@ class SchedulerDecodeMigrationMixin:
         recv_req: PrepareDecodeMigrationReqInput,
         *,
         req: Optional[Req] = None,
-        resolve_overlap: bool = True,
     ) -> PrepareDecodeMigrationReqOutput:
-
-        if resolve_overlap:
-            try:
-                self._resolve_decode_migration_overlap_result()
-            except Exception as exc:
-                logger.exception(
-                    "Failed to resolve overlap result for rid=%s migration_id=%s",
-                    recv_req.rid,
-                    recv_req.migration_id,
-                )
-                return self._prepare_failure(
-                    recv_req, "error", f"Failed to resolve source frontier: {exc}"
-                )
-
         if req is None:
             req = self._find_decode_migration_req(recv_req.rid)
         if req is None:
@@ -519,8 +569,7 @@ class SchedulerDecodeMigrationMixin:
             created_at=time.monotonic(),
             transfer_end=committed_len,
         )
-        self.decode_migration_transfers[recv_req.migration_id] = record
-        self.decode_migration_by_rid[recv_req.rid] = recv_req.migration_id
+        self.decode_migrations.activate(record)
 
         logger.info(
             "Prepared decode migration rid=%s migration_id=%s committed=%d "
@@ -588,13 +637,17 @@ class SchedulerDecodeMigrationMixin:
         )
 
     def process_decode_migration_transfers(self: "Scheduler") -> None:
-        if not self.decode_migration_transfers:
+        if not self.decode_migrations.has_active_transfers():
             return
 
         records = [
             record
-            for record in self.decode_migration_transfers.values()
-            if record.status not in ("transferred", "failed")
+            for record in self.decode_migrations.transfers()
+            if record.state
+            in (
+                DecodeMigrationState.BOOTSTRAPPING,
+                DecodeMigrationState.TRANSFERRING,
+            )
         ]
         if not records:
             return
@@ -610,7 +663,7 @@ class SchedulerDecodeMigrationMixin:
                 self._fail_decode_migration(record, "Migration transfer timed out")
                 continue
             if poll == KVPoll.Bootstrapping:
-                record.status = "bootstrapping"
+                record.state = DecodeMigrationState.BOOTSTRAPPING
                 continue
             if poll == KVPoll.WaitingForInput and not record.send_started:
                 decode_prefix_len = record.sender.pop_decode_prefix_len()
@@ -633,7 +686,7 @@ class SchedulerDecodeMigrationMixin:
                 record.sender.init(len(page_indices), record.metadata_buffer_index)
                 record.sender.send(page_indices, [])
                 record.send_started = True
-                record.status = "transferring"
+                record.state = DecodeMigrationState.TRANSFERRING
                 logger.info(
                     "Started decode migration transfer rid=%s migration_id=%s "
                     "range=[%d,%d) pages=%d",
@@ -645,10 +698,10 @@ class SchedulerDecodeMigrationMixin:
                 )
                 continue
             if poll in (KVPoll.WaitingForInput, KVPoll.Transferring):
-                record.status = "transferring"
+                record.state = DecodeMigrationState.TRANSFERRING
                 continue
             if poll == KVPoll.Success:
-                record.status = "transferred"
+                record.state = DecodeMigrationState.TRANSFERRED
                 self._release_decode_migration_transport(record)
                 logger.info(
                     "Decode migration transfer completed rid=%s migration_id=%s",
@@ -669,6 +722,7 @@ class SchedulerDecodeMigrationMixin:
     ) -> None:
         if record.sender is not None:
             record.sender.clear()
+            record.sender = None
         if record.metadata_buffer_index >= 0:
             self.disagg_metadata_buffers.bootstrap_room[
                 record.metadata_buffer_index
@@ -685,19 +739,15 @@ class SchedulerDecodeMigrationMixin:
             record.migration_id,
             error,
         )
-        record.status = "failed"
-        record.error = error
-        self._release_decode_migration_transport(record)
-        self._release_decode_migration_source(record)
+        self._close_decode_migration(record)
 
     def finalize_decode_migration(
         self: "Scheduler", recv_req: FinalizeDecodeMigrationReqInput
     ) -> FinalizeDecodeMigrationReqOutput:
-        record = self.decode_migration_transfers.get(recv_req.migration_id)
-        armed = self.decode_migration_arms.get(recv_req.migration_id)
-        if record is None and armed is not None and armed.rid == recv_req.rid:
+        entry = self.decode_migrations.get(recv_req.migration_id)
+        if isinstance(entry, ArmedDecodeMigration) and entry.rid == recv_req.rid:
             if recv_req.action == "cancel":
-                self._clear_decode_migration_arm(recv_req.migration_id, recv_req.rid)
+                self.decode_migrations.discard(recv_req.migration_id)
                 return FinalizeDecodeMigrationReqOutput(
                     rid=recv_req.rid,
                     migration_id=recv_req.migration_id,
@@ -715,7 +765,7 @@ class SchedulerDecodeMigrationMixin:
                 source_dp_rank=self.ps.dp_rank or 0,
                 error="Migration source is armed but not yet parked",
             )
-        if record is None or record.req.rid != recv_req.rid:
+        if not isinstance(entry, DecodeMigrationTransfer) or entry.rid != recv_req.rid:
             return FinalizeDecodeMigrationReqOutput(
                 rid=recv_req.rid,
                 migration_id=recv_req.migration_id,
@@ -726,45 +776,32 @@ class SchedulerDecodeMigrationMixin:
                 error="Migration generation is not active",
             )
 
-        status = record.status
-        if recv_req.action == "commit" and status != "transferred":
+        record = entry
+        status = record.state
+        if recv_req.action == "commit" and status != DecodeMigrationState.TRANSFERRED:
             return FinalizeDecodeMigrationReqOutput(
                 rid=recv_req.rid,
                 migration_id=recv_req.migration_id,
                 action=recv_req.action,
                 success=False,
-                transfer_status=status,
+                transfer_status=status.value,
                 source_dp_rank=self.ps.dp_rank or 0,
                 error="Destination cannot commit before source transfer completes",
             )
-        if recv_req.action == "resume":
-            return FinalizeDecodeMigrationReqOutput(
-                rid=recv_req.rid,
-                migration_id=recv_req.migration_id,
-                action=recv_req.action,
-                success=False,
-                transfer_status=status,
-                source_dp_rank=self.ps.dp_rank or 0,
-                error="Source resumption is unsupported after request quiescence",
-            )
-
-        self._release_decode_migration_transport(record)
-        self._release_decode_migration_source(record)
-        self.decode_migration_transfers.pop(recv_req.migration_id, None)
-        self.decode_migration_by_rid.pop(recv_req.rid, None)
+        self._close_decode_migration(record)
 
         logger.info(
             "Finalized decode migration rid=%s migration_id=%s action=%s status=%s",
             recv_req.rid,
             recv_req.migration_id,
             recv_req.action,
-            status,
+            status.value,
         )
         return FinalizeDecodeMigrationReqOutput(
             rid=recv_req.rid,
             migration_id=recv_req.migration_id,
             action=recv_req.action,
             success=True,
-            transfer_status=status,
+            transfer_status=status.value,
             source_dp_rank=self.ps.dp_rank or 0,
         )

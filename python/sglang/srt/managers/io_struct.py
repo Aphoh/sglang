@@ -1624,15 +1624,15 @@ class PrepareDecodeMigrationReqOutput(BaseReq):
 
 @dataclass
 class FinalizeDecodeMigrationReqInput(BaseReq):
-    """Commit, resume, or cancel a prepared decode migration."""
+    """Commit or cancel a prepared decode migration."""
 
     migration_id: str
-    action: Literal["commit", "resume", "cancel"]
+    action: Literal["commit", "cancel"]
 
     routed_dp_rank: Optional[int] = None
 
     def __post_init__(self):
-        allowed = ["commit", "resume", "cancel"]
+        allowed = ["commit", "cancel"]
         if self.action not in allowed:
             raise ValueError(
                 f"Invalid migration finalization action: {self.action!r}. "

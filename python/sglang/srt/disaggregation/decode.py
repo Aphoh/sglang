@@ -1824,11 +1824,10 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 batch_result = None
 
-            # Process the last batch unless migration already resolved it.
+            # Process the last batch.
             if self.last_batch:
-                if not self._decode_migration_overlap_result_processed:
-                    tmp_batch, tmp_result = self.result_queue.popleft()
-                    self.process_batch_result(tmp_batch, tmp_result)
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.on_idle()
 
@@ -1838,7 +1837,6 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
-            self._decode_migration_overlap_result_processed = False
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
@@ -1851,27 +1849,29 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
+    def admit_prebuilt_batch(self: Scheduler, batch: Optional[ScheduleBatch]) -> None:
+        """Merge a batch whose KV has already been materialized elsewhere."""
+        if batch is None:
+            return
+        assert self.chunked_req is None
+        self.batch_result_processor.process_batch_result_prebuilt(batch)
+        batch.filter_batch()
+        if batch.is_empty():
+            return
+        if self.running_batch.is_empty():
+            self.running_batch = batch
+            if self.enable_hisparse:
+                self.running_batch.hisparse_coordinator = self.hisparse_coordinator
+        else:
+            self.running_batch.merge_batch(batch)
+        self.running_batch.batch_is_full = False
+
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch()
-        if new_prebuilt_batch:
-            assert self.chunked_req is None
-            self.batch_result_processor.process_batch_result_prebuilt(
-                new_prebuilt_batch
-            )
-            new_prebuilt_batch.filter_batch()
-            if not new_prebuilt_batch.is_empty():
-                if self.running_batch.is_empty():
-                    self.running_batch = new_prebuilt_batch
-                    if self.enable_hisparse:
-                        self.running_batch.hisparse_coordinator = (
-                            self.hisparse_coordinator
-                        )
-                else:
-                    self.running_batch.merge_batch(new_prebuilt_batch)
+        self.admit_prebuilt_batch(self.get_new_prebuilt_batch())
 
         # Schedule decode batch
         if self.running_batch.is_empty():
@@ -1885,7 +1885,9 @@ class SchedulerDisaggregationDecodeMixin:
             set_schedule_time_batch(ret)
         return ret
 
-    def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
+    def get_new_prebuilt_batch(
+        self: Scheduler, *, prebuilt_kv_only: bool = False
+    ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -1908,15 +1910,19 @@ class SchedulerDisaggregationDecodeMixin:
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
 
-        for i in range(len(self.waiting_queue)):
-            req = self.waiting_queue[i]
-            # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
+        for req in self.waiting_queue:
+            if prebuilt_kv_only and not req.has_prebuilt_kv:
+                waiting_queue.append(req)
+                continue
+            # We can only add as many requests as there are available slots.
+            if len(can_run_list) < num_not_used_batch:
                 can_run_list.append(req)
-                # Decode-radix path: new requests already matched in
-                # `pop_preallocated`. Retracted requests reset `last_node`,
-                # so re-match only when that state is missing.
-                if self.server_args.disaggregation_decode_enable_radix_cache:
+                # A prebuilt-KV request has already established its exact
+                # ownership layout. Other decode requests retain their normal
+                # radix matching behavior.
+                if req.has_prebuilt_kv:
+                    tree_cache = None
+                elif self.server_args.disaggregation_decode_enable_radix_cache:
                     tree_cache = self.tree_cache if req.last_node is None else None
                 else:
                     tree_cache = self.tree_cache
