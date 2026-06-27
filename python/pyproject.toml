@@ -28,7 +28,7 @@ dependencies = [
   "distro",
   "einops",
   "fastapi",
-  "flashinfer_python[cu13] @ git+https://github.com/Aphoh/flashinfer.git@86e3f6f4112336e181b6cd6ef58cdd8ee21ef0b2",
+  "flashinfer_python[cu13] @ git+https://github.com/Aphoh/flashinfer.git@3709f4ce776e954891384220c028bb31bff1d217",
   "flashinfer_cubin==0.6.13",
   "gguf",
   "interegular",
