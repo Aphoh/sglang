@@ -315,11 +315,16 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         self.assertEqual(output.transfer_status, "bootstrapping")
 
     @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
-    def test_commit_releases_parked_source_once(self, release_kv_cache):
+    def test_commit_releases_parked_source_and_invalidates_full_batch_cache(
+        self, release_kv_cache
+    ):
         req = _Req("request")
         scheduler = _Scheduler([req])
         with self._sender_patch():
             scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
+        # The request is parked but retains its request-pool slot until commit.
+        # A prefill pass during transfer can therefore cache the empty batch as full.
+        scheduler.running_batch.batch_is_full = True
         scheduler.decode_migration_transfers["migration"].status = "transferred"
 
         output = scheduler.finalize_decode_migration(
@@ -332,6 +337,7 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         release_kv_cache.assert_called_once_with(
             req, scheduler.tree_cache, is_insert=False
         )
+        self.assertFalse(scheduler.running_batch.batch_is_full)
         self.assertEqual(scheduler.decode_migration_transfers, {})
         self.assertEqual(scheduler.decode_migration_by_rid, {})
 

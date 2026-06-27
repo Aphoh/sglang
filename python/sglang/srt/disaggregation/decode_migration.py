@@ -295,6 +295,10 @@ class SchedulerDecodeMigrationMixin:
             return
         if record.req.req_pool_idx is not None:
             release_kv_cache(record.req, self.tree_cache, is_insert=False)
+            # A parked request no longer belongs to running_batch, so the
+            # scheduler can cache it as full while this transfer still owns
+            # the request-pool slot. Releasing that slot must reopen admission.
+            self.running_batch.batch_is_full = False
         record.source_released = True
 
     def prepare_decode_migration(
