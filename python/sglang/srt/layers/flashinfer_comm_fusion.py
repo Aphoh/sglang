@@ -31,6 +31,7 @@ _flashinfer_comm = None
 _flashinfer_allreduce_unavailable = False
 _flashinfer_create_workspace_supports_group = False
 _flashinfer_create_workspace_supports_comm_backend = False
+_flashinfer_create_workspace_supports_checkpointable = False
 _flashinfer_allreduce_supports_trigger_completion = False
 
 
@@ -49,6 +50,9 @@ if is_flashinfer_available():
             _flashinfer_create_workspace_supports_group = "group" in workspace_params
             _flashinfer_create_workspace_supports_comm_backend = (
                 "comm_backend" in workspace_params
+            )
+            _flashinfer_create_workspace_supports_checkpointable = (
+                "checkpointable" in workspace_params
             )
             _flashinfer_allreduce_supports_trigger_completion = (
                 "trigger_completion_at_end" in allreduce_params
@@ -300,11 +304,12 @@ class FlashInferWorkspaceManager:
             if checkpointable:
                 if (
                     not _flashinfer_create_workspace_supports_comm_backend
+                    or not _flashinfer_create_workspace_supports_checkpointable
                     or cpu_group is None
                 ):
                     raise RuntimeError(
-                        "Checkpointable FlashInfer workspaces require a CPU "
-                        "communication backend"
+                        "Installed FlashInfer does not support checkpointable "
+                        "workspaces with a CPU communication backend"
                     )
                 from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
                     TorchDistributedCommBackend,
@@ -312,6 +317,7 @@ class FlashInferWorkspaceManager:
 
                 comm_backend = TorchDistributedCommBackend(cpu_group)
                 kwargs["comm_backend"] = comm_backend
+                kwargs["checkpointable"] = True
                 self.workspace = create_workspace(**kwargs)
                 if not all(
                     hasattr(self.workspace, method)
