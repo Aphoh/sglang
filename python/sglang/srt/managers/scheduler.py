@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.decode_migration import SchedulerDecodeMigrationMixin
+from sglang.srt.disaggregation.migration_trace import trace_scheduler
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
@@ -2201,6 +2202,13 @@ class Scheduler(
                 and req.bootstrap_room is not None
             ):
                 req.is_decode_migration_destination = True
+                trace_scheduler(
+                    self,
+                    "destination_scheduler",
+                    "destination_request_enqueued",
+                    rid=req.rid,
+                    bootstrap_room=req.bootstrap_room,
+                )
                 self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
                 if not is_retracted:
                     req.time_stats.set_decode_prealloc_queue_entry_time()

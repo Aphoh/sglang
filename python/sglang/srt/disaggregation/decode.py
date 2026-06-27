@@ -35,6 +35,7 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.migration_trace import trace_destination_request
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
@@ -542,6 +543,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         decode_req = DecodeRequest(req=req, kv_receiver=kv_receiver)
+        trace_destination_request(
+            self.scheduler,
+            "destination_receiver_created",
+            req,
+            transfer_backend=str(backend),
+        )
         self.queue.append(decode_req)
         return decode_req
 
@@ -656,6 +663,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 pass
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
+                trace_destination_request(
+                    self.scheduler,
+                    "destination_receiver_bootstrap_ready",
+                    decode_req.req,
+                )
                 decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
@@ -764,7 +776,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pending_reqs = remaining
 
         for decode_req, prefill_dp_rank in resolved:
+            receiver_init_started_at = time.monotonic()
             decode_req.kv_receiver.init(prefill_dp_rank)
+            trace_destination_request(
+                self.scheduler,
+                "destination_receiver_initialized",
+                decode_req.req,
+                source_dp_rank=prefill_dp_rank,
+                receiver_init_ms=round(
+                    (time.monotonic() - receiver_init_started_at) * 1000, 3
+                ),
+            )
 
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
@@ -1044,10 +1066,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
+            metadata_send_started_at = time.monotonic()
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
+                decode_prefix_len=total_prefix_len,
+            )
+            trace_destination_request(
+                self.scheduler,
+                "destination_metadata_sent",
+                decode_req.req,
+                metadata_send_ms=round(
+                    (time.monotonic() - metadata_send_started_at) * 1000, 3
+                ),
+                page_count=len(page_indices),
                 decode_prefix_len=total_prefix_len,
             )
             if (
@@ -1667,7 +1700,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
                 ):
                     continue
+                transfer_commit_started_at = time.monotonic()
                 self._commit_transfer_to_req(decode_req)
+                trace_destination_request(
+                    self.scheduler,
+                    "destination_kv_ready",
+                    decode_req.req,
+                    receiver_completion_ms=round(
+                        (time.monotonic() - transfer_commit_started_at) * 1000, 3
+                    ),
+                    transfer_queue_depth=len(self.queue),
+                )
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):

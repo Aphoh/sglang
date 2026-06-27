@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode_migration_state import (
     build_decode_migration_frontier,
 )
+from sglang.srt.disaggregation.migration_trace import trace_scheduler
 from sglang.srt.disaggregation.prefill import create_prefill_kv_manager
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -55,6 +56,8 @@ class DecodeMigrationTransfer:
     created_at: float
     transfer_start: int = 0
     transfer_end: int = 0
+    bootstrap_ready_at: float = 0.0
+    send_started_at: float = 0.0
     send_started: bool = False
     status: str = "bootstrapping"
     error: Optional[str] = None
@@ -130,6 +133,15 @@ class SchedulerDecodeMigrationMixin:
         ]
 
         for req in selected:
+            trace_scheduler(
+                self,
+                "destination_scheduler",
+                "destination_admitted",
+                rid=getattr(req, "rid", "unknown"),
+                migration_id=getattr(req, "decode_migration_id", None),
+                waiting_before_admit=len(ready),
+                selected_count=len(selected),
+            )
             # Decode preallocation already established the complete destination
             # KV layout, with or without decode-side radix matching. Preserve
             # that exact ownership state. Re-matching here can observe a prefix
@@ -150,9 +162,21 @@ class SchedulerDecodeMigrationMixin:
             self.enable_overlap,
             self.spec_algorithm,
         )
+        admission_started_at = time.monotonic()
         batch.prepare_for_prebuilt()
         batch.process_prebuilt(self.server_args, self.future_map)
         self.batch_result_processor.process_batch_result_prebuilt(batch)
+        for req in selected:
+            trace_scheduler(
+                self,
+                "destination_scheduler",
+                "destination_prebuilt_complete",
+                rid=getattr(req, "rid", "unknown"),
+                migration_id=getattr(req, "decode_migration_id", None),
+                admission_prebuilt_ms=round(
+                    (time.monotonic() - admission_started_at) * 1000, 3
+                ),
+            )
         batch.filter_batch()
         if batch.is_empty():
             return
@@ -382,6 +406,7 @@ class SchedulerDecodeMigrationMixin:
         req: Optional[Req] = None,
         resolve_overlap: bool = True,
     ) -> PrepareDecodeMigrationReqOutput:
+        prepare_started_at = time.monotonic()
 
         if resolve_overlap:
             try:
@@ -522,6 +547,19 @@ class SchedulerDecodeMigrationMixin:
         self.decode_migration_transfers[recv_req.migration_id] = record
         self.decode_migration_by_rid[recv_req.rid] = recv_req.migration_id
 
+        trace_scheduler(
+            self,
+            "source_scheduler",
+            "source_parked_prepared",
+            rid=recv_req.rid,
+            migration_id=recv_req.migration_id,
+            prepare_and_park_ms=round(
+                (record.created_at - prepare_started_at) * 1000, 3
+            ),
+            committed_len=committed_len,
+            logical_len=frontier.logical_len,
+            bootstrap_room=room,
+        )
         logger.info(
             "Prepared decode migration rid=%s migration_id=%s committed=%d "
             "logical=%d actual_logical=%d seen=%d room=%d",
@@ -613,6 +651,18 @@ class SchedulerDecodeMigrationMixin:
                 record.status = "bootstrapping"
                 continue
             if poll == KVPoll.WaitingForInput and not record.send_started:
+                bootstrap_ready_at = time.monotonic()
+                record.bootstrap_ready_at = bootstrap_ready_at
+                trace_scheduler(
+                    self,
+                    "source_scheduler",
+                    "source_bootstrap_ready",
+                    rid=record.req.rid,
+                    migration_id=record.migration_id,
+                    source_park_to_bootstrap_ready_ms=round(
+                        (bootstrap_ready_at - record.created_at) * 1000, 3
+                    ),
+                )
                 decode_prefix_len = record.sender.pop_decode_prefix_len()
                 if decode_prefix_len < 0 or decode_prefix_len > record.committed_len:
                     self._fail_decode_migration(
@@ -630,10 +680,35 @@ class SchedulerDecodeMigrationMixin:
                 page_indices = kv_to_page_indices(
                     kv_indices.cpu().numpy(), token_to_kv_pool.page_size
                 )
+                sender_init_started_at = time.monotonic()
                 record.sender.init(len(page_indices), record.metadata_buffer_index)
+                sender_init_finished_at = time.monotonic()
+                sender_send_started_at = sender_init_finished_at
+                record.send_started_at = sender_send_started_at
                 record.sender.send(page_indices, [])
+                sender_send_finished_at = time.monotonic()
                 record.send_started = True
                 record.status = "transferring"
+                trace_scheduler(
+                    self,
+                    "source_scheduler",
+                    "source_send_issued",
+                    rid=record.req.rid,
+                    migration_id=record.migration_id,
+                    bootstrap_to_send_ms=round(
+                        (record.send_started_at - record.bootstrap_ready_at) * 1000,
+                        3,
+                    ),
+                    sender_init_ms=round(
+                        (sender_init_finished_at - sender_init_started_at) * 1000, 3
+                    ),
+                    sender_send_call_ms=round(
+                        (sender_send_finished_at - sender_send_started_at) * 1000, 3
+                    ),
+                    transfer_start=record.transfer_start,
+                    transfer_end=record.transfer_end,
+                    page_count=len(page_indices),
+                )
                 logger.info(
                     "Started decode migration transfer rid=%s migration_id=%s "
                     "range=[%d,%d) pages=%d",
@@ -648,7 +723,21 @@ class SchedulerDecodeMigrationMixin:
                 record.status = "transferring"
                 continue
             if poll == KVPoll.Success:
+                transfer_completed_at = time.monotonic()
                 record.status = "transferred"
+                trace_scheduler(
+                    self,
+                    "source_scheduler",
+                    "source_transfer_complete",
+                    rid=record.req.rid,
+                    migration_id=record.migration_id,
+                    send_to_complete_ms=round(
+                        (transfer_completed_at - record.send_started_at) * 1000, 3
+                    ),
+                    source_park_to_complete_ms=round(
+                        (transfer_completed_at - record.created_at) * 1000, 3
+                    ),
+                )
                 self._release_decode_migration_transport(record)
                 logger.info(
                     "Decode migration transfer completed rid=%s migration_id=%s",
@@ -679,6 +768,17 @@ class SchedulerDecodeMigrationMixin:
     def _fail_decode_migration(
         self: "Scheduler", record: DecodeMigrationTransfer, error: str
     ) -> None:
+        trace_scheduler(
+            self,
+            "source_scheduler",
+            "source_transfer_failed",
+            rid=record.req.rid,
+            migration_id=record.migration_id,
+            source_park_to_failure_ms=round(
+                (time.monotonic() - record.created_at) * 1000, 3
+            ),
+            error=error,
+        )
         logger.error(
             "Decode migration failed rid=%s migration_id=%s error=%s",
             record.req.rid,
@@ -727,6 +827,15 @@ class SchedulerDecodeMigrationMixin:
             )
 
         status = record.status
+        trace_scheduler(
+            self,
+            "source_scheduler",
+            "source_finalize_received",
+            rid=recv_req.rid,
+            migration_id=recv_req.migration_id,
+            action=recv_req.action,
+            transfer_status=status,
+        )
         if recv_req.action == "commit" and status != "transferred":
             return FinalizeDecodeMigrationReqOutput(
                 rid=recv_req.rid,
@@ -748,8 +857,23 @@ class SchedulerDecodeMigrationMixin:
                 error="Source resumption is unsupported after request quiescence",
             )
 
+        source_release_started_at = time.monotonic()
         self._release_decode_migration_transport(record)
         self._release_decode_migration_source(record)
+        trace_scheduler(
+            self,
+            "source_scheduler",
+            "source_released",
+            rid=recv_req.rid,
+            migration_id=recv_req.migration_id,
+            action=recv_req.action,
+            source_release_ms=round(
+                (time.monotonic() - source_release_started_at) * 1000, 3
+            ),
+            source_park_to_release_ms=round(
+                (time.monotonic() - record.created_at) * 1000, 3
+            ),
+        )
         self.decode_migration_transfers.pop(recv_req.migration_id, None)
         self.decode_migration_by_rid.pop(recv_req.rid, None)
 
