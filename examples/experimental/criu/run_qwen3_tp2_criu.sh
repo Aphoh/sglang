@@ -304,8 +304,12 @@ printf 'restored\n' >"${run_dir}/phase.tmp"
 mv "${run_dir}/phase.tmp" "${run_dir}/phase"
 wait_for_file "${run_dir}/passed" "post-restore generation"
 wait_for_process_exit "${controller_pid}" "${controller_start_time}"
-if ! wait "${launcher_pid}"; then
-  echo "cuda-checkpoint launcher exited unsuccessfully" >&2
+launcher_status=0
+wait "${launcher_pid}" || launcher_status=$?
+# CRIU dump kills the original task tree. Bash retains that SIGKILL status even
+# after the restored controller completes successfully under the same PID.
+if [[ ${launcher_status} -ne 0 && ${launcher_status} -ne 137 ]]; then
+  echo "cuda-checkpoint launcher exited with status ${launcher_status}" >&2
   exit 1
 fi
 
