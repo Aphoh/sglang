@@ -10,9 +10,12 @@ from typing import (
     TYPE_CHECKING,
     List,
     Optional,
+    Protocol,
     Tuple,
     Union,
 )
+
+import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -44,7 +47,16 @@ LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 
 
-def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
+class DecodeMetricsBatch(Protocol):
+    reqs: list[Req]
+    seq_lens_cpu: torch.Tensor | None
+    dp_cooperation_info: DPCooperationInfo | None
+    forward_iter: int | None
+
+    def batch_size(self) -> int: ...
+
+
+def _decode_total_seq_lens(batch: DecodeMetricsBatch) -> int:
     """Sync-free sum of seq_lens for decode metrics."""
     if batch.seq_lens_cpu is not None:
         return int(batch.seq_lens_cpu.sum().item())
@@ -460,7 +472,7 @@ class SchedulerMetricsReporter:
         return flops, read_bytes, write_bytes
 
     def _estimate_decode_perf(
-        self, batch: ScheduleBatch, num_tokens: int
+        self, batch: DecodeMetricsBatch, num_tokens: int
     ) -> Tuple[float, float, float]:
         tokens = max(0, int(num_tokens))
         if tokens == 0:
@@ -641,7 +653,7 @@ class SchedulerMetricsReporter:
     def report_decode_stats(
         self,
         can_run_cuda_graph: bool,
-        running_batch: ScheduleBatch = None,
+        running_batch: DecodeMetricsBatch | None = None,
         num_correct_drafts: int = 0,
     ):
         batch = running_batch or self.scheduler.running_batch

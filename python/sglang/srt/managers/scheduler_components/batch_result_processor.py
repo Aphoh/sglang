@@ -350,9 +350,7 @@ class SchedulerBatchResultProcessor:
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
-            batch=self.result_disposition.batch_without_discarded(
-                batch, discarded_result_reqs
-            ),
+            batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
@@ -748,7 +746,7 @@ class SchedulerBatchResultProcessor:
         ) % (1 << 30)
         self.metrics_reporter.report_decode_stats(
             can_run_cuda_graph,
-            running_batch=self.result_disposition.batch_without_discarded(
+            running_batch=self.result_disposition.decode_metrics_view(
                 batch, discarded_result_reqs
             ),
             num_correct_drafts=result.num_correct_drafts,

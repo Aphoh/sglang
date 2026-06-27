@@ -7,6 +7,9 @@ import torch
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.result_disposition import (
+    ResultDispositionHandler,
+)
 
 
 class _FakeBatch:
@@ -128,6 +131,25 @@ class DecodeMigrationDestinationAdmissionTests(unittest.TestCase):
         SchedulerDisaggregationDecodeMixin.admit_prebuilt_batch(scheduler, new_batch)
 
         req.init_next_round_input.assert_called_once_with(None)
+
+
+class ResultDispositionHandlerTests(unittest.TestCase):
+    def test_decode_metrics_view_filters_without_copying_schedule_batch(self):
+        first = object()
+        second = object()
+        batch = SimpleNamespace(
+            reqs=[first, second],
+            seq_lens_cpu=torch.tensor([7, 11]),
+            dp_cooperation_info=object(),
+            forward_iter=3,
+            copy=MagicMock(side_effect=AssertionError("must not copy ScheduleBatch")),
+        )
+
+        view = ResultDispositionHandler.decode_metrics_view(batch, [first])
+
+        self.assertEqual(view.reqs, [second])
+        self.assertEqual(view.seq_lens_cpu.tolist(), [11])
+        self.assertEqual(view.batch_size(), 1)
 
 
 class DecodeMigrationReceiverInitializationTests(unittest.TestCase):

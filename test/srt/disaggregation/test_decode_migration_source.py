@@ -233,11 +233,58 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         record = scheduler.decode_migrations.get("migration")
         self.assertEqual(record.state, DecodeMigrationState.AWAITING_STALE_RESULT)
         release_kv_cache.assert_not_called()
+        retry = scheduler.finalize_decode_migration(
+            FinalizeDecodeMigrationReqInput(
+                rid="request", migration_id="migration", action="cancel"
+            )
+        )
+        self.assertTrue(retry.success)
+        self.assertEqual(retry.transfer_status, "bootstrapping")
         self.assertEqual(
             scheduler.get_decode_migration_result_disposition(req),
             ResultDisposition.DISCARD,
         )
         self.assertIsNone(scheduler.decode_migrations.get("migration"))
+        release_kv_cache.assert_called_once_with(
+            req, scheduler.tree_cache, is_insert=False
+        )
+
+    @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
+    def test_commit_retry_preserves_transferred_status_while_tombstoned(
+        self, release_kv_cache
+    ):
+        req = _Req("request", output_ids=[20])
+        scheduler = _Scheduler([req], overlap=True)
+        scheduler.prepare_decode_migration(
+            _prepare("request", "migration", 17, target_sequence_length=4)
+        )
+        req.output_ids.append(21)
+        req.kv_committed_len += 1
+        scheduler.result_queue.append((_Batch([req]), object()))
+        with self._sender_patch():
+            self.assertTrue(scheduler.maybe_park_decode_migration_at_boundary(req))
+        scheduler.decode_migrations.get("migration").state = (
+            DecodeMigrationState.TRANSFERRED
+        )
+
+        first = scheduler.finalize_decode_migration(
+            FinalizeDecodeMigrationReqInput(
+                rid="request", migration_id="migration", action="commit"
+            )
+        )
+        retry = scheduler.finalize_decode_migration(
+            FinalizeDecodeMigrationReqInput(
+                rid="request", migration_id="migration", action="commit"
+            )
+        )
+
+        self.assertTrue(first.success)
+        self.assertTrue(retry.success)
+        self.assertEqual(retry.transfer_status, "transferred")
+        self.assertEqual(
+            scheduler.get_decode_migration_result_disposition(req),
+            ResultDisposition.DISCARD,
+        )
         release_kv_cache.assert_called_once_with(
             req, scheduler.tree_cache, is_insert=False
         )

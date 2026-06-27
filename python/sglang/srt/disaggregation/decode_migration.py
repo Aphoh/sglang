@@ -12,7 +12,7 @@ import logging
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode_migration_state import (
@@ -65,6 +65,12 @@ class ArmedDecodeMigration:
         return self.request.rid
 
 
+@dataclass(frozen=True)
+class DecodeMigrationFinalization:
+    action: Literal["commit", "cancel"]
+    transfer_status: Literal["bootstrapping", "transferring", "transferred"]
+
+
 @dataclass
 class DecodeMigrationTransfer:
     migration_id: str
@@ -81,6 +87,7 @@ class DecodeMigrationTransfer:
     transfer_end: int = 0
     send_started: bool = False
     state: DecodeMigrationState = DecodeMigrationState.BOOTSTRAPPING
+    finalization: DecodeMigrationFinalization | None = None
 
     @property
     def rid(self) -> str:
@@ -344,13 +351,16 @@ class SchedulerDecodeMigrationMixin:
         self.running_batch.batch_is_full = False
 
     def _close_decode_migration(
-        self: "Scheduler", record: DecodeMigrationTransfer
+        self: "Scheduler",
+        record: DecodeMigrationTransfer,
+        finalization: DecodeMigrationFinalization | None = None,
     ) -> None:
         if record.state == DecodeMigrationState.AWAITING_STALE_RESULT:
             return
         self._release_decode_migration_transport(record)
         if self._has_queued_decode_migration_result(record.req):
             record.state = DecodeMigrationState.AWAITING_STALE_RESULT
+            record.finalization = finalization
             return
         self._release_decode_migration_source(record)
         self.decode_migrations.discard(record.migration_id)
@@ -777,6 +787,37 @@ class SchedulerDecodeMigrationMixin:
             )
 
         record = entry
+        if record.state == DecodeMigrationState.AWAITING_STALE_RESULT:
+            finalization = record.finalization
+            if finalization is None:
+                return FinalizeDecodeMigrationReqOutput(
+                    rid=recv_req.rid,
+                    migration_id=recv_req.migration_id,
+                    action=recv_req.action,
+                    success=False,
+                    transfer_status="unknown",
+                    source_dp_rank=self.ps.dp_rank or 0,
+                    error="Migration source cleanup is still in progress",
+                )
+            if recv_req.action != finalization.action:
+                return FinalizeDecodeMigrationReqOutput(
+                    rid=recv_req.rid,
+                    migration_id=recv_req.migration_id,
+                    action=recv_req.action,
+                    success=False,
+                    transfer_status=finalization.transfer_status,
+                    source_dp_rank=self.ps.dp_rank or 0,
+                    error=f"Migration was already finalized with {finalization.action}",
+                )
+            return FinalizeDecodeMigrationReqOutput(
+                rid=recv_req.rid,
+                migration_id=recv_req.migration_id,
+                action=recv_req.action,
+                success=True,
+                transfer_status=finalization.transfer_status,
+                source_dp_rank=self.ps.dp_rank or 0,
+            )
+
         status = record.state
         if recv_req.action == "commit" and status != DecodeMigrationState.TRANSFERRED:
             return FinalizeDecodeMigrationReqOutput(
@@ -788,7 +829,13 @@ class SchedulerDecodeMigrationMixin:
                 source_dp_rank=self.ps.dp_rank or 0,
                 error="Destination cannot commit before source transfer completes",
             )
-        self._close_decode_migration(record)
+        self._close_decode_migration(
+            record,
+            DecodeMigrationFinalization(
+                action=recv_req.action,
+                transfer_status=status.value,
+            ),
+        )
 
         logger.info(
             "Finalized decode migration rid=%s migration_id=%s action=%s status=%s",
