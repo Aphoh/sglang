@@ -53,7 +53,7 @@ echo "Movin package pin: ${expected_movin_commit}; checkout: ${actual_movin_comm
   --editable "${movin_root}" \
   --editable "${sglang_root}/python"
 MOVIN_DEPS_DIR="${movin_deps_dir}" "${python_bin}" -m movin.build_deps
-"${python_bin}" -c 'import flashinfer, importlib.metadata as m, movin, sglang; assert m.version("flashinfer-python") == "0.6.13"; assert flashinfer.__git_version__ == "83cbafda5d8c41588ceadba2cb163750e7c305eb"; assert m.version("flashinfer-cubin") == "0.6.13"; print("movin package:", movin.__file__); print("sglang package:", sglang.__file__)'
+"${python_bin}" -c 'import flashinfer, importlib.metadata as m, movin, sglang; assert m.version("flashinfer-python") == "0.6.13"; assert flashinfer.__git_version__ == "1ac01069632461c4a84110d2c9c630a95a4c77e3"; assert m.version("flashinfer-cubin") == "0.6.13"; print("movin package:", movin.__file__); print("sglang package:", sglang.__file__)'
 
 cc -O2 -Wall -Wextra -Werror -shared -fPIC \
   "${movin_root}/examples/cuda_checkpoint/nvidiactl_criu_plugin.c" \

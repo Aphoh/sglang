@@ -8,7 +8,7 @@ ARG CRIU_REF=00b4a49d17a0bb7d9f69c0164148c0c46f0ca928
 ARG CUDA_CHECKPOINT_REF=1c71b048c779d30921f01172dda96e04033bb8ac
 ARG DYNAMO_REF=eab08859f1f48f3ff7dceab57c849caf105a275c
 ARG FLASHINFER_REPOSITORY=https://github.com/Aphoh/flashinfer.git
-ARG FLASHINFER_REF=83cbafda5d8c41588ceadba2cb163750e7c305eb
+ARG FLASHINFER_REF=1ac01069632461c4a84110d2c9c630a95a4c77e3
 ARG RUST_TOOLCHAIN=1.90.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -74,6 +74,6 @@ RUN curl -LsSf https://astral.sh/uv/0.11.16/install.sh | \
     && uv pip uninstall --system --break-system-packages flashinfer-jit-cache \
     && criu --version \
     && uv --version \
-    && python -c 'import flashinfer, importlib.metadata as m, torch; assert m.version("torch").startswith("2.11.0"); assert torch.version.cuda == "13.0"; assert m.version("flashinfer-python") == "0.6.13"; assert flashinfer.__git_version__ == "83cbafda5d8c41588ceadba2cb163750e7c305eb"; assert m.version("flashinfer-cubin") == "0.6.13"; assert m.version("nixl-cu13") == "1.1.0"; assert m.version("sglang-kernel") == "0.4.3"'
+    && python -c 'import flashinfer, importlib.metadata as m, torch; assert m.version("torch").startswith("2.11.0"); assert torch.version.cuda == "13.0"; assert m.version("flashinfer-python") == "0.6.13"; assert flashinfer.__git_version__ == "1ac01069632461c4a84110d2c9c630a95a4c77e3"; assert m.version("flashinfer-cubin") == "0.6.13"; assert m.version("nixl-cu13") == "1.1.0"; assert m.version("sglang-kernel") == "0.4.3"'
 
 WORKDIR /workspace/sglang

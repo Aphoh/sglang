@@ -3,7 +3,7 @@
 This branch adds a scoped dense-TP checkpoint lifecycle to SGLang. It uses
 [`movin`](https://github.com/NVIDIA-dev/warnold-movin) for lifecycle
 coordination and a pinned
-[`Aphoh/flashinfer`](https://github.com/Aphoh/flashinfer/commit/83cbafda5d8c41588ceadba2cb163750e7c305eb)
+[`Aphoh/flashinfer`](https://github.com/Aphoh/flashinfer/commit/1ac01069632461c4a84110d2c9c630a95a4c77e3)
 build for checkpointable TRT-LLM all-reduce and symmetric all-gather.
 
 The authoritative, pinned reproduction lives in Movin:
