@@ -7,7 +7,7 @@ ARG CRIU_REPOSITORY=https://github.com/galletas1712/criu.git
 ARG CRIU_REF=00b4a49d17a0bb7d9f69c0164148c0c46f0ca928
 ARG CUDA_CHECKPOINT_REF=1c71b048c779d30921f01172dda96e04033bb8ac
 ARG DYNAMO_REF=eab08859f1f48f3ff7dceab57c849caf105a275c
-ARG RUST_TOOLCHAIN=1.85.1
+ARG RUST_TOOLCHAIN=1.90.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     asciidoctor bash bsdmainutils build-essential ca-certificates curl git-core \
