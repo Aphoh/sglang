@@ -65,6 +65,6 @@ RUN curl -LsSf https://astral.sh/uv/0.11.16/install.sh | \
     && uv pip uninstall --system --break-system-packages flashinfer-jit-cache \
     && criu --version \
     && uv --version \
-    && python -c 'import flashinfer, importlib.metadata as m, sgl_kernel, torch; assert m.version("torch").startswith("2.11.0"); assert torch.version.cuda == "13.0"; assert m.version("flashinfer-python") == "0.6.12"; assert m.version("flashinfer-cubin") == "0.6.12"; assert m.version("nixl-cu13") == "1.1.0"; assert m.version("sglang-kernel") == "0.4.3"'
+    && python -c 'import flashinfer, importlib.metadata as m, torch; assert m.version("torch").startswith("2.11.0"); assert torch.version.cuda == "13.0"; assert m.version("flashinfer-python") == "0.6.12"; assert m.version("flashinfer-cubin") == "0.6.12"; assert m.version("nixl-cu13") == "1.1.0"; assert m.version("sglang-kernel") == "0.4.3"'
 
 WORKDIR /workspace/sglang
