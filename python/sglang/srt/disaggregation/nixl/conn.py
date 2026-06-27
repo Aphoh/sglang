@@ -25,6 +25,7 @@ from sglang.srt.disaggregation.common.conn import (
     KVTransferError,
 )
 from sglang.srt.disaggregation.common.staging_handler import StagingRegisterInfo
+from sglang.srt.disaggregation.migration_trace import trace_nixl_bootstrap
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
@@ -1876,6 +1877,12 @@ class NixlKVManager(CommonKVManager):
                 required_dst_info_num = self.transfer_infos[room][
                     agent_name
                 ].required_dst_info_num
+                trace_nixl_bootstrap(
+                    "source_nixl_bootstrap_metadata_received",
+                    bootstrap_room=room,
+                    received_info_count=len(self.transfer_infos[room]),
+                    required_info_count=required_dst_info_num,
+                )
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
                     self.req_to_decode_prefix_len[room] = next(
@@ -1888,6 +1895,12 @@ class NixlKVManager(CommonKVManager):
                     )
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
+                    trace_nixl_bootstrap(
+                        "source_nixl_bootstrap_status_ready",
+                        bootstrap_room=room,
+                        received_info_count=len(self.transfer_infos[room]),
+                        required_info_count=required_dst_info_num,
+                    )
 
         threading.Thread(target=bootstrap_thread).start()
 

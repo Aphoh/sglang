@@ -22,6 +22,31 @@ def enabled() -> bool:
     }
 
 
+def trace_nixl_bootstrap(
+    stage: str,
+    *,
+    bootstrap_room: int,
+    **fields,
+) -> None:
+    """Trace an opaque-room NIXL bootstrap-server event.
+
+    The connection layer does not own a request ID. Consumers join this event
+    to scheduler events via the opaque bootstrap room, never by rank identity.
+    """
+
+    if not enabled():
+        return
+    logger.info(
+        "decode_migration_trace role=source_nixl_bootstrap stage=%s "
+        "bootstrap_room=%d wall_time_ns=%d mono_time_ns=%d fields=%s",
+        stage,
+        bootstrap_room,
+        time.time_ns(),
+        time.monotonic_ns(),
+        json.dumps(fields, separators=(",", ":"), sort_keys=True),
+    )
+
+
 def trace_scheduler(
     scheduler: "Scheduler",
     role: str,
