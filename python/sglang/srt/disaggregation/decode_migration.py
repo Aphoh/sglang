@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Literal, Optional
@@ -86,6 +87,7 @@ class DecodeMigrationTransfer:
     transfer_start: int = 0
     transfer_end: int = 0
     send_started: bool = False
+    commit_requested: bool = False
     state: DecodeMigrationState = DecodeMigrationState.BOOTSTRAPPING
     finalization: DecodeMigrationFinalization | None = None
 
@@ -102,6 +104,11 @@ class DecodeMigrationRegistry:
         default_factory=dict
     )
     _migration_id_by_rid: dict[str, str] = field(default_factory=dict)
+    _finalizations: OrderedDict[str, tuple[str, DecodeMigrationFinalization]] = field(
+        default_factory=OrderedDict
+    )
+
+    _MAX_FINALIZATION_TOMBSTONES = 1024
 
     def get(
         self, migration_id: str
@@ -146,6 +153,22 @@ class DecodeMigrationRegistry:
         ):
             self._migration_id_by_rid.pop(entry.rid, None)
         return entry
+
+    def remember_finalization(
+        self, record: DecodeMigrationTransfer, finalization: DecodeMigrationFinalization
+    ) -> None:
+        self._finalizations[record.migration_id] = (record.rid, finalization)
+        self._finalizations.move_to_end(record.migration_id)
+        while len(self._finalizations) > self._MAX_FINALIZATION_TOMBSTONES:
+            self._finalizations.popitem(last=False)
+
+    def get_finalization(
+        self, migration_id: str
+    ) -> tuple[str, DecodeMigrationFinalization] | None:
+        finalization = self._finalizations.get(migration_id)
+        if finalization is not None:
+            self._finalizations.move_to_end(migration_id)
+        return finalization
 
     def arms(self) -> tuple[ArmedDecodeMigration, ...]:
         return tuple(
@@ -304,6 +327,10 @@ class SchedulerDecodeMigrationMixin:
             return ResultDisposition.PROCESS
         if record.state == DecodeMigrationState.AWAITING_STALE_RESULT:
             self._release_decode_migration_source(record)
+            if record.finalization is not None:
+                self.decode_migrations.remember_finalization(
+                    record, record.finalization
+                )
             self.decode_migrations.discard(record.migration_id)
         return ResultDisposition.DISCARD
 
@@ -363,6 +390,8 @@ class SchedulerDecodeMigrationMixin:
             record.finalization = finalization
             return
         self._release_decode_migration_source(record)
+        if finalization is not None:
+            self.decode_migrations.remember_finalization(record, finalization)
         self.decode_migrations.discard(record.migration_id)
 
     def _has_queued_decode_migration_result(self: "Scheduler", req: Req) -> bool:
@@ -549,6 +578,16 @@ class SchedulerDecodeMigrationMixin:
             )
             self.disagg_metadata_buffers.cached_tokens[metadata_index].zero_()
             self.disagg_metadata_buffers.bootstrap_room[metadata_index][0] = room
+            # An armed migration reaches this method at its exact logical
+            # frontier. Emit an otherwise buffered partial stream chunk before
+            # removing the request so the controller can observe the trigger.
+            if (
+                frontier.logical_len == len(req.origin_input_ids) + len(req.output_ids)
+                and len(req.output_ids) > req.send_token_offset
+            ):
+                self.output_streamer.stream_output(
+                    [req], req.return_logprob, force_stream_req=req
+                )
             self._park_decode_migration_req(req)
         except Exception as exc:
             if sender is not None:
@@ -718,6 +757,13 @@ class SchedulerDecodeMigrationMixin:
                     record.req.rid,
                     record.migration_id,
                 )
+                if record.commit_requested:
+                    self._close_decode_migration(
+                        record,
+                        DecodeMigrationFinalization(
+                            action="commit", transfer_status="transferred"
+                        ),
+                    )
                 continue
             if poll == KVPoll.Failed:
                 error = "Decode migration transfer failed"
@@ -755,6 +801,37 @@ class SchedulerDecodeMigrationMixin:
         self: "Scheduler", recv_req: FinalizeDecodeMigrationReqInput
     ) -> FinalizeDecodeMigrationReqOutput:
         entry = self.decode_migrations.get(recv_req.migration_id)
+        if entry is None:
+            finalized = self.decode_migrations.get_finalization(recv_req.migration_id)
+            if finalized is not None:
+                rid, finalization = finalized
+                if rid != recv_req.rid:
+                    return FinalizeDecodeMigrationReqOutput(
+                        rid=recv_req.rid,
+                        migration_id=recv_req.migration_id,
+                        action=recv_req.action,
+                        success=False,
+                        source_dp_rank=self.ps.dp_rank or 0,
+                        error="Migration id belongs to another request",
+                    )
+                if recv_req.action != finalization.action:
+                    return FinalizeDecodeMigrationReqOutput(
+                        rid=recv_req.rid,
+                        migration_id=recv_req.migration_id,
+                        action=recv_req.action,
+                        success=False,
+                        transfer_status=finalization.transfer_status,
+                        source_dp_rank=self.ps.dp_rank or 0,
+                        error=f"Migration was already finalized with {finalization.action}",
+                    )
+                return FinalizeDecodeMigrationReqOutput(
+                    rid=recv_req.rid,
+                    migration_id=recv_req.migration_id,
+                    action=recv_req.action,
+                    success=True,
+                    transfer_status=finalization.transfer_status,
+                    source_dp_rank=self.ps.dp_rank or 0,
+                )
         if isinstance(entry, ArmedDecodeMigration) and entry.rid == recv_req.rid:
             if recv_req.action == "cancel":
                 self.decode_migrations.discard(recv_req.migration_id)
@@ -819,7 +896,7 @@ class SchedulerDecodeMigrationMixin:
             )
 
         status = record.state
-        if recv_req.action == "commit" and status != DecodeMigrationState.TRANSFERRED:
+        if record.commit_requested and recv_req.action != "commit":
             return FinalizeDecodeMigrationReqOutput(
                 rid=recv_req.rid,
                 migration_id=recv_req.migration_id,
@@ -827,7 +904,18 @@ class SchedulerDecodeMigrationMixin:
                 success=False,
                 transfer_status=status.value,
                 source_dp_rank=self.ps.dp_rank or 0,
-                error="Destination cannot commit before source transfer completes",
+                error="Migration source already accepted commit",
+            )
+        if recv_req.action == "commit" and status != DecodeMigrationState.TRANSFERRED:
+            record.commit_requested = True
+            return FinalizeDecodeMigrationReqOutput(
+                rid=recv_req.rid,
+                migration_id=recv_req.migration_id,
+                action=recv_req.action,
+                success=True,
+                transfer_status=status.value,
+                commit_pending=True,
+                source_dp_rank=self.ps.dp_rank or 0,
             )
         self._close_decode_migration(
             record,

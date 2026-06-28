@@ -95,10 +95,13 @@ class SchedulerOutputStreamer:
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        force_stream_req: Optional[Req] = None,
     ):
         """Stream the output to detokenizer."""
         if self.is_generation:
-            self._stream_output_generation(reqs, return_logprob, skip_req)
+            self._stream_output_generation(
+                reqs, return_logprob, skip_req, force_stream_req
+            )
         else:  # embedding or reward model
             self._stream_output_embedding(reqs)
 
@@ -121,6 +124,7 @@ class SchedulerOutputStreamer:
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        force_stream_req: Optional[Req] = None,
         is_idle_batch: bool = False,
     ):
         return_hidden_states = any(
@@ -154,7 +158,7 @@ class SchedulerOutputStreamer:
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
 
-            acc.accept(req=req)
+            acc.accept(req=req, force_stream=req is force_stream_req)
             self._maybe_log_time_stats(req=req)
 
         # Send to detokenizer
@@ -314,8 +318,13 @@ class _GenerationStreamAccumulator:
             self.output_token_ids_logprobs_val = []
             self.output_token_ids_logprobs_idx = []
 
-    def accept(self, *, req: Req) -> None:
-        if req.finished():
+    def accept(self, *, req: Req, force_stream: bool = False) -> None:
+        if force_stream:
+            # Decode migration parks this request immediately after this call.
+            # Flush its committed frontier even when it falls between ordinary
+            # stream-interval boundaries.
+            should_output = True
+        elif req.finished():
             assert not req.finished_output
             req.finished_output = True
             if req.finished_len is None:

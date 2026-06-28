@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import torch
 
+from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode_migration import (
     DecodeMigrationRegistry,
     DecodeMigrationState,
@@ -43,6 +44,8 @@ class _Req:
         self.output_ids = list(output_ids or [20, 21])
         self.kv_committed_len = len(self.origin_input_ids) + len(self.output_ids) - 1
         self.req_pool_idx = 1
+        self.send_token_offset = 0
+        self.return_logprob = False
         self.to_finish = None
         self._finished = False
 
@@ -94,8 +97,11 @@ class _Scheduler(SchedulerDecodeMigrationMixin):
         self.transfer_backend = object()
         self.spec_algorithm = SimpleNamespace(is_none=lambda: True)
         self.ps = SimpleNamespace(tp_rank=0, pp_rank=0, dp_rank=dp_rank)
+        self.attn_cp_cpu_group = None
+        self.attn_tp_cpu_group = None
         self.tree_cache = object()
         self.process_batch_result = MagicMock()
+        self.output_streamer = MagicMock()
 
     def _get_decode_migration_kv_manager(self):
         return object()
@@ -380,6 +386,23 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         self.assertIsNotNone(scheduler.decode_migrations.get_for_rid(req.rid))
         self.assertEqual(scheduler.decode_migrations.get("migration").committed_len, 3)
 
+    def test_boundary_park_force_flushes_an_unstreamed_partial_chunk(self):
+        req = _Req("request", output_ids=[20, 21, 22, 23, 24, 25])
+        req.send_token_offset = 5
+        scheduler = _Scheduler([req], overlap=True)
+        scheduler.prepare_decode_migration(
+            _prepare("request", "migration", 17, target_sequence_length=9)
+        )
+        req.output_ids.append(26)
+        req.kv_committed_len += 1
+
+        with self._sender_patch():
+            self.assertTrue(scheduler.maybe_park_decode_migration_at_boundary(req))
+
+        scheduler.output_streamer.stream_output.assert_called_once_with(
+            [req], False, force_stream_req=req
+        )
+
     def test_sequence_arm_exports_exact_frontier_after_overlap_overshoot(self):
         req = _Req("request", output_ids=[20])
         scheduler = _Scheduler([req], overlap=True)
@@ -412,6 +435,34 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         self.assertEqual(output.committed_len, 3)
         self.assertEqual(output.logical_len, 4)
         self.assertEqual(output.output_tokens_seen, 2)
+        scheduler.output_streamer.stream_output.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
+    def test_failed_overlap_transfer_discards_stale_result_without_tombstone(
+        self, release_kv_cache
+    ):
+        req = _Req("request", output_ids=[20])
+        scheduler = _Scheduler([req], overlap=True)
+        scheduler.prepare_decode_migration(
+            _prepare("request", "migration", 17, target_sequence_length=4)
+        )
+        req.output_ids.append(21)
+        req.kv_committed_len += 1
+        scheduler.result_queue.append((_Batch([req]), object()))
+        with self._sender_patch():
+            self.assertTrue(scheduler.maybe_park_decode_migration_at_boundary(req))
+
+        scheduler._fail_decode_migration(
+            scheduler.decode_migrations.get("migration"), "test failure"
+        )
+        self.assertEqual(
+            scheduler.get_decode_migration_result_disposition(req),
+            ResultDisposition.DISCARD,
+        )
+        self.assertIsNone(scheduler.decode_migrations.get("migration"))
+        release_kv_cache.assert_called_once_with(
+            req, scheduler.tree_cache, is_insert=False
+        )
 
     def test_control_responses_report_actual_dp_rank(self):
         req = _Req("request", output_ids=[20])
@@ -483,7 +534,7 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         self.assertEqual(scheduler.running_batch.reqs, [req])
         self.assertIsNone(scheduler.decode_migrations.get("migration"))
 
-    def test_commit_requires_completed_transfer(self):
+    def test_commit_is_accepted_before_transfer_completion(self):
         req = _Req("request")
         scheduler = _Scheduler([req])
         with self._sender_patch():
@@ -493,8 +544,46 @@ class DecodeMigrationSourceTests(unittest.TestCase):
                 rid="request", migration_id="migration", action="commit"
             )
         )
-        self.assertFalse(output.success)
+        self.assertTrue(output.success)
+        self.assertTrue(output.commit_pending)
         self.assertEqual(output.transfer_status, "bootstrapping")
+        self.assertTrue(scheduler.decode_migrations.get("migration").commit_requested)
+
+    @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
+    @patch(
+        "sglang.srt.disaggregation.decode_migration.poll_and_all_reduce_attn_cp_tp_group"
+    )
+    def test_pending_commit_releases_after_transfer_and_is_idempotent(
+        self, poll_transfers, release_kv_cache
+    ):
+        req = _Req("request")
+        scheduler = _Scheduler([req])
+        with self._sender_patch():
+            scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
+
+        accepted = scheduler.finalize_decode_migration(
+            FinalizeDecodeMigrationReqInput(
+                rid="request", migration_id="migration", action="commit"
+            )
+        )
+        self.assertTrue(accepted.success)
+        self.assertTrue(accepted.commit_pending)
+
+        poll_transfers.return_value = [KVPoll.Success]
+        scheduler.process_decode_migration_transfers()
+
+        release_kv_cache.assert_called_once_with(
+            req, scheduler.tree_cache, is_insert=False
+        )
+        self.assertIsNone(scheduler.decode_migrations.get("migration"))
+        retry = scheduler.finalize_decode_migration(
+            FinalizeDecodeMigrationReqInput(
+                rid="request", migration_id="migration", action="commit"
+            )
+        )
+        self.assertTrue(retry.success)
+        self.assertFalse(retry.commit_pending)
+        self.assertEqual(retry.transfer_status, "transferred")
 
     @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
     def test_commit_releases_parked_source_and_invalidates_full_batch_cache(

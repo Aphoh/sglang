@@ -1648,6 +1648,9 @@ class FinalizeDecodeMigrationReqOutput(BaseReq):
     transfer_status: Literal[
         "bootstrapping", "transferring", "transferred", "failed", "unknown"
     ] = "unknown"
+    # A source commit may be accepted before its scheduler observes local NIXL
+    # completion. The source retains KV ownership until that transition.
+    commit_pending: bool = False
     source_dp_rank: int = 0
     error: Optional[str] = None
 
