@@ -1,9 +1,8 @@
 """Low-overhead, opt-in structured timing for decode migration.
 
-Events are retained in process memory and dumped as JSONL at orderly process
-exit. This keeps the migration hot path free of stdout/stderr locks and file
-I/O. Send SIGUSR1 to a worker process to flush its current buffer without
-stopping it.
+Events are appended to bounded in-memory buffers on the worker hot path. A
+daemon writer snapshots and persists them as JSONL in batches, so neither
+stdout/stderr locks nor synchronous file I/O are part of each trace event.
 """
 
 from __future__ import annotations
@@ -12,7 +11,6 @@ import atexit
 import json
 import logging
 import os
-import signal
 import socket
 import threading
 import time
@@ -27,33 +25,39 @@ logger = logging.getLogger(__name__)
 _TRACE_ENV = "DYNAMO_DECODE_MIGRATION_TRACE"
 _TRACE_DIR_ENV = "DYNAMO_DECODE_MIGRATION_TRACE_DIR"
 _TRACE_MAX_EVENTS_ENV = "DYNAMO_DECODE_MIGRATION_TRACE_MAX_EVENTS"
+_TRACE_FLUSH_EVENTS_ENV = "DYNAMO_DECODE_MIGRATION_TRACE_FLUSH_EVENTS"
+_TRACE_FLUSH_INTERVAL_MS_ENV = "DYNAMO_DECODE_MIGRATION_TRACE_FLUSH_INTERVAL_MS"
 _TRACE_DIR_DEFAULT = "/tmp/dynamo-decode-migration-trace"
 
 _events: list[dict[str, Any]] = []
 _events_lock = threading.Lock()
 _dropped_events = 0
+_writer_pid = 0
+_writer_start_lock = threading.Lock()
+_writer_wakeup = threading.Event()
 
 
 def enabled() -> bool:
     return os.environ.get(_TRACE_ENV, "").lower() in {"1", "true", "yes"}
 
 
-def _max_events() -> int:
+def _positive_int(name: str, default: int) -> int:
     try:
-        return max(1, int(os.environ.get(_TRACE_MAX_EVENTS_ENV, "8192")))
+        return max(1, int(os.environ.get(name, str(default))))
     except ValueError:
-        return 8192
+        return default
 
 
-def _append(event: dict[str, Any]) -> None:
-    """Append without serializing or performing I/O on the scheduler hot path."""
+def _max_events() -> int:
+    return _positive_int(_TRACE_MAX_EVENTS_ENV, 8192)
 
-    global _dropped_events
-    with _events_lock:
-        if len(_events) < _max_events():
-            _events.append(event)
-        else:
-            _dropped_events += 1
+
+def _flush_events() -> int:
+    return _positive_int(_TRACE_FLUSH_EVENTS_ENV, 256)
+
+
+def _flush_interval_s() -> float:
+    return _positive_int(_TRACE_FLUSH_INTERVAL_MS_ENV, 250) / 1000
 
 
 def _trace_path() -> Path:
@@ -61,15 +65,11 @@ def _trace_path() -> Path:
     return trace_dir / f"decode-migration-{socket.gethostname()}-{os.getpid()}.jsonl"
 
 
-def flush() -> None:
-    """Persist the current buffer. Safe to call repeatedly and from SIGUSR1."""
-
+def _drain() -> list[dict[str, Any]]:
     global _dropped_events
-    if not enabled():
-        return
     with _events_lock:
         if not _events and not _dropped_events:
-            return
+            return []
         events = list(_events)
         _events.clear()
         dropped_events = _dropped_events
@@ -85,32 +85,73 @@ def flush() -> None:
                 "fields": {"count": dropped_events},
             }
         )
+    return events
+
+
+def _write(events: list[dict[str, Any]]) -> None:
+    if not events:
+        return
     try:
         path = _trace_path()
         path.parent.mkdir(parents=True, exist_ok=True)
+        payload = "".join(
+            json.dumps(event, separators=(",", ":"), sort_keys=True) + "\n"
+            for event in events
+        )
         with path.open("a", encoding="utf-8", buffering=1024 * 1024) as trace_file:
-            trace_file.write("".join(json.dumps(event, separators=(",", ":"), sort_keys=True) + "\n" for event in events))
+            trace_file.write(payload)
     except Exception:
-        # Do not turn tracing persistence failures into inference failures.
+        # Tracing must never break inference. This is at most one error per batch.
         logger.exception("Failed to flush decode migration trace buffer")
 
 
-def _install_flush_hook() -> None:
-    atexit.register(flush)
-    if not hasattr(signal, "SIGUSR1"):
+def flush() -> None:
+    """Synchronously persist the current process buffer at orderly exit."""
+
+    if enabled():
+        _write(_drain())
+
+
+def _writer_loop(wakeup: threading.Event) -> None:
+    while True:
+        wakeup.wait(_flush_interval_s())
+        wakeup.clear()
+        _write(_drain())
+
+
+def _ensure_writer() -> None:
+    """Start one daemon writer per process, including forked scheduler children."""
+
+    global _writer_pid, _writer_wakeup
+    if not enabled() or _writer_pid == os.getpid():
         return
-    try:
-        previous = signal.getsignal(signal.SIGUSR1)
-        if previous not in (signal.SIG_DFL, signal.SIG_IGN):
+    with _writer_start_lock:
+        if _writer_pid == os.getpid():
             return
+        _writer_pid = os.getpid()
+        _writer_wakeup = threading.Event()
+        threading.Thread(
+            target=_writer_loop,
+            args=(_writer_wakeup,),
+            name="decode-migration-trace-writer",
+            daemon=True,
+        ).start()
 
-        def _flush_on_usr1(_signum, _frame) -> None:
-            flush()
 
-        signal.signal(signal.SIGUSR1, _flush_on_usr1)
-    except (ValueError, OSError):
-        # Signal handlers can only be installed in a process main thread.
-        pass
+def _append(event: dict[str, Any]) -> None:
+    """Append without serialization or synchronous I/O on the scheduler path."""
+
+    global _dropped_events
+    _ensure_writer()
+    should_wake = False
+    with _events_lock:
+        if len(_events) < _max_events():
+            _events.append(event)
+            should_wake = len(_events) >= _flush_events()
+        else:
+            _dropped_events += 1
+    if should_wake:
+        _writer_wakeup.set()
 
 
 def trace_nixl_bootstrap(
@@ -190,4 +231,4 @@ def trace_destination_request(
     )
 
 
-_install_flush_hook()
+atexit.register(flush)
