@@ -38,6 +38,9 @@ class _Req:
         self.req_pool_idx = 1
         self.to_finish = None
         self._finished = False
+        self.stream = False
+        self.send_token_offset = 0
+        self.return_logprob = False
 
     def finished(self):
         return self._finished
@@ -92,6 +95,7 @@ class _Scheduler(SchedulerDecodeMigrationMixin):
         self.ps = SimpleNamespace(tp_rank=0, pp_rank=0, dp_rank=dp_rank)
         self.tree_cache = object()
         self.process_batch_result = MagicMock()
+        self.output_streamer = MagicMock()
 
     def _get_decode_migration_kv_manager(self):
         return object()
@@ -160,6 +164,23 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         self.assertTrue(two.success)
         self.assertEqual(scheduler.running_batch.reqs, [])
         self.assertEqual(set(scheduler.decode_migration_transfers), {"one", "two"})
+
+    def test_parking_flushes_partial_stream_chunk_before_removal(self):
+        req = _Req("request", output_ids=[20, 21, 22])
+        req.stream = True
+        req.send_token_offset = 2
+        scheduler = _Scheduler([req])
+
+        with self._sender_patch():
+            output = scheduler.prepare_decode_migration(
+                _prepare("request", "migration", 17, output_tokens_seen=3)
+            )
+
+        self.assertTrue(output.success)
+        scheduler.output_streamer.stream_output.assert_called_once_with(
+            [req], False, force_stream_req=req
+        )
+        self.assertEqual(scheduler.running_batch.reqs, [])
 
     def test_sequence_arm_parks_exactly_at_boundary(self):
         req = _Req("request", output_ids=[20])

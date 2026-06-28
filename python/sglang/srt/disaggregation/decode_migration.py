@@ -261,7 +261,28 @@ class SchedulerDecodeMigrationMixin:
         batch.batch_is_full = False
         return True
 
-    def _park_decode_migration_req(self: "Scheduler", req: Req) -> None:
+    def _park_decode_migration_req(
+        self: "Scheduler", req: Req, migration_id: str
+    ) -> None:
+        # Parking removes this request before the normal end-of-batch stream
+        # pass. Flush any partial stream chunk first, so a sequence-length
+        # frontend trigger observes the exact boundary even when
+        # ``--stream-interval`` is greater than one.
+        if req.stream and len(req.output_ids) > req.send_token_offset:
+            buffered_output_tokens = len(req.output_ids) - req.send_token_offset
+            self.output_streamer.stream_output(
+                [req],
+                req.return_logprob,
+                force_stream_req=req,
+            )
+            trace_scheduler(
+                self,
+                "source_scheduler",
+                "source_boundary_stream_flushed",
+                rid=req.rid,
+                migration_id=migration_id,
+                buffered_output_tokens=buffered_output_tokens,
+            )
         req.is_decode_migration_source_parked = True
         removed = self._filter_req_from_batch(self.running_batch, req)
         if self.last_batch is not self.running_batch:
@@ -514,7 +535,7 @@ class SchedulerDecodeMigrationMixin:
             )
             self.disagg_metadata_buffers.cached_tokens[metadata_index].zero_()
             self.disagg_metadata_buffers.bootstrap_room[metadata_index][0] = room
-            self._park_decode_migration_req(req)
+            self._park_decode_migration_req(req, recv_req.migration_id)
         except Exception as exc:
             if sender is not None:
                 sender.clear()

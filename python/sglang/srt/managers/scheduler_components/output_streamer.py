@@ -95,10 +95,20 @@ class SchedulerOutputStreamer:
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        force_stream_req: Optional[Req] = None,
     ):
-        """Stream the output to detokenizer."""
+        """Stream the output to detokenizer.
+
+        ``force_stream_req`` flushes one request even if it has not reached its
+        normal stream interval. Decode migration uses this when it parks the
+        request exactly at its handoff boundary; otherwise a partial final
+        stream chunk could be retained forever after the request leaves its
+        source batch.
+        """
         if self.is_generation:
-            self._stream_output_generation(reqs, return_logprob, skip_req)
+            self._stream_output_generation(
+                reqs, return_logprob, skip_req, force_stream_req=force_stream_req
+            )
         else:  # embedding or reward model
             self._stream_output_embedding(reqs)
 
@@ -122,6 +132,7 @@ class SchedulerOutputStreamer:
         return_logprob: bool,
         skip_req: Optional[Req] = None,
         is_idle_batch: bool = False,
+        force_stream_req: Optional[Req] = None,
     ):
         return_hidden_states = any(
             req.return_hidden_states for req in reqs if req is not skip_req
@@ -154,7 +165,7 @@ class SchedulerOutputStreamer:
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
 
-            acc.accept(req=req)
+            acc.accept(req=req, force_stream=req is force_stream_req)
             self._maybe_log_time_stats(req=req)
 
         # Send to detokenizer
@@ -314,7 +325,7 @@ class _GenerationStreamAccumulator:
             self.output_token_ids_logprobs_val = []
             self.output_token_ids_logprobs_idx = []
 
-    def accept(self, *, req: Req) -> None:
+    def accept(self, *, req: Req, force_stream: bool = False) -> None:
         if req.finished():
             assert not req.finished_output
             req.finished_output = True
@@ -342,6 +353,8 @@ class _GenerationStreamAccumulator:
                     len(req.output_ids) % self.default_force_stream_interval == 0
                 )
 
+        if force_stream:
+            should_output = True
         if not should_output:
             return
 
