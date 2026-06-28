@@ -1822,7 +1822,10 @@ class NixlKVManager(CommonKVManager):
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
             while True:
+                recv_started_at = time.monotonic()
+                recv_started_wall_time_ns = time.time_ns()
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                recv_finished_at = time.monotonic()
                 logger.debug(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )
@@ -1882,6 +1885,8 @@ class NixlKVManager(CommonKVManager):
                     bootstrap_room=room,
                     received_info_count=len(self.transfer_infos[room]),
                     required_info_count=required_dst_info_num,
+                    recv_wait_ms=round((recv_finished_at - recv_started_at) * 1000, 3),
+                    recv_wait_started_wall_time_ns=recv_started_wall_time_ns,
                 )
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
