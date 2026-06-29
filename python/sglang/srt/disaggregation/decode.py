@@ -1052,8 +1052,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 state_indices,
                 decode_prefix_len=total_prefix_len,
             )
-            if getattr(decode_req.req, "decode_migration_id", None) and hasattr(
-                decode_req.kv_receiver, "defer_waiting_timeout"
+            if (
+                getattr(decode_req.req, "decode_migration_id", None)
+                and not getattr(decode_req.req, "decode_migration_bound", False)
+                and hasattr(decode_req.kv_receiver, "defer_waiting_timeout")
             ):
                 decode_req.kv_receiver.defer_waiting_timeout()
             if (

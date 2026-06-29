@@ -744,6 +744,24 @@ class DecodeMigrationWaiterRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(await finalize_task, expected_finalize)
         self.assertEqual(manager.decode_migration_futures, {})
 
+    async def test_result_dispatcher_routes_bind_output(self):
+        manager = self.manager()
+        manager.init_communicators = MagicMock()
+        manager.init_request_dispatcher()
+        future = asyncio.get_running_loop().create_future()
+        manager.decode_migration_futures[("migration", 3)] = future
+        expected = BindDecodeMigrationReqOutput(
+            rid="request",
+            migration_id="migration",
+            success=True,
+            status="ready",
+            source_dp_rank=3,
+        )
+
+        manager._result_dispatcher(expected)
+
+        self.assertIs(await future, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

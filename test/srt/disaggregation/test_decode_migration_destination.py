@@ -253,6 +253,56 @@ class DecodeMigrationEarlyReservationTests(unittest.TestCase):
         allocator.free.assert_called_once()
         receiver.resume_waiting_timeout.assert_called_once()
 
+    def test_bind_updates_placeholder_still_waiting_for_preallocation(self):
+        req = SimpleNamespace(
+            rid="destination",
+            bootstrap_room=17,
+            decode_migration_id="migration",
+            decode_migration_bound=False,
+            req_pool_idx=None,
+            kv_allocated_len=0,
+            kv_committed_len=0,
+            origin_input_ids=array("q", [0] * 8),
+            origin_input_ids_unpadded=array("q", [0] * 8),
+            output_ids=array("q"),
+            prefix_indices=torch.empty(0, dtype=torch.int64),
+            sampling_params=SimpleNamespace(max_new_tokens=1, min_new_tokens=0),
+            set_extend_input_len=MagicMock(),
+        )
+        receiver = MagicMock()
+        decode_req = DecodeRequest(req=req, kv_receiver=receiver)
+        allocator = SimpleNamespace(page_size=1, free=MagicMock())
+        scheduler = SimpleNamespace(
+            ps=SimpleNamespace(dp_rank=0),
+            disagg_decode_prealloc_queue=SimpleNamespace(queue=[decode_req]),
+            disagg_decode_transfer_queue=SimpleNamespace(queue=[]),
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=SimpleNamespace(req_to_token=None),
+        )
+
+        result = SchedulerDecodeMigrationMixin.bind_decode_migration_destination(
+            scheduler,
+            BindDecodeMigrationReqInput(
+                rid="destination",
+                migration_id="migration",
+                bootstrap_room=17,
+                committed_input_ids=[10, 11, 20, 21],
+                pending_input_ids=[22],
+                committed_len=4,
+                logical_len=5,
+                max_new_tokens=9,
+                routed_dp_rank=0,
+            ),
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(req.origin_input_ids.tolist(), [10, 11, 20, 21])
+        self.assertEqual(req.decode_migration_pending_input_id, 22)
+        self.assertEqual(req.kv_allocated_len, 0)
+        self.assertTrue(req.decode_migration_bound)
+        allocator.free.assert_not_called()
+        receiver.resume_waiting_timeout.assert_not_called()
+
     def test_completed_transfer_waits_for_exact_state_bind(self):
         req = SimpleNamespace(
             rid="destination",

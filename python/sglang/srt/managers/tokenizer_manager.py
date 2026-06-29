@@ -569,6 +569,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._handle_decode_migration_output,
                 ),
                 (
+                    BindDecodeMigrationReqOutput,
+                    self._handle_decode_migration_output,
+                ),
+                (
                     FinalizeDecodeMigrationReqOutput,
                     self._handle_decode_migration_output,
                 ),

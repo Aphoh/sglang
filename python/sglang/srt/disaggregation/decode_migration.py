@@ -925,7 +925,18 @@ class SchedulerDecodeMigrationMixin:
         if req.bootstrap_room != recv_req.bootstrap_room:
             return output("error", "destination bootstrap room does not match")
 
-        reserved_len = req.kv_allocated_len
+        # A placeholder can still be waiting for normal P/D preallocation when
+        # the source reaches its trigger. Its logical reservation is already
+        # fixed by origin_input_ids even though no request-pool slot exists yet.
+        in_prealloc_queue = any(
+            candidate is decode_req
+            for candidate in self.disagg_decode_prealloc_queue.queue
+        )
+        reserved_len = (
+            len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            if req.req_pool_idx is None and in_prealloc_queue
+            else req.kv_allocated_len
+        )
         if reserved_len < recv_req.committed_len:
             return output(
                 "error", "destination reservation is smaller than source state"
@@ -954,7 +965,9 @@ class SchedulerDecodeMigrationMixin:
         if recv_req.min_new_tokens is not None:
             req.sampling_params.min_new_tokens = recv_req.min_new_tokens
         req.decode_migration_bound = True
-        if hasattr(decode_req.kv_receiver, "resume_waiting_timeout"):
+        if req.req_pool_idx is not None and hasattr(
+            decode_req.kv_receiver, "resume_waiting_timeout"
+        ):
             decode_req.kv_receiver.resume_waiting_timeout()
         logger.info(
             "Bound decode migration destination rid=%s migration_id=%s "
