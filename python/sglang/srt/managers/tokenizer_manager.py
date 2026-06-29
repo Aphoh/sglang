@@ -60,6 +60,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    BindDecodeMigrationReqInput,
+    BindDecodeMigrationReqOutput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     EmbeddingReqInput,
@@ -1131,6 +1133,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
+                decode_migration_id=obj.decode_migration_id,
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
@@ -1698,6 +1701,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         try:
             await self.send_to_scheduler.send_pyobj(obj)
             return await asyncio.wait_for(future, timeout=10.0)
+        finally:
+            self.decode_migration_futures.pop(key, None)
+
+    async def bind_decode_migration_destination(
+        self, obj: BindDecodeMigrationReqInput
+    ) -> BindDecodeMigrationReqOutput:
+        key = self._decode_migration_waiter_key(obj)
+        if key in self.decode_migration_futures:
+            raise RuntimeError(f"Decode migration control already pending for {key}")
+        future = self.auto_create_handle_loop.create_future()
+        self.decode_migration_futures[key] = future
+        self.send_to_scheduler.send_pyobj(obj)
+        try:
+            return await future
         finally:
             self.decode_migration_futures.pop(key, None)
 

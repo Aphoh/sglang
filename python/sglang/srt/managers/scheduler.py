@@ -92,6 +92,7 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    BindDecodeMigrationReqInput,
     CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
@@ -1365,6 +1366,10 @@ class Scheduler(
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (PrepareDecodeMigrationReqInput, self.prepare_decode_migration),
+                (
+                    BindDecodeMigrationReqInput,
+                    self.bind_decode_migration_destination,
+                ),
                 (FinalizeDecodeMigrationReqInput, self.finalize_decode_migration),
                 (ConfigureLoggingReq, self.configure_logging),
                 (DumperControlReqInput, self.handle_dumper_control),
@@ -2000,6 +2005,9 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
+            req.decode_migration_id = recv_req.decode_migration_id
+            req.decode_migration_bound = recv_req.decode_migration_id is None
+            req.stream_output_start_offset = 0
             req.tokenizer = self.tokenizer
 
             if self.disaggregation_mode != DisaggregationMode.NULL:

@@ -221,6 +221,8 @@ class GenerateReqInput(BaseReq):
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
+    # Internal identity for a destination request reserved by decode migration.
+    decode_migration_id: Optional[str] = None
 
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
@@ -786,6 +788,7 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
+    decode_migration_id: Optional[str] = None
 
     # Require reasoning for the request (hybrid reasoning model only)
     require_reasoning: bool = False
@@ -1599,6 +1602,7 @@ class PrepareDecodeMigrationReqInput(BaseReq):
     bootstrap_room: int
     output_tokens_seen: int = 0
     target_sequence_length: Optional[int] = None
+    target_token_id: Optional[int] = None
 
     routed_dp_rank: Optional[int] = None
 
@@ -1619,6 +1623,32 @@ class PrepareDecodeMigrationReqOutput(BaseReq):
     logical_len: int = 0
     output_tokens_seen: int = 0
     source_dp_rank: int = 0
+    error: Optional[str] = None
+
+
+@dataclass
+class BindDecodeMigrationReqInput(BaseReq):
+    """Replace a destination reservation's placeholders with exact source state."""
+
+    migration_id: str
+    bootstrap_room: int
+    committed_input_ids: List[int]
+    pending_input_ids: List[int]
+    committed_len: int
+    logical_len: int
+    max_new_tokens: Optional[int] = None
+    min_new_tokens: Optional[int] = None
+
+    routed_dp_rank: Optional[int] = None
+
+
+@dataclass
+class BindDecodeMigrationReqOutput(BaseReq):
+    migration_id: str
+    success: bool
+    status: Literal["ready", "not_found", "error"]
+    source_dp_rank: int = 0
+    pending_token_suppressed: bool = False
     error: Optional[str] = None
 
 

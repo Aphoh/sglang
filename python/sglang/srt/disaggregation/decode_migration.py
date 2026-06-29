@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from array import array
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -28,6 +29,8 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    BindDecodeMigrationReqInput,
+    BindDecodeMigrationReqOutput,
     FinalizeDecodeMigrationReqInput,
     FinalizeDecodeMigrationReqOutput,
     PrepareDecodeMigrationReqInput,
@@ -38,6 +41,7 @@ from sglang.srt.managers.scheduler_components.result_disposition import (
     ResultDisposition,
 )
 from sglang.srt.mem_cache.common import kv_to_page_indices, release_kv_cache
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base import BaseKVManager, BaseKVSender
@@ -56,6 +60,7 @@ class DecodeMigrationState(str, Enum):
 @dataclass
 class ArmedDecodeMigration:
     request: PrepareDecodeMigrationReqInput
+    sender: "BaseKVSender"
 
     @property
     def migration_id(self) -> str:
@@ -121,14 +126,16 @@ class DecodeMigrationRegistry:
         migration_id = self._migration_id_by_rid.get(rid)
         return self.get(migration_id) if migration_id is not None else None
 
-    def arm(self, request: PrepareDecodeMigrationReqInput) -> ArmedDecodeMigration:
+    def arm(
+        self, request: PrepareDecodeMigrationReqInput, sender: "BaseKVSender"
+    ) -> ArmedDecodeMigration:
         existing = self.get(request.migration_id)
         if existing is not None:
             assert existing.rid == request.rid
             assert isinstance(existing, ArmedDecodeMigration)
             return existing
         assert self.get_for_rid(request.rid) is None
-        arm = ArmedDecodeMigration(request)
+        arm = ArmedDecodeMigration(request, sender)
         self._by_migration_id[arm.migration_id] = arm
         self._migration_id_by_rid[arm.rid] = arm.migration_id
         return arm
@@ -256,7 +263,7 @@ class SchedulerDecodeMigrationMixin:
 
         for arm in self.decode_migrations.arms():
             if recv_req.abort_all or arm.rid.startswith(recv_req.rid):
-                self.decode_migrations.discard(arm.migration_id)
+                self._discard_decode_migration_arm(arm)
 
     def _find_decode_migration_req(self: "Scheduler", rid: str) -> Optional[Req]:
         for req in self.running_batch.reqs:
@@ -291,7 +298,13 @@ class SchedulerDecodeMigrationMixin:
     ) -> None:
         entry = self.decode_migrations.get(migration_id)
         if isinstance(entry, ArmedDecodeMigration) and entry.rid == rid:
-            self.decode_migrations.discard(migration_id)
+            self._discard_decode_migration_arm(entry)
+
+    def _discard_decode_migration_arm(
+        self: "Scheduler", arm: ArmedDecodeMigration
+    ) -> None:
+        arm.sender.clear()
+        self.decode_migrations.discard(arm.migration_id)
 
     def maybe_park_decode_migration_at_boundary(self: "Scheduler", req: Req) -> bool:
         arm = self.decode_migrations.get_for_rid(req.rid)
@@ -301,11 +314,17 @@ class SchedulerDecodeMigrationMixin:
             self._clear_decode_migration_arm(arm.migration_id, req.rid)
             return False
         target = arm.request.target_sequence_length
+        target_token_id = arm.request.target_token_id
         logical_len = len(req.origin_input_ids) + len(req.output_ids)
-        if target is None or logical_len < target:
+        sequence_reached = target is not None and logical_len >= target
+        token_reached = (
+            target_token_id is not None
+            and bool(req.output_ids)
+            and req.output_ids[-1] == target_token_id
+        )
+        if not (sequence_reached or token_reached):
             return False
 
-        self.decode_migrations.discard(arm.migration_id)
         output = self._prepare_decode_migration_now(arm.request, req=req)
         if not output.success:
             logger.error(
@@ -358,15 +377,43 @@ class SchedulerDecodeMigrationMixin:
         recv_req: PrepareDecodeMigrationReqInput,
         logical_len: int,
     ) -> PrepareDecodeMigrationReqOutput:
-        arm = self.decode_migrations.arm(recv_req)
+        try:
+            sender = self._create_decode_migration_sender(recv_req)
+        except Exception as exc:
+            logger.exception(
+                "Failed to arm decode migration rid=%s migration_id=%s",
+                recv_req.rid,
+                recv_req.migration_id,
+            )
+            return self._prepare_failure(
+                recv_req, "error", f"Failed to create migration sender: {exc}"
+            )
+        arm = self.decode_migrations.arm(recv_req, sender)
         logger.info(
-            "Armed decode migration rid=%s migration_id=%s target=%d current=%d",
+            "Armed decode migration rid=%s migration_id=%s sequence_target=%s "
+            "token_target=%s current=%d",
             arm.rid,
             arm.migration_id,
             arm.request.target_sequence_length,
+            arm.request.target_token_id,
             logical_len,
         )
         return self._armed_output(recv_req, arm, logical_len)
+
+    def _create_decode_migration_sender(
+        self: "Scheduler", recv_req: PrepareDecodeMigrationReqInput
+    ) -> "BaseKVSender":
+        if recv_req.bootstrap_room <= 0:
+            raise ValueError("bootstrap_room must be an opaque positive integer")
+        manager = self._get_decode_migration_kv_manager()
+        sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
+        return sender_class(
+            mgr=manager,
+            bootstrap_addr=f"{recv_req.bootstrap_host}:{recv_req.bootstrap_port}",
+            bootstrap_room=recv_req.bootstrap_room,
+            dest_tp_ranks=[self.ps.tp_rank],
+            pp_rank=self.ps.pp_rank,
+        )
 
     def _release_decode_migration_source(
         self: "Scheduler", record: DecodeMigrationTransfer
@@ -425,6 +472,10 @@ class SchedulerDecodeMigrationMixin:
                     "Migration source is no longer active",
                 )
             if existing.migration_id == recv_req.migration_id:
+                existing.output_tokens_seen = min(
+                    max(existing.output_tokens_seen, recv_req.output_tokens_seen),
+                    max(0, existing.logical_len - len(existing.req.origin_input_ids)),
+                )
                 return self._prepared_output(recv_req, existing)
             return self._prepare_failure(
                 recv_req,
@@ -452,12 +503,21 @@ class SchedulerDecodeMigrationMixin:
 
         req = self._find_decode_migration_req(recv_req.rid)
         target = recv_req.target_sequence_length
+        target_token_id = recv_req.target_token_id
         logical_len = (
             len(req.origin_input_ids) + len(req.output_ids) if req is not None else 0
         )
         if target is not None and target <= 0:
             return self._prepare_failure(
                 recv_req, "error", "target_sequence_length must be positive"
+            )
+        if target_token_id is not None and target_token_id < 0:
+            return self._prepare_failure(
+                recv_req, "error", "target_token_id must be non-negative"
+            )
+        if target is not None and target_token_id is not None:
+            return self._prepare_failure(
+                recv_req, "error", "Only one decode migration trigger may be armed"
             )
 
         if isinstance(existing, ArmedDecodeMigration):
@@ -474,7 +534,7 @@ class SchedulerDecodeMigrationMixin:
             )
             target = recv_req.target_sequence_length
 
-        if target is not None and target > logical_len:
+        if (target is not None and target > logical_len) or target_token_id is not None:
             return self._arm_decode_migration(recv_req, logical_len)
 
         return self._prepare_decode_migration_now(recv_req, req=req)
@@ -528,6 +588,29 @@ class SchedulerDecodeMigrationMixin:
                 )
             output_ids = output_ids[: target - len(prompt_ids)]
             committed_len = target - 1
+        elif recv_req.target_token_id is not None:
+            if not output_ids or output_ids[-1] != recv_req.target_token_id:
+                return self._prepare_failure(
+                    recv_req,
+                    "error",
+                    "Source has not reached the requested token migration frontier",
+                    prompt_len=len(prompt_ids),
+                    committed_len=committed_len,
+                    logical_len=actual_logical_len,
+                    output_tokens_seen=recv_req.output_tokens_seen,
+                )
+            token_frontier = actual_logical_len - 1
+            if token_frontier > committed_len:
+                return self._prepare_failure(
+                    recv_req,
+                    "error",
+                    "Target token was sampled before its prefix KV was committed",
+                    prompt_len=len(prompt_ids),
+                    committed_len=committed_len,
+                    logical_len=actual_logical_len,
+                    output_tokens_seen=recv_req.output_tokens_seen,
+                )
+            committed_len = token_frontier
         try:
             frontier = build_decode_migration_frontier(
                 prompt_ids,
@@ -560,15 +643,12 @@ class SchedulerDecodeMigrationMixin:
 
         metadata_index = -1
         sender = None
+        armed = self.decode_migrations.get(recv_req.migration_id)
         try:
-            manager = self._get_decode_migration_kv_manager()
-            sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
-            sender = sender_class(
-                mgr=manager,
-                bootstrap_addr=f"{recv_req.bootstrap_host}:{recv_req.bootstrap_port}",
-                bootstrap_room=room,
-                dest_tp_ranks=[self.ps.tp_rank],
-                pp_rank=self.ps.pp_rank,
+            sender = (
+                armed.sender
+                if isinstance(armed, ArmedDecodeMigration)
+                else self._create_decode_migration_sender(recv_req)
             )
             allocated_index = self.req_to_metadata_buffer_idx_allocator.alloc()
             assert allocated_index is not None
@@ -592,6 +672,8 @@ class SchedulerDecodeMigrationMixin:
         except Exception as exc:
             if sender is not None:
                 sender.clear()
+            if isinstance(armed, ArmedDecodeMigration):
+                self.decode_migrations.discard(armed.migration_id)
             if metadata_index >= 0:
                 self.req_to_metadata_buffer_idx_allocator.free(metadata_index)
             if all(candidate is not req for candidate in self.running_batch.reqs):
@@ -797,6 +879,93 @@ class SchedulerDecodeMigrationMixin:
         )
         self._close_decode_migration(record)
 
+    def bind_decode_migration_destination(
+        self: "Scheduler", recv_req: BindDecodeMigrationReqInput
+    ) -> BindDecodeMigrationReqOutput:
+        rank = self.ps.dp_rank or 0
+
+        def output(status: str, error: str | None = None):
+            return BindDecodeMigrationReqOutput(
+                rid=recv_req.rid,
+                migration_id=recv_req.migration_id,
+                success=status == "ready",
+                status=status,
+                source_dp_rank=rank,
+                pending_token_suppressed=status == "ready",
+                error=error,
+            )
+
+        if len(recv_req.committed_input_ids) != recv_req.committed_len:
+            return output("error", "committed_input_ids length does not match")
+        if (
+            len(recv_req.pending_input_ids) != 1
+            or recv_req.logical_len != recv_req.committed_len + 1
+        ):
+            return output(
+                "error", "migration bind requires exactly one pending input token"
+            )
+
+        decode_req = next(
+            (
+                candidate
+                for candidate in (
+                    list(self.disagg_decode_prealloc_queue.queue)
+                    + list(self.disagg_decode_transfer_queue.queue)
+                )
+                if candidate.req.rid == recv_req.rid
+            ),
+            None,
+        )
+        if decode_req is None:
+            return output("not_found", "destination reservation is not active")
+
+        req = decode_req.req
+        if getattr(req, "decode_migration_id", None) != recv_req.migration_id:
+            return output("error", "destination migration identity does not match")
+        if req.bootstrap_room != recv_req.bootstrap_room:
+            return output("error", "destination bootstrap room does not match")
+
+        reserved_len = req.kv_allocated_len
+        if reserved_len < recv_req.committed_len:
+            return output(
+                "error", "destination reservation is smaller than source state"
+            )
+        if req.req_pool_idx is not None:
+            page_size = self.token_to_kv_pool_allocator.page_size
+            free_start = ceil_align(recv_req.committed_len, page_size)
+            if free_start < reserved_len:
+                unused = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+                    free_start:reserved_len
+                ]
+                self.token_to_kv_pool_allocator.free(unused)
+
+        req.origin_input_ids = array("q", recv_req.committed_input_ids)
+        req.origin_input_ids_unpadded = req.origin_input_ids
+        req.output_ids = array("q")
+        req.decode_migration_pending_input_id = recv_req.pending_input_ids[0]
+        req.full_untruncated_fill_ids = req.origin_input_ids
+        if req.req_pool_idx is not None:
+            req.kv_committed_len = recv_req.committed_len
+            req.kv_allocated_len = recv_req.committed_len
+            req.fill_len = recv_req.committed_len
+            req.set_extend_input_len(recv_req.committed_len - len(req.prefix_indices))
+        if recv_req.max_new_tokens is not None:
+            req.sampling_params.max_new_tokens = recv_req.max_new_tokens
+        if recv_req.min_new_tokens is not None:
+            req.sampling_params.min_new_tokens = recv_req.min_new_tokens
+        req.decode_migration_bound = True
+        if hasattr(decode_req.kv_receiver, "resume_waiting_timeout"):
+            decode_req.kv_receiver.resume_waiting_timeout()
+        logger.info(
+            "Bound decode migration destination rid=%s migration_id=%s "
+            "committed=%d reserved=%d",
+            recv_req.rid,
+            recv_req.migration_id,
+            recv_req.committed_len,
+            reserved_len,
+        )
+        return output("ready")
+
     def finalize_decode_migration(
         self: "Scheduler", recv_req: FinalizeDecodeMigrationReqInput
     ) -> FinalizeDecodeMigrationReqOutput:
@@ -834,7 +1003,7 @@ class SchedulerDecodeMigrationMixin:
                 )
         if isinstance(entry, ArmedDecodeMigration) and entry.rid == recv_req.rid:
             if recv_req.action == "cancel":
-                self.decode_migrations.discard(recv_req.migration_id)
+                self._discard_decode_migration_arm(entry)
                 return FinalizeDecodeMigrationReqOutput(
                     rid=recv_req.rid,
                     migration_id=recv_req.migration_id,

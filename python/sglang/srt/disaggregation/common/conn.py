@@ -1093,6 +1093,12 @@ class CommonKVReceiver(BaseKVReceiver):
             self.abort_notified = True
         return KVPoll.Failed
 
+    def defer_waiting_timeout(self) -> None:
+        self.init_time = None
+
+    def resume_waiting_timeout(self) -> None:
+        self.init_time = time.time()
+
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
 

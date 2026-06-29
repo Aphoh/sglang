@@ -335,12 +335,18 @@ class _GenerationStreamAccumulator:
                 stream_interval = (
                     req.sampling_params.stream_interval or self.default_stream_interval
                 )
+                stream_output_start_offset = getattr(
+                    req, "stream_output_start_offset", 0
+                )
+                visible_output_len = max(
+                    0, len(req.output_ids) - stream_output_start_offset
+                )
 
                 # origin stream_interval logic
                 should_output = (
-                    len(req.output_ids) % stream_interval == 1
+                    visible_output_len % stream_interval == 1
                     if stream_interval > 1
-                    else len(req.output_ids) % stream_interval == 0
+                    else visible_output_len % stream_interval == 0
                 )
 
                 if should_output:

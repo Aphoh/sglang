@@ -102,9 +102,15 @@ class _Scheduler(SchedulerDecodeMigrationMixin):
         self.tree_cache = object()
         self.process_batch_result = MagicMock()
         self.output_streamer = MagicMock()
+        self.created_senders = []
 
     def _get_decode_migration_kv_manager(self):
         return object()
+
+    def _create_decode_migration_sender(self, _recv_req):
+        sender = _Sender()
+        self.created_senders.append(sender)
+        return sender
 
     def detach_request_from_scheduling(self, req):
         removed = False
@@ -131,6 +137,7 @@ def _prepare(
     room,
     output_tokens_seen=0,
     target_sequence_length=None,
+    target_token_id=None,
 ):
     return PrepareDecodeMigrationReqInput(
         rid=rid,
@@ -140,6 +147,7 @@ def _prepare(
         bootstrap_room=room,
         output_tokens_seen=output_tokens_seen,
         target_sequence_length=target_sequence_length,
+        target_token_id=target_token_id,
     )
 
 

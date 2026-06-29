@@ -863,7 +863,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # TODO: add new_token ratio
             origin_input_len = len(decode_req.req.origin_input_ids)
             prefix_match: Optional[DecodePrefixMatch] = None
-            if self.enable_radix_cache:
+            if self.enable_radix_cache and not getattr(
+                decode_req.req, "decode_migration_id", None
+            ):
                 # Match prefix against decode's radix cache.
                 prefix_match = self._match_prefix_and_lock(decode_req.req)
                 prefix_indices = prefix_match.prefix_indices
@@ -1050,6 +1052,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 state_indices,
                 decode_prefix_len=total_prefix_len,
             )
+            if getattr(decode_req.req, "decode_migration_id", None) and hasattr(
+                decode_req.kv_receiver, "defer_waiting_timeout"
+            ):
+                decode_req.kv_receiver.defer_waiting_timeout()
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -1524,7 +1530,27 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._commit_hicache_local_restore_to_req(decode_req)
 
         # Case 3: Success - commit the transfer
-        decode_req.req.output_ids.append(output_id[0].item())
+        transferred_output_id = output_id[0].item()
+        expected_output_id = getattr(
+            decode_req.req, "decode_migration_pending_input_id", None
+        )
+        if (
+            expected_output_id is not None
+            and transferred_output_id != expected_output_id
+        ):
+            prepare_abort(
+                decode_req.req,
+                "Decode migration pending token does not match source state",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            return
+        decode_req.req.output_ids.append(transferred_output_id)
+        if getattr(decode_req.req, "decode_migration_id", None):
+            # The pending frontier token was already emitted by the source.
+            decode_req.req.send_token_offset = 1
+            decode_req.req.stream_output_start_offset = 1
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that
@@ -1662,6 +1688,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
+                if getattr(decode_req.req, "decode_migration_id", None) and not getattr(
+                    decode_req.req, "decode_migration_bound", False
+                ):
+                    continue
                 if (
                     self.scheduler.enable_decode_hicache
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
@@ -1927,6 +1957,11 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
+                if req.has_prebuilt_kv and req.last_node is None:
+                    # Placeholder IDs deliberately skip radix matching. Exact IDs
+                    # are installed before admission, so use the empty root match.
+                    req.last_node = self.tree_cache.root_node
+                    self.tree_cache.inc_lock_ref(req.last_node)
                 # Truncate fill_len to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).

@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    BindDecodeMigrationReqInput,
     BlockReqInput,
     FinalizeDecodeMigrationReqInput,
     PrepareDecodeMigrationReqInput,
@@ -262,6 +263,10 @@ class DataParallelController:
                 (TokenizedGenerateReqInput, self.dispatching_with_trace),
                 (
                     PrepareDecodeMigrationReqInput,
+                    self.send_routed_control_message,
+                ),
+                (
+                    BindDecodeMigrationReqInput,
                     self.send_routed_control_message,
                 ),
                 (
