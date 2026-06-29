@@ -12,7 +12,7 @@ from sglang.srt.disaggregation.decode import (
     SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.decode_migration import SchedulerDecodeMigrationMixin
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, MetadataBuffers
 from sglang.srt.managers.io_struct import BindDecodeMigrationReqInput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.result_disposition import (
@@ -200,6 +200,38 @@ class DecodeMigrationReceiverInitializationTests(unittest.TestCase):
 
 
 class DecodeMigrationEarlyReservationTests(unittest.TestCase):
+    def test_frontier_metadata_round_trip(self):
+        buffers = MetadataBuffers(
+            2,
+            hidden_size=16,
+            hidden_states_dtype=torch.float32,
+            decode_migration_max_tokens=32,
+        )
+        buffers.set_decode_migration_frontier(
+            1,
+            committed_input_ids=[10, 11, 20, 21],
+            pending_input_id=22,
+            prompt_len=2,
+            logical_len=5,
+            output_tokens_seen=3,
+            max_new_tokens=9,
+            min_new_tokens=1,
+        )
+
+        self.assertEqual(
+            buffers.get_decode_migration_frontier(1),
+            {
+                "committed_input_ids": [10, 11, 20, 21],
+                "pending_input_ids": [22],
+                "prompt_len": 2,
+                "committed_len": 4,
+                "logical_len": 5,
+                "output_tokens_seen": 3,
+                "max_new_tokens": 9,
+                "min_new_tokens": 1,
+            },
+        )
+
     def test_bind_replaces_placeholders_and_releases_unused_tail(self):
         req = SimpleNamespace(
             rid="destination",
@@ -303,25 +335,46 @@ class DecodeMigrationEarlyReservationTests(unittest.TestCase):
         allocator.free.assert_not_called()
         receiver.resume_waiting_timeout.assert_not_called()
 
-    def test_completed_transfer_waits_for_exact_state_bind(self):
+    def test_completed_transfer_binds_from_transferred_frontier(self):
         req = SimpleNamespace(
             rid="destination",
             decode_migration_bound=False,
             decode_migration_id="migration",
+            bootstrap_room=17,
+            return_logprob=False,
+            finished_reason=None,
         )
-        decode_req = DecodeRequest(req=req, kv_receiver=MagicMock())
+        decode_req = DecodeRequest(
+            req=req, kv_receiver=MagicMock(), metadata_buffer_index=0
+        )
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = [decode_req]
-        queue.scheduler = SimpleNamespace(enable_decode_hicache=False)
+        queue.scheduler = SimpleNamespace(
+            enable_decode_hicache=False,
+            enable_hisparse=False,
+            metrics_reporter=SimpleNamespace(enable_metrics=False),
+            bind_decode_migration_destination_from_transfer=MagicMock(
+                side_effect=lambda _decode_req: setattr(
+                    req, "decode_migration_bound", True
+                )
+            ),
+        )
         queue.enable_staging = False
+        queue.metadata_buffers = SimpleNamespace(
+            bootstrap_room=torch.zeros((1, 1), dtype=torch.int64)
+        )
+        queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(free=MagicMock())
         queue._poll_with_metadata_gate = MagicMock(return_value=[KVPoll.Success])
         queue._commit_transfer_to_req = MagicMock()
 
         transferred = queue.pop_transferred()
 
-        self.assertEqual(transferred, [])
-        self.assertEqual(queue.queue, [decode_req])
-        queue._commit_transfer_to_req.assert_not_called()
+        self.assertEqual(transferred, [req])
+        self.assertEqual(queue.queue, [])
+        queue.scheduler.bind_decode_migration_destination_from_transfer.assert_called_once_with(
+            decode_req
+        )
+        queue._commit_transfer_to_req.assert_called_once_with(decode_req)
 
 
 class DecodeMigrationDestinationTimeoutTests(unittest.TestCase):

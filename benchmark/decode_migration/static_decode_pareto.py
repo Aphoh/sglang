@@ -226,7 +226,8 @@ def run(args) -> dict:
     measurement_started = benchmark_started + warmup_requests * interval
     measurement_started_wall = benchmark_started_wall + warmup_requests * interval
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=total_requests) as pool:
+    max_workers = args.max_concurrency or total_requests
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
             pool.submit(
                 stream_one,
@@ -355,6 +356,11 @@ def main() -> None:
     p.add_argument("--mode", choices=("baseline", "migration"), required=True)
     p.add_argument("--run-label", default="")
     p.add_argument("--requests", type=int, default=64)
+    p.add_argument(
+        "--max-concurrency",
+        type=int,
+        help="Maximum number of in-flight requests (default: all requests).",
+    )
     p.add_argument("--arrival-rate", type=float, required=True)
     p.add_argument(
         "--max-tokens",

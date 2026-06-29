@@ -194,6 +194,7 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         state_item_lens = [[64], [128, 256]]
         state_dims = [[16], [32, 64]]
         staging_ptr = high_ptr + 0x5000
+        aux_item_lens = [64, 128]
 
         msg = [
             b"None",
@@ -212,6 +213,8 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
             pack_int_lists(state_dims, "I"),
             struct.pack("Q", staging_ptr),
             b"1048576",
+            b"4096",
+            b"".join(struct.pack("Q", length) for length in aux_item_lens),
         ]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
@@ -230,6 +233,7 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_kv_item_len, 1024)
         self.assertEqual(info.dst_state_item_lens, state_item_lens)
         self.assertEqual(info.dst_state_dim_per_tensor, state_dims)
+        self.assertEqual(info.dst_aux_item_lens, aux_item_lens)
         self.assertIsNotNone(info.staging)
         self.assertEqual(info.staging.base_ptr, staging_ptr)
         self.assertEqual(info.staging.total_size, 1048576)
@@ -255,7 +259,37 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_state_data_ptrs, [])
         self.assertEqual(info.dst_state_item_lens, [])
         self.assertEqual(info.dst_state_dim_per_tensor, [])
+        self.assertEqual(info.dst_aux_item_lens, [])
         self.assertIsNone(info.staging)
+
+    def test_send_aux_uses_peer_stride_and_bounded_length(self):
+        manager = NixlKVManager.__new__(NixlKVManager)
+        manager.agent = StagingFakeAgent()
+        manager.kv_args = SimpleNamespace(
+            aux_data_ptrs=[0x1000, 0x2000],
+            aux_item_lens=[128, 64],
+        )
+        manager.decode_kv_args_table = {
+            "peer": SimpleNamespace(dst_aux_item_lens=[256, 64])
+        }
+
+        manager.send_aux(
+            "peer",
+            prefill_aux_index=2,
+            dst_aux_ptrs=[0x3000, 0x4000],
+            dst_aux_index=3,
+            notif="notif",
+            aux_transfer_lens={0: 96},
+        )
+
+        self.assertEqual(
+            manager.agent.get_xfer_descs_calls[0][0],
+            [(0x1000 + 2 * 128, 96, 0), (0x2000 + 2 * 64, 64, 0)],
+        )
+        self.assertEqual(
+            manager.agent.get_xfer_descs_calls[1][0],
+            [(0x3000 + 3 * 256, 96, 0), (0x4000 + 3 * 64, 64, 0)],
+        )
 
 
 class TestNixlTransferStatus(CustomTestCase):
@@ -321,6 +355,50 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
         self.assertTrue(sender.should_send_kv_chunk(0, last_chunk=True))
         self.assertFalse(sender.should_send_kv_chunk(0, last_chunk=False))
         self.assertTrue(sender.should_send_kv_chunk(3, last_chunk=False))
+
+
+class TestNixlAsyncTransferCompletion(CustomTestCase):
+    def test_completion_updates_status_and_releases_room_state(self):
+        manager = NixlKVManager.__new__(NixlKVManager)
+        manager.agent = SimpleNamespace(
+            check_xfer_state=MagicMock(side_effect=["PROC", "DONE"]),
+        )
+        manager.update_status = MagicMock()
+        manager.request_status = {17: KVPoll.Transferring}
+        manager.transfer_infos = {17: object()}
+        manager.req_to_decode_prefix_len = {17: 3}
+        manager.enable_staging = False
+        chunk = SimpleNamespace(is_last_chunk=True)
+
+        manager._wait_for_transfer_handles(17, ["handle"])
+        manager._complete_transfer_chunk(17, chunk)
+
+        manager.update_status.assert_called_once_with(17, KVPoll.Success)
+        self.assertNotIn(17, manager.transfer_infos)
+        self.assertNotIn(17, manager.req_to_decode_prefix_len)
+
+    def test_nonfinal_completion_keeps_room_active(self):
+        manager = NixlKVManager.__new__(NixlKVManager)
+        manager.update_status = MagicMock()
+        manager.request_status = {19: KVPoll.Transferring}
+
+        manager._complete_transfer_chunk(19, SimpleNamespace(is_last_chunk=False))
+
+        manager.update_status.assert_called_once_with(19, KVPoll.Transferring)
+
+    def test_completion_after_abort_only_releases_room_state(self):
+        manager = NixlKVManager.__new__(NixlKVManager)
+        manager.update_status = MagicMock()
+        manager.request_status = {23: KVPoll.Failed}
+        manager.transfer_infos = {23: object()}
+        manager.req_to_decode_prefix_len = {23: 5}
+        manager.enable_staging = False
+
+        manager._complete_transfer_chunk(23, SimpleNamespace(is_last_chunk=True))
+
+        manager.update_status.assert_not_called()
+        self.assertNotIn(23, manager.transfer_infos)
+        self.assertNotIn(23, manager.req_to_decode_prefix_len)
 
 
 class TestNixlNotifications(CustomTestCase):
@@ -675,8 +753,8 @@ class TestNixlStaging(CustomTestCase):
             staging=SimpleNamespace(base_ptr=0x8000, total_size=4096),
         )
         calls = []
-        mgr.send_kvcache_staged = (
-            lambda *args, **kwargs: calls.append((args, kwargs)) or "handle"
+        mgr.send_kvcache_staged = lambda *args, **kwargs: (
+            calls.append((args, kwargs)) or "handle"
         )
 
         handle, deferred = mgr._do_staging_transfer(

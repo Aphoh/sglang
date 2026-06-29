@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from queue import Queue
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -122,6 +123,7 @@ class KVArgsRegisterInfo:
     dst_num_slots: Optional[int] = None
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
+    dst_aux_item_lens: List[int] = dataclasses.field(default_factory=list)
     # Keep last: optional, parsed from a variable-length tail of the ZMQ
     # frame in from_zmq() below, so positional construction stays stable.
     staging: Optional["StagingRegisterInfo"] = None
@@ -140,6 +142,11 @@ class KVArgsRegisterInfo:
         dst_num_slots = (
             int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else None
         )
+        dst_aux_item_lens = (
+            list(struct.unpack(f"{len(msg[17]) // 8}Q", msg[17]))
+            if len(msg) > 17 and msg[17] != b""
+            else []
+        )
 
         return cls(
             room=str(msg[0].decode("ascii")),
@@ -157,6 +164,7 @@ class KVArgsRegisterInfo:
             dst_num_slots=dst_num_slots,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
+            dst_aux_item_lens=dst_aux_item_lens,
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
         )
 
@@ -246,7 +254,11 @@ class NixlKVManager(CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         try:
-            from nixl._api import nixl_agent, nixl_agent_config
+            from nixl._api import (
+                nixl_agent,
+                nixl_agent_config,
+                nixl_thread_sync_t,
+            )
         except ImportError as e:
             raise ImportError(
                 "Please install NIXL by following the instructions at "
@@ -267,8 +279,30 @@ class NixlKVManager(CommonKVManager):
                 "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS must be a JSON object "
                 "with string keys and string values"
             )
-        agent_config = nixl_agent_config(backends=[], num_threads=num_threads)
+        manual_progress = args.nixl_manual_progress
+        logger.info(
+            "Initializing NIXL manager mode=%s manual_progress=%s",
+            disaggregation_mode,
+            manual_progress,
+        )
+        agent_config = nixl_agent_config(
+            backends=[],
+            # Source-side posting benefits from NIXL's progress thread. The
+            # destination instead uses the low-latency notification worker below.
+            enable_prog_thread=(
+                not manual_progress or disaggregation_mode == DisaggregationMode.PREFILL
+            ),
+            num_threads=num_threads,
+            sync_mode=(
+                nixl_thread_sync_t.NIXL_THREAD_SYNC_RW if manual_progress else None
+            ),
+        )
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
+        if manual_progress and backend == "UCX":
+            # Migration lists are typically a few hundred descriptors, below
+            # NIXL's large-transfer default of 1024. Use the existing posting
+            # pool for these latency-sensitive transfers unless overridden.
+            backend_params.setdefault("split_batch_size", "16")
         if num_threads > 0:
             # TODO: Remove this once NIXL passes thread parameters from
             # nixl_agent_config to explicitly-created backends.
@@ -304,10 +338,18 @@ class NixlKVManager(CommonKVManager):
             self._num_slots_src = (
                 self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
             )
-            transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
+            # A dedicated migration sender uses one lane because concurrent
+            # transfer()/check_xfer_state() loops on the same NIXL agent cause
+            # severe posting contention. Normal P/D managers retain the
+            # configured queue count.
+            transfer_queue_size = (
+                1 if manual_progress else envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
+            )
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
+            self._defer_transfer_completion = manual_progress
+            self._transfer_completion_queue = Queue()
             self.exceptions: Dict[int, Exception] = {}
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
@@ -324,6 +366,13 @@ class NixlKVManager(CommonKVManager):
                 threading.Thread(
                     target=self.transfer_worker,
                     args=(queue, staging_buffer),
+                    name=f"nixl-kv-transfer-{i}",
+                    daemon=True,
+                ).start()
+            if self._defer_transfer_completion:
+                threading.Thread(
+                    target=self.transfer_completion_worker,
+                    name="nixl-transfer-completion",
                     daemon=True,
                 ).start()
             self._start_bootstrap_thread()
@@ -331,11 +380,14 @@ class NixlKVManager(CommonKVManager):
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
+            self._transfer_status_lock = threading.Lock()
             if self.enable_staging:
                 self._init_staging_decode_ctx()
                 self._staging_handler = None
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
                 self._start_decode_staging_thread()
+            if manual_progress and server_args.enable_decode_migration:
+                self._start_decode_progress_thread()
             self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
@@ -849,6 +901,7 @@ class NixlKVManager(CommonKVManager):
                             dst_info.dst_aux_ptrs,
                             req.dst_aux_index,
                             aux_notif,
+                            kv_chunk.aux_transfer_lens,
                         )
                         handles.append(aux_xfer_handle)
 
@@ -856,41 +909,63 @@ class NixlKVManager(CommonKVManager):
                     # Chunk has been re-enqueued; do not advance status.
                     continue
 
-                while handles:
-                    states = [self.agent.check_xfer_state(h) for h in handles]
-                    if any(s == "ERR" for s in states):
-                        raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
-                    if all(s == "DONE" for s in states):
-                        break
-                    time.sleep(0)
-
-                if kv_chunk.is_last_chunk:
-                    self.update_status(room, KVPoll.Success)
-                    # Drop per-room state on Success (parity with mooncake
-                    # transfer_worker; staging prefetch sets are NIXL-only).
-                    self.transfer_infos.pop(room, None)
-                    self.req_to_decode_prefix_len.pop(room, None)
-                    if self.enable_staging and self._staging_ctx is not None:
-                        self._staging_ctx.prefetched_rooms.discard(room)
-                        self._staging_ctx.prefetch_requested = {
-                            k
-                            for k in self._staging_ctx.prefetch_requested
-                            if k[0] != room
-                        }
+                if self._defer_transfer_completion:
+                    self._transfer_completion_queue.put((room, handles, kv_chunk))
                 else:
-                    self.update_status(room, KVPoll.Transferring)
+                    self._wait_for_transfer_handles(room, handles)
+                    self._complete_transfer_chunk(room, kv_chunk)
             except Exception as e:
-                # Catch all exceptions to prevent silently killing this
-                # worker thread, but still propagate via failure_exception().
-                if isinstance(e, _NIXL_TRANSPORT_ERRORS):
-                    logger.warning(f"NIXL transport error for room {room}: {e}")
-                else:
-                    logger.exception(
-                        f"Unexpected transfer worker error for room {room}"
-                    )
-                self.exceptions[room] = e
-                self.record_failure(room, str(e))
-                self.update_status(room, KVPoll.Failed)
+                self._record_transfer_error(room, e)
+
+    def transfer_completion_worker(self):
+        """Observe posted migration transfers without blocking the posting lane."""
+        while True:
+            room, handles, kv_chunk = self._transfer_completion_queue.get()
+            try:
+                self._wait_for_transfer_handles(room, handles)
+                self._complete_transfer_chunk(room, kv_chunk)
+            except Exception as exc:
+                self._record_transfer_error(room, exc)
+
+    def _wait_for_transfer_handles(self, room: int, handles: List[Any]) -> None:
+        while handles:
+            states = [self.agent.check_xfer_state(handle) for handle in handles]
+            if any(state == "ERR" for state in states):
+                raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
+            if all(state == "DONE" for state in states):
+                return
+            time.sleep(0)
+
+    def _complete_transfer_chunk(self, room: int, kv_chunk: TransferKVChunk) -> None:
+        status = self.request_status.get(room)
+        if status is None or status == KVPoll.Failed:
+            self._drop_transfer_room(room)
+            return
+        if not kv_chunk.is_last_chunk:
+            self.update_status(room, KVPoll.Transferring)
+            return
+
+        self.update_status(room, KVPoll.Success)
+        self._drop_transfer_room(room)
+
+    def _drop_transfer_room(self, room: int) -> None:
+        self.transfer_infos.pop(room, None)
+        self.req_to_decode_prefix_len.pop(room, None)
+        if self.enable_staging and self._staging_ctx is not None:
+            self._staging_ctx.prefetched_rooms.discard(room)
+            self._staging_ctx.prefetch_requested = {
+                key for key in self._staging_ctx.prefetch_requested if key[0] != room
+            }
+
+    def _record_transfer_error(self, room: int, exc: Exception) -> None:
+        # Keep worker threads alive while propagating the failure to sender.poll().
+        if isinstance(exc, _NIXL_TRANSPORT_ERRORS):
+            logger.warning("NIXL transport error for room %d: %s", room, exc)
+        else:
+            logger.exception("Unexpected transfer worker error for room %d", room)
+        self.exceptions[room] = exc
+        self.record_failure(room, str(exc))
+        self.update_status(room, KVPoll.Failed)
 
     def register_buffer_to_engine(self):
         kv_addrs = []
@@ -1361,17 +1436,31 @@ class NixlKVManager(CommonKVManager):
         dst_aux_ptrs: list[int],
         dst_aux_index: int,
         notif: str,
+        aux_transfer_lens: Optional[dict[int, int]] = None,
     ):
         src_addrs = []
         dst_addrs = []
 
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
+        dst_aux_item_lens = (
+            self.decode_kv_args_table[peer_name].dst_aux_item_lens
+            or prefill_aux_item_lens
+        )
+        if len(dst_aux_item_lens) != len(prefill_aux_item_lens):
+            raise ValueError("Source and destination auxiliary buffer counts differ")
 
         for i, _ in enumerate(dst_aux_ptrs):
-            length = prefill_aux_item_lens[i]
-            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
+            src_item_len = prefill_aux_item_lens[i]
+            dst_item_len = dst_aux_item_lens[i]
+            default_len = min(src_item_len, 64) if i == 0 else src_item_len
+            length = (aux_transfer_lens or {}).get(i, default_len)
+            if length <= 0 or length > min(src_item_len, dst_item_len):
+                raise ValueError(
+                    f"Invalid auxiliary transfer length {length} for buffer {i}"
+                )
+            src_addr = prefill_aux_ptrs[i] + src_item_len * prefill_aux_index
+            dst_addr = dst_aux_ptrs[i] + dst_item_len * dst_aux_index
             src_addrs.append((src_addr, length, 0))
             dst_addrs.append((dst_addr, length, 0))
 
@@ -1648,6 +1737,7 @@ class NixlKVManager(CommonKVManager):
         is_last_chunk: bool,
         chunk_id: int,
         aux_index: Optional[int] = None,
+        aux_transfer_lens: Optional[dict[int, int]] = None,
         state_indices: Optional[List] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
@@ -1675,42 +1765,61 @@ class NixlKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 chunk_id=chunk_id,
                 prefill_aux_index=aux_index,
+                aux_transfer_lens=aux_transfer_lens,
                 state_indices=state_indices,
             )
         )
         return None
 
+    def _start_decode_progress_thread(self):
+        def progress_worker():
+            while True:
+                self.update_transfer_status()
+                time.sleep(0.001)
+
+        threading.Thread(
+            target=progress_worker,
+            name="nixl-decode-progress",
+            daemon=True,
+        ).start()
+
     def update_transfer_status(self):
-        # Process notifications from received transfers.
-        notif_map = self.agent.get_new_notifs()
-        for peer_name, messages in notif_map.items():
-            for msg in messages:
-                # Notification tag layouts (underscore-separated):
-                #   kv:    {room}_kv_{chunk_id}_{is_last}_{pp_rank}             -> 5 fields
-                #   stg:   {room}_stg_{chunk_id}_{is_last}_{pp_rank}_{chunk_idx}
-                #          _{page_start}_{num_pages}_{agent_name}               -> 9 fields
-                #   aux:   {room}_aux                                           -> 2 fields
-                #   state: {room}_state_{pp_rank}                               -> 3 fields
-                # maxsplit=8 keeps everything past the 8th underscore in the
-                # last component, so agent_name (which may itself contain
-                # underscores) lands intact in components[8] for the stg path.
-                components = msg.decode("ascii").split("_", 8)
-                room = int(components[0])
-                tag = components[1]
-                if tag == "kv":
-                    chunk_id = int(components[2])
-                    is_last_chunk = bool(int(components[3]))
-                    pp_rank = int(components[4]) if len(components) > 4 else 0
-                    self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
-                elif tag == "stg":
-                    self._handle_stg_notification(components, room)
-                elif tag == "aux":
-                    # main's "nokv" marker (decode-side radix cache hit):
-                    # mark expected_kvs_per_pp[pp_rank] = 0 for this rank.
-                    self._handle_aux_notification(room, components)
-                elif tag == "state":
-                    pp_rank = int(components[2]) if len(components) > 2 else 0
-                    self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+        lock = getattr(self, "_transfer_status_lock", None)
+
+        def process_notifications():
+            # Keep notification retrieval and status mutation atomic. In
+            # manual-progress mode this runs on the dedicated progress thread.
+            notif_map = self.agent.get_new_notifs()
+            for _peer_name, messages in notif_map.items():
+                for msg in messages:
+                    # Notification tag layouts (underscore-separated):
+                    #   kv:    {room}_kv_{chunk_id}_{is_last}_{pp_rank}
+                    #   aux:   {room}_aux
+                    #   state: {room}_state_{pp_rank}
+                    # maxsplit preserves underscores in staging agent names.
+                    components = msg.decode("ascii").split("_", 8)
+                    room = int(components[0])
+                    tag = components[1]
+                    if tag == "kv":
+                        chunk_id = int(components[2])
+                        is_last_chunk = bool(int(components[3]))
+                        pp_rank = int(components[4]) if len(components) > 4 else 0
+                        self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
+                    elif tag == "stg":
+                        self._handle_stg_notification(components, room)
+                    elif tag == "aux":
+                        # main's "nokv" marker (decode-side radix cache hit):
+                        # mark expected_kvs_per_pp[pp_rank] = 0 for this rank.
+                        self._handle_aux_notification(room, components)
+                    elif tag == "state":
+                        pp_rank = int(components[2]) if len(components) > 2 else 0
+                        self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+
+        if lock is None:
+            process_notifications()
+        else:
+            with lock:
+                process_notifications()
 
     def _handle_stg_notification(self, components, room: int):
         """Handle a staging RDMA notification tag.
@@ -1813,9 +1922,17 @@ class NixlKVManager(CommonKVManager):
             self._chunk_writer_counts.pop(room, None)
 
     def check_transfer_done(self, room: int):
-        if room not in self.transfer_statuses:
-            return False
-        return self.transfer_statuses[room].is_done()
+        lock = getattr(self, "_transfer_status_lock", None)
+
+        def is_done():
+            if room not in self.transfer_statuses:
+                return False
+            return self.transfer_statuses[room].is_done()
+
+        if lock is None:
+            return is_done()
+        with lock:
+            return is_done()
 
     def _start_bootstrap_thread(self):
         def bootstrap_thread():
@@ -1934,6 +2051,7 @@ class NixlKVSender(CommonKVSender):
             is_last_chunk,
             self.chunk_id,
             self.aux_index,
+            self.aux_transfer_lens,
             state_indices,
         )
         self._record_transfer_indices(kv_indices, state_indices)
@@ -2100,6 +2218,9 @@ class NixlKVReceiver(CommonKVReceiver):
             packed_aux_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
+            packed_aux_item_lens = b"".join(
+                struct.pack("Q", length) for length in self.kv_mgr.kv_args.aux_item_lens
+            )
             packed_state_data_ptrs = pack_int_lists(
                 self.kv_mgr.kv_args.state_data_ptrs or [], "Q"
             )
@@ -2147,6 +2268,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         packed_staging_base_ptr,
                         staging_total_size_str,
                         str(dst_num_slots).encode("ascii"),
+                        packed_aux_item_lens,
                     ]
                 )
 

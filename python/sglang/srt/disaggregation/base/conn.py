@@ -66,6 +66,8 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # Decode migration uses dedicated NIXL send/receive progress threads.
+    nixl_manual_progress: bool = False
 
 
 class KVPoll:
@@ -126,6 +128,10 @@ class BaseKVSender(ABC):
 
     def pop_decode_prefix_len(self) -> int:
         return 0
+
+    def set_aux_transfer_lens(self, aux_transfer_lens: dict[int, int]) -> None:
+        """Override fixed auxiliary item lengths for this request."""
+        pass
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0

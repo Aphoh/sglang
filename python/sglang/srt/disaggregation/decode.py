@@ -442,6 +442,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
+        kv_args.nixl_manual_progress = (
+            self.scheduler.server_args.enable_decode_migration
+        )
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -1693,13 +1696,41 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 if getattr(decode_req.req, "decode_migration_id", None) and not getattr(
                     decode_req.req, "decode_migration_bound", False
                 ):
-                    continue
+                    error = (
+                        self.scheduler.bind_decode_migration_destination_from_transfer(
+                            decode_req
+                        )
+                    )
+                    if error is not None:
+                        prepare_abort(
+                            decode_req.req,
+                            error,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                        decode_req.kv_receiver.clear()
+                        decode_req.kv_receiver = None
+                        indices_to_remove.add(i)
+                        self.scheduler.output_streamer.stream_output(
+                            [decode_req.req], decode_req.req.return_logprob
+                        )
+                        release_kv_cache(
+                            decode_req.req, self.tree_cache, is_insert=False
+                        )
+                        continue
                 if (
                     self.scheduler.enable_decode_hicache
                     and hicache_restore_status == HiCacheRestoreResult.PENDING
                 ):
                     continue
                 self._commit_transfer_to_req(decode_req)
+                if getattr(decode_req.req, "decode_migration_id", None):
+                    logger.debug(
+                        "Decode migration receiver admitted rid=%s migration_id=%s "
+                        "room=%s",
+                        decode_req.req.rid,
+                        decode_req.req.decode_migration_id,
+                        decode_req.req.bootstrap_room,
+                    )
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):

@@ -722,6 +722,7 @@ class CommonKVSender(BaseKVSender):
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
         self._transfer_num_state_indices = 0
+        self.aux_transfer_lens: dict[int, int] = {}
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
@@ -779,6 +780,9 @@ class CommonKVSender(BaseKVSender):
 
     def pop_decode_prefix_len(self) -> int:
         return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
+
+    def set_aux_transfer_lens(self, aux_transfer_lens: dict[int, int]) -> None:
+        self.aux_transfer_lens = dict(aux_transfer_lens)
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk

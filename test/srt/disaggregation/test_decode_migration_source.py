@@ -23,6 +23,7 @@ from sglang.srt.managers.io_struct import (
     QuiesceDecodeMigrationReqInput,
     QuiesceDecodeMigrationReqOutput,
 )
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.result_disposition import (
     ResultDisposition,
 )
@@ -34,8 +35,10 @@ class _Batch:
         self.reqs = list(reqs)
         self.decoding_reqs = None
         self.batch_is_full = True
+        self.filter_calls = 0
 
     def filter_batch(self, keep_indices=None, **_kwargs):
+        self.filter_calls += 1
         if keep_indices is None:
             keep_indices = list(range(len(self.reqs)))
         self.reqs = [self.reqs[index] for index in keep_indices]
@@ -165,6 +168,31 @@ class DecodeMigrationSourceTests(unittest.TestCase):
                 _Sender if kind == KVClassType.SENDER else object
             ),
         )
+
+    def test_scheduler_batches_deferred_request_detaches(self):
+        reqs = [_Req(str(index)) for index in range(8)]
+        running_batch = _Batch(reqs)
+        running_batch.decoding_reqs = list(reqs)
+        scheduler = SimpleNamespace(
+            running_batch=running_batch,
+            last_batch=running_batch,
+            cur_batch=running_batch,
+            _deferred_detach_requests={},
+        )
+
+        for req in reqs[:6]:
+            self.assertTrue(Scheduler.detach_request_from_scheduling(scheduler, req))
+        self.assertEqual(running_batch.reqs, reqs)
+
+        removed = Scheduler._detach_requests_from_scheduling(
+            scheduler, list(scheduler._deferred_detach_requests.values())
+        )
+
+        self.assertEqual(removed, {id(req) for req in reqs[:6]})
+        self.assertEqual(running_batch.reqs, reqs[6:])
+        self.assertEqual(running_batch.decoding_reqs, reqs[6:])
+        self.assertEqual(running_batch.filter_calls, 1)
+        self.assertFalse(running_batch.batch_is_full)
 
     def test_quiesce_uses_the_frontend_acknowledged_frontier(self):
         target = _Req("target", output_ids=[20, 21])

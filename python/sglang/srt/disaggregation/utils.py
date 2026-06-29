@@ -195,6 +195,9 @@ class ReqToMetadataIdxAllocator:
 
 
 class MetadataBuffers:
+    _MIGRATION_MAGIC = 0x4D494752
+    _MIGRATION_HEADER_SIZE = 8
+
     def __init__(
         self,
         size: int,
@@ -202,6 +205,7 @@ class MetadataBuffers:
         hidden_states_dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
+        decode_migration_max_tokens: Optional[int] = None,
     ):
         self.custom_mem_pool = custom_mem_pool
         bootstrap_room_dtype = torch.uint64
@@ -225,7 +229,13 @@ class MetadataBuffers:
 
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
-            self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
+            output_ids_width = max(
+                16,
+                (decode_migration_max_tokens or 0) + self._MIGRATION_HEADER_SIZE,
+            )
+            self.output_ids = torch.zeros(
+                (size, output_ids_width), dtype=torch.int32, device=device
+            )
             self.cached_tokens = torch.zeros(
                 (size, 16), dtype=torch.int32, device=device
             )
@@ -297,7 +307,7 @@ class MetadataBuffers:
 
     def get_buf(self, idx: int):
         return (
-            self.output_ids[idx].clone(),
+            self.output_ids[idx, :16].clone(),
             self.cached_tokens[idx].clone(),
             self.output_token_logprobs_val[idx].clone(),
             self.output_token_logprobs_idx[idx].clone(),
@@ -308,6 +318,67 @@ class MetadataBuffers:
             self.output_hidden_states[idx].clone(),
             self.bootstrap_room[idx].clone(),
         )
+
+    def set_decode_migration_frontier(
+        self,
+        idx: int,
+        *,
+        committed_input_ids: list[int],
+        pending_input_id: int,
+        prompt_len: int,
+        logical_len: int,
+        output_tokens_seen: int,
+        max_new_tokens: Optional[int],
+        min_new_tokens: Optional[int],
+    ) -> None:
+        row = self.output_ids[idx]
+        token_start = self._MIGRATION_HEADER_SIZE
+        if token_start + len(committed_input_ids) > row.numel():
+            raise ValueError("Decode migration frontier exceeds metadata capacity")
+
+        row.zero_()
+        row[0] = pending_input_id
+        row[1] = self._MIGRATION_MAGIC
+        row[2] = prompt_len
+        row[3] = len(committed_input_ids)
+        row[4] = logical_len
+        row[5] = output_tokens_seen
+        row[6] = -1 if max_new_tokens is None else max_new_tokens
+        row[7] = -1 if min_new_tokens is None else min_new_tokens
+        row[token_start : token_start + len(committed_input_ids)] = torch.tensor(
+            committed_input_ids, dtype=torch.int32, device=row.device
+        )
+
+    def get_decode_migration_frontier(self, idx: int) -> Optional[dict]:
+        row = self.output_ids[idx]
+        if int(row[1].item()) != self._MIGRATION_MAGIC:
+            return None
+
+        committed_len = int(row[3].item())
+        token_start = self._MIGRATION_HEADER_SIZE
+        if committed_len < 0 or token_start + committed_len > row.numel():
+            raise ValueError("Invalid decode migration frontier length")
+
+        max_new_tokens = int(row[6].item())
+        min_new_tokens = int(row[7].item())
+        return {
+            "committed_input_ids": row[
+                token_start : token_start + committed_len
+            ].tolist(),
+            "pending_input_ids": [int(row[0].item())],
+            "prompt_len": int(row[2].item()),
+            "committed_len": committed_len,
+            "logical_len": int(row[4].item()),
+            "output_tokens_seen": int(row[5].item()),
+            "max_new_tokens": max_new_tokens if max_new_tokens >= 0 else None,
+            "min_new_tokens": min_new_tokens if min_new_tokens >= 0 else None,
+        }
+
+    def decode_migration_frontier_nbytes(self, committed_len: int) -> int:
+        elements = self._MIGRATION_HEADER_SIZE + committed_len
+        if elements > self.output_ids.shape[1]:
+            raise ValueError("Decode migration frontier exceeds metadata capacity")
+        return elements * self.output_ids.element_size()
 
     def set_buf(self, req: Req):
 

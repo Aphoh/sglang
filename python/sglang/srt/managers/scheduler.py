@@ -1085,6 +1085,11 @@ class Scheduler(
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                decode_migration_max_tokens=(
+                    self.max_req_len
+                    if self.server_args.enable_decode_migration
+                    else None
+                ),
             )
 
             (
@@ -1113,6 +1118,11 @@ class Scheduler(
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                decode_migration_max_tokens=(
+                    self.max_req_len
+                    if self.server_args.enable_decode_migration
+                    else None
+                ),
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -1148,6 +1158,7 @@ class Scheduler(
                     hidden_size=16,
                     hidden_states_dtype=torch.float32,
                     custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                    decode_migration_max_tokens=self.max_req_len,
                 )
             (
                 self.disagg_decode_prealloc_queue,
@@ -1564,23 +1575,38 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
-        for recv_req in recv_reqs:
-            # Skip health check when server is busy — ongoing requests already carry health info.
-            if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
-                for_health_check=True
-            ):
-                self.return_health_check_ipcs.append(
-                    getattr(recv_req, "http_worker_ipc", None)
-                )
-                continue
+        self._deferred_detach_requests = (
+            {} if self.server_args.enable_decode_migration else None
+        )
+        try:
+            for recv_req in recv_reqs:
+                # Skip health check when server is busy — ongoing requests already carry health info.
+                if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
+                    for_health_check=True
+                ):
+                    self.return_health_check_ipcs.append(
+                        getattr(recv_req, "http_worker_ipc", None)
+                    )
+                    continue
 
-            output = self._request_dispatcher(recv_req)
-            if output is not None:
-                if not isinstance(output, RpcReqOutput):
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
-                else:
-                    if self.ipc_channels.recv_from_rpc is not None:
-                        self.ipc_channels.recv_from_rpc.send_pyobj(output)
+                output = self._request_dispatcher(recv_req)
+                if output is not None:
+                    if not isinstance(output, RpcReqOutput):
+                        self.ipc_channels.send_to_tokenizer.send_output(
+                            output, recv_req
+                        )
+                    else:
+                        if self.ipc_channels.recv_from_rpc is not None:
+                            self.ipc_channels.recv_from_rpc.send_pyobj(output)
+        finally:
+            deferred = (
+                list(self._deferred_detach_requests.values())
+                if self._deferred_detach_requests is not None
+                else []
+            )
+            self._deferred_detach_requests = None
+            if deferred:
+                self._detach_requests_from_scheduling(deferred)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
@@ -2919,26 +2945,43 @@ class Scheduler(
 
     def detach_request_from_scheduling(self, req: Req) -> bool:
         """Remove a request from every scheduler batch that can retain it."""
-        removed_from_running = False
+        deferred = getattr(self, "_deferred_detach_requests", None)
+        if deferred is not None:
+            if all(candidate is not req for candidate in self.running_batch.reqs):
+                return False
+            deferred[id(req)] = req
+            return True
+        return id(req) in self._detach_requests_from_scheduling([req])
+
+    def _detach_requests_from_scheduling(self, reqs: List[Req]) -> set[int]:
+        """Remove several requests with at most one filter per retained batch."""
+        target_ids = {id(req) for req in reqs}
+        removed_from_running = set()
         seen_batches = set()
         for batch in (self.running_batch, self.last_batch, self.cur_batch):
             if batch is None or id(batch) in seen_batches:
                 continue
             seen_batches.add(id(batch))
-            if all(candidate is not req for candidate in batch.reqs):
+            removed_ids = {
+                id(candidate) for candidate in batch.reqs if id(candidate) in target_ids
+            }
+            if not removed_ids:
                 continue
             keep_indices = [
-                i for i, candidate in enumerate(batch.reqs) if candidate is not req
+                i
+                for i, candidate in enumerate(batch.reqs)
+                if id(candidate) not in target_ids
             ]
             batch.filter_batch(keep_indices=keep_indices)
             if batch.decoding_reqs is not None:
                 batch.decoding_reqs = [
                     candidate
                     for candidate in batch.decoding_reqs
-                    if candidate is not req
+                    if id(candidate) not in target_ids
                 ]
             batch.batch_is_full = False
-            removed_from_running |= batch is self.running_batch
+            if batch is self.running_batch:
+                removed_from_running.update(removed_ids)
         return removed_from_running
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:

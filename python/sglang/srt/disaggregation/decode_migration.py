@@ -237,6 +237,7 @@ class SchedulerDecodeMigrationMixin:
                     scheduler=self,
                     tp_rank=self.ps.tp_rank,
                     pp_rank=self.ps.pp_rank,
+                    nixl_manual_progress=True,
                 )
         return self._decode_migration_kv_manager
 
@@ -662,9 +663,48 @@ class SchedulerDecodeMigrationMixin:
             allocated_index = self.req_to_metadata_buffer_idx_allocator.alloc()
             assert allocated_index is not None
             metadata_index = allocated_index
-            self.disagg_metadata_buffers.output_ids[metadata_index][0] = (
-                frontier.pending_input_ids[0]
+            committed_output_tokens = max(
+                0, frontier.committed_len - frontier.prompt_len
             )
+            sampling_params = getattr(req, "sampling_params", None)
+            max_new_tokens = getattr(sampling_params, "max_new_tokens", None)
+            min_new_tokens = getattr(sampling_params, "min_new_tokens", None)
+            set_frontier = getattr(
+                self.disagg_metadata_buffers,
+                "set_decode_migration_frontier",
+                None,
+            )
+            if set_frontier is None:
+                # Compatibility for transfer-backend test doubles.
+                self.disagg_metadata_buffers.output_ids[metadata_index][0] = (
+                    frontier.pending_input_ids[0]
+                )
+            else:
+                set_frontier(
+                    metadata_index,
+                    committed_input_ids=frontier.committed_input_ids,
+                    pending_input_id=frontier.pending_input_ids[0],
+                    prompt_len=frontier.prompt_len,
+                    logical_len=frontier.logical_len,
+                    output_tokens_seen=frontier.output_tokens_seen,
+                    max_new_tokens=(
+                        max(1, max_new_tokens - committed_output_tokens)
+                        if max_new_tokens is not None
+                        else None
+                    ),
+                    min_new_tokens=(
+                        max(0, min_new_tokens - committed_output_tokens)
+                        if min_new_tokens is not None
+                        else None
+                    ),
+                )
+                sender.set_aux_transfer_lens(
+                    {
+                        0: self.disagg_metadata_buffers.decode_migration_frontier_nbytes(
+                            frontier.committed_len
+                        )
+                    }
+                )
             self.disagg_metadata_buffers.cached_tokens[metadata_index].zero_()
             self.disagg_metadata_buffers.bootstrap_room[metadata_index][0] = room
             self._park_decode_migration_req(req)
@@ -917,6 +957,56 @@ class SchedulerDecodeMigrationMixin:
         if req.bootstrap_room != recv_req.bootstrap_room:
             return output("error", "destination bootstrap room does not match")
 
+        error = SchedulerDecodeMigrationMixin._bind_decode_migration_destination_state(
+            self,
+            decode_req,
+            committed_input_ids=recv_req.committed_input_ids,
+            pending_input_ids=recv_req.pending_input_ids,
+            committed_len=recv_req.committed_len,
+            logical_len=recv_req.logical_len,
+            max_new_tokens=recv_req.max_new_tokens,
+            min_new_tokens=recv_req.min_new_tokens,
+        )
+        if error is not None:
+            return output("error", error)
+        return output("ready")
+
+    def bind_decode_migration_destination_from_transfer(
+        self: "Scheduler", decode_req
+    ) -> Optional[str]:
+        try:
+            state = self.disagg_metadata_buffers.get_decode_migration_frontier(
+                decode_req.metadata_buffer_index
+            )
+        except ValueError as exc:
+            return str(exc)
+        if state is None:
+            return "Decode migration transfer omitted frontier metadata"
+        if state["prompt_len"] > state["committed_len"]:
+            return "Decode migration prompt length exceeds committed length"
+        return SchedulerDecodeMigrationMixin._bind_decode_migration_destination_state(
+            self, decode_req, **state
+        )
+
+    def _bind_decode_migration_destination_state(
+        self: "Scheduler",
+        decode_req,
+        *,
+        committed_input_ids: list[int],
+        pending_input_ids: list[int],
+        committed_len: int,
+        logical_len: int,
+        max_new_tokens: Optional[int],
+        min_new_tokens: Optional[int],
+        **_ignored,
+    ) -> Optional[str]:
+        if len(committed_input_ids) != committed_len:
+            return "committed_input_ids length does not match"
+        if len(pending_input_ids) != 1 or logical_len != committed_len + 1:
+            return "migration bind requires exactly one pending input token"
+
+        req = decode_req.req
+
         # A placeholder can still be waiting for normal P/D preallocation when
         # the source reaches its trigger. Its logical reservation is already
         # fixed by origin_input_ids even though no request-pool slot exists yet.
@@ -929,33 +1019,31 @@ class SchedulerDecodeMigrationMixin:
             if req.req_pool_idx is None and in_prealloc_queue
             else req.kv_allocated_len
         )
-        if reserved_len < recv_req.committed_len:
-            return output(
-                "error", "destination reservation is smaller than source state"
-            )
+        if reserved_len < committed_len:
+            return "destination reservation is smaller than source state"
         if req.req_pool_idx is not None:
             page_size = self.token_to_kv_pool_allocator.page_size
-            free_start = ceil_align(recv_req.committed_len, page_size)
+            free_start = ceil_align(committed_len, page_size)
             if free_start < reserved_len:
                 unused = self.req_to_token_pool.req_to_token[req.req_pool_idx][
                     free_start:reserved_len
                 ]
                 self.token_to_kv_pool_allocator.free(unused)
 
-        req.origin_input_ids = array("q", recv_req.committed_input_ids)
+        req.origin_input_ids = array("q", committed_input_ids)
         req.origin_input_ids_unpadded = req.origin_input_ids
         req.output_ids = array("q")
-        req.decode_migration_pending_input_id = recv_req.pending_input_ids[0]
+        req.decode_migration_pending_input_id = pending_input_ids[0]
         req.full_untruncated_fill_ids = req.origin_input_ids
         if req.req_pool_idx is not None:
-            req.kv_committed_len = recv_req.committed_len
-            req.kv_allocated_len = recv_req.committed_len
-            req.fill_len = recv_req.committed_len
-            req.set_extend_input_len(recv_req.committed_len - len(req.prefix_indices))
-        if recv_req.max_new_tokens is not None:
-            req.sampling_params.max_new_tokens = recv_req.max_new_tokens
-        if recv_req.min_new_tokens is not None:
-            req.sampling_params.min_new_tokens = recv_req.min_new_tokens
+            req.kv_committed_len = committed_len
+            req.kv_allocated_len = committed_len
+            req.fill_len = committed_len
+            req.set_extend_input_len(committed_len - len(req.prefix_indices))
+        if max_new_tokens is not None:
+            req.sampling_params.max_new_tokens = max_new_tokens
+        if min_new_tokens is not None:
+            req.sampling_params.min_new_tokens = min_new_tokens
         req.decode_migration_bound = True
         if req.req_pool_idx is not None and hasattr(
             decode_req.kv_receiver, "resume_waiting_timeout"
@@ -964,12 +1052,12 @@ class SchedulerDecodeMigrationMixin:
         logger.info(
             "Bound decode migration destination rid=%s migration_id=%s "
             "committed=%d reserved=%d",
-            recv_req.rid,
-            recv_req.migration_id,
-            recv_req.committed_len,
+            req.rid,
+            req.decode_migration_id,
+            committed_len,
             reserved_len,
         )
-        return output("ready")
+        return None
 
     def finalize_decode_migration(
         self: "Scheduler", recv_req: FinalizeDecodeMigrationReqInput
