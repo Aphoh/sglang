@@ -37,6 +37,7 @@ from sglang.srt.managers.io_struct import (
     FinalizeDecodeMigrationReqInput,
     PrepareDecodeMigrationReqInput,
     ProfileReq,
+    QuiesceDecodeMigrationReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
@@ -263,6 +264,10 @@ class DataParallelController:
                 (TokenizedGenerateReqInput, self.dispatching_with_trace),
                 (
                     PrepareDecodeMigrationReqInput,
+                    self.send_routed_control_message,
+                ),
+                (
+                    QuiesceDecodeMigrationReqInput,
                     self.send_routed_control_message,
                 ),
                 (

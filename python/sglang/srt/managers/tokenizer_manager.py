@@ -75,6 +75,8 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PrepareDecodeMigrationReqInput,
     PrepareDecodeMigrationReqOutput,
+    QuiesceDecodeMigrationReqInput,
+    QuiesceDecodeMigrationReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -566,6 +568,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     PrepareDecodeMigrationReqOutput,
+                    self._handle_decode_migration_output,
+                ),
+                (
+                    QuiesceDecodeMigrationReqOutput,
                     self._handle_decode_migration_output,
                 ),
                 (
@@ -1696,6 +1702,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def prepare_decode_migration(
         self, obj: PrepareDecodeMigrationReqInput
     ) -> PrepareDecodeMigrationReqOutput:
+        self.auto_create_handle_loop()
+        key = self._decode_migration_waiter_key(obj)
+        if key in self.decode_migration_futures:
+            raise RuntimeError(f"Migration waiter already exists for {key}")
+        future = asyncio.get_running_loop().create_future()
+        self.decode_migration_futures[key] = future
+        try:
+            await self.send_to_scheduler.send_pyobj(obj)
+            return await asyncio.wait_for(future, timeout=10.0)
+        finally:
+            self.decode_migration_futures.pop(key, None)
+
+    async def quiesce_decode_migration(
+        self, obj: QuiesceDecodeMigrationReqInput
+    ) -> QuiesceDecodeMigrationReqOutput:
         self.auto_create_handle_loop()
         key = self._decode_migration_waiter_key(obj)
         if key in self.decode_migration_futures:

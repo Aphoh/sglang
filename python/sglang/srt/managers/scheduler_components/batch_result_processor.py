@@ -78,7 +78,7 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: "SchedulerLogprobResultProcessor"
     output_streamer: "SchedulerOutputStreamer"
     abort_request: Callable
-    maybe_park_decode_migration_at_boundary: Optional[Callable] = None
+    maybe_quiesce_decode_migration: Optional[Callable] = None
     result_disposition: ResultDispositionHandler = ResultDispositionHandler()
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
@@ -238,8 +238,8 @@ class SchedulerBatchResultProcessor:
 
                     req.update_finish_state()
                     parked = (
-                        self.maybe_park_decode_migration_at_boundary(req)
-                        if self.maybe_park_decode_migration_at_boundary is not None
+                        self.maybe_quiesce_decode_migration(req)
+                        if self.maybe_quiesce_decode_migration is not None
                         else False
                     )
                     if req.finished() and not parked:
@@ -672,8 +672,8 @@ class SchedulerBatchResultProcessor:
             if is_spec_v1:
                 req.time_stats.set_last_decode_finish_time()
                 parked = (
-                    self.maybe_park_decode_migration_at_boundary(req)
-                    if self.maybe_park_decode_migration_at_boundary is not None
+                    self.maybe_quiesce_decode_migration(req)
+                    if self.maybe_quiesce_decode_migration is not None
                     else False
                 )
                 if not parked:
@@ -703,8 +703,8 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state(new_accepted_len)
 
             parked = (
-                self.maybe_park_decode_migration_at_boundary(req)
-                if self.maybe_park_decode_migration_at_boundary is not None
+                self.maybe_quiesce_decode_migration(req)
+                if self.maybe_quiesce_decode_migration is not None
                 else False
             )
             if not parked:

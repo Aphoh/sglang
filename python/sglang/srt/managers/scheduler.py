@@ -128,6 +128,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PrepareDecodeMigrationReqInput,
     ProfileReq,
+    QuiesceDecodeMigrationReqInput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1366,6 +1367,7 @@ class Scheduler(
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (PrepareDecodeMigrationReqInput, self.prepare_decode_migration),
+                (QuiesceDecodeMigrationReqInput, self.quiesce_decode_migration),
                 (
                     BindDecodeMigrationReqInput,
                     self.bind_decode_migration_destination,
@@ -1785,8 +1787,8 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
-            maybe_park_decode_migration_at_boundary=(
-                self.maybe_park_decode_migration_at_boundary
+            maybe_quiesce_decode_migration=(
+                self.maybe_quiesce_decode_migration
                 if self.server_args.enable_decode_migration
                 else None
             ),

@@ -1594,15 +1594,12 @@ class UpdateExpertBackupReq(BaseReq):
 
 @dataclass
 class PrepareDecodeMigrationReqInput(BaseReq):
-    """Quiesce a source request and synchronize it to a prepared destination."""
+    """Prepare a source request to transfer to an existing destination."""
 
     migration_id: str
     bootstrap_host: str
     bootstrap_port: int
     bootstrap_room: int
-    output_tokens_seen: int = 0
-    target_sequence_length: Optional[int] = None
-    target_token_id: Optional[int] = None
 
     routed_dp_rank: Optional[int] = None
 
@@ -1611,10 +1608,26 @@ class PrepareDecodeMigrationReqInput(BaseReq):
 class PrepareDecodeMigrationReqOutput(BaseReq):
     migration_id: str
     success: bool
-    status: Literal["armed", "prepared", "finished", "not_found", "busy", "error"]
-    bootstrap_host: Optional[str] = None
-    bootstrap_port: Optional[int] = None
-    bootstrap_room: Optional[int] = None
+    status: Literal["ready", "finished", "not_found", "busy", "error"]
+    source_dp_rank: int = 0
+    error: Optional[str] = None
+
+
+@dataclass
+class QuiesceDecodeMigrationReqInput(BaseReq):
+    """Stop a prepared source request at its next safe decode boundary."""
+
+    migration_id: str
+    output_tokens_seen: int = 0
+
+    routed_dp_rank: Optional[int] = None
+
+
+@dataclass
+class QuiesceDecodeMigrationReqOutput(BaseReq):
+    migration_id: str
+    success: bool
+    status: Literal["quiescing", "quiesced", "finished", "not_found", "busy", "error"]
     committed_input_ids: List[int] = field(default_factory=list)
     pending_input_ids: List[int] = field(default_factory=list)
     unforwarded_committed_output_ids: List[int] = field(default_factory=list)

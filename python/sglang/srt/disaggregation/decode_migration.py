@@ -12,7 +12,7 @@ import logging
 import time
 from array import array
 from collections import OrderedDict
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Literal, Optional
 
@@ -35,6 +35,8 @@ from sglang.srt.managers.io_struct import (
     FinalizeDecodeMigrationReqOutput,
     PrepareDecodeMigrationReqInput,
     PrepareDecodeMigrationReqOutput,
+    QuiesceDecodeMigrationReqInput,
+    QuiesceDecodeMigrationReqOutput,
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.result_disposition import (
@@ -58,9 +60,11 @@ class DecodeMigrationState(str, Enum):
 
 
 @dataclass
-class ArmedDecodeMigration:
+class PreparedDecodeMigrationSource:
     request: PrepareDecodeMigrationReqInput
     sender: "BaseKVSender"
+    quiesce_requested: bool = False
+    output_tokens_seen: int = 0
 
     @property
     def migration_id(self) -> str:
@@ -105,9 +109,9 @@ class DecodeMigrationTransfer:
 class DecodeMigrationRegistry:
     """Own source migration lifecycle state indexed by migration and request."""
 
-    _by_migration_id: dict[str, ArmedDecodeMigration | DecodeMigrationTransfer] = field(
-        default_factory=dict
-    )
+    _by_migration_id: dict[
+        str, PreparedDecodeMigrationSource | DecodeMigrationTransfer
+    ] = field(default_factory=dict)
     _migration_id_by_rid: dict[str, str] = field(default_factory=dict)
     _finalizations: OrderedDict[str, tuple[str, DecodeMigrationFinalization]] = field(
         default_factory=OrderedDict
@@ -117,28 +121,28 @@ class DecodeMigrationRegistry:
 
     def get(
         self, migration_id: str
-    ) -> ArmedDecodeMigration | DecodeMigrationTransfer | None:
+    ) -> PreparedDecodeMigrationSource | DecodeMigrationTransfer | None:
         return self._by_migration_id.get(migration_id)
 
     def get_for_rid(
         self, rid: str
-    ) -> ArmedDecodeMigration | DecodeMigrationTransfer | None:
+    ) -> PreparedDecodeMigrationSource | DecodeMigrationTransfer | None:
         migration_id = self._migration_id_by_rid.get(rid)
         return self.get(migration_id) if migration_id is not None else None
 
-    def arm(
+    def prepare(
         self, request: PrepareDecodeMigrationReqInput, sender: "BaseKVSender"
-    ) -> ArmedDecodeMigration:
+    ) -> PreparedDecodeMigrationSource:
         existing = self.get(request.migration_id)
         if existing is not None:
             assert existing.rid == request.rid
-            assert isinstance(existing, ArmedDecodeMigration)
+            assert isinstance(existing, PreparedDecodeMigrationSource)
             return existing
         assert self.get_for_rid(request.rid) is None
-        arm = ArmedDecodeMigration(request, sender)
-        self._by_migration_id[arm.migration_id] = arm
-        self._migration_id_by_rid[arm.rid] = arm.migration_id
-        return arm
+        prepared = PreparedDecodeMigrationSource(request, sender)
+        self._by_migration_id[prepared.migration_id] = prepared
+        self._migration_id_by_rid[prepared.rid] = prepared.migration_id
+        return prepared
 
     def activate(self, record: DecodeMigrationTransfer) -> None:
         existing = self.get(record.migration_id)
@@ -152,7 +156,7 @@ class DecodeMigrationRegistry:
 
     def discard(
         self, migration_id: str
-    ) -> ArmedDecodeMigration | DecodeMigrationTransfer | None:
+    ) -> PreparedDecodeMigrationSource | DecodeMigrationTransfer | None:
         entry = self._by_migration_id.pop(migration_id, None)
         if (
             entry is not None
@@ -177,11 +181,11 @@ class DecodeMigrationRegistry:
             self._finalizations.move_to_end(migration_id)
         return finalization
 
-    def arms(self) -> tuple[ArmedDecodeMigration, ...]:
+    def prepared_sources(self) -> tuple[PreparedDecodeMigrationSource, ...]:
         return tuple(
             entry
             for entry in self._by_migration_id.values()
-            if isinstance(entry, ArmedDecodeMigration)
+            if isinstance(entry, PreparedDecodeMigrationSource)
         )
 
     def transfers(self) -> tuple[DecodeMigrationTransfer, ...]:
@@ -261,9 +265,9 @@ class SchedulerDecodeMigrationMixin:
             if recv_req.abort_all or record.req.rid.startswith(recv_req.rid):
                 self._close_decode_migration(record)
 
-        for arm in self.decode_migrations.arms():
-            if recv_req.abort_all or arm.rid.startswith(recv_req.rid):
-                self._discard_decode_migration_arm(arm)
+        for prepared in self.decode_migrations.prepared_sources():
+            if recv_req.abort_all or prepared.rid.startswith(recv_req.rid):
+                self._discard_prepared_decode_migration(prepared)
 
     def _find_decode_migration_req(self: "Scheduler", rid: str) -> Optional[Req]:
         for req in self.running_batch.reqs:
@@ -277,9 +281,24 @@ class SchedulerDecodeMigrationMixin:
         recv_req: PrepareDecodeMigrationReqInput,
         status: str,
         error: Optional[str] = None,
-        **state,
     ) -> PrepareDecodeMigrationReqOutput:
         return PrepareDecodeMigrationReqOutput(
+            rid=recv_req.rid,
+            migration_id=recv_req.migration_id,
+            success=False,
+            status=status,
+            source_dp_rank=self.ps.dp_rank or 0,
+            error=error,
+        )
+
+    def _quiesce_failure(
+        self: "Scheduler",
+        recv_req: QuiesceDecodeMigrationReqInput,
+        status: str,
+        error: Optional[str] = None,
+        **state,
+    ) -> QuiesceDecodeMigrationReqOutput:
+        return QuiesceDecodeMigrationReqOutput(
             rid=recv_req.rid,
             migration_id=recv_req.migration_id,
             success=False,
@@ -293,45 +312,44 @@ class SchedulerDecodeMigrationMixin:
         if not self.detach_request_from_scheduling(req):
             raise RuntimeError("Request left the running decode batch before migration")
 
-    def _clear_decode_migration_arm(
+    def _clear_prepared_decode_migration(
         self: "Scheduler", migration_id: str, rid: str
     ) -> None:
         entry = self.decode_migrations.get(migration_id)
-        if isinstance(entry, ArmedDecodeMigration) and entry.rid == rid:
-            self._discard_decode_migration_arm(entry)
+        if isinstance(entry, PreparedDecodeMigrationSource) and entry.rid == rid:
+            self._discard_prepared_decode_migration(entry)
 
-    def _discard_decode_migration_arm(
-        self: "Scheduler", arm: ArmedDecodeMigration
+    def _discard_prepared_decode_migration(
+        self: "Scheduler", prepared: PreparedDecodeMigrationSource
     ) -> None:
-        arm.sender.clear()
-        self.decode_migrations.discard(arm.migration_id)
+        prepared.sender.clear()
+        self.decode_migrations.discard(prepared.migration_id)
 
-    def maybe_park_decode_migration_at_boundary(self: "Scheduler", req: Req) -> bool:
-        arm = self.decode_migrations.get_for_rid(req.rid)
-        if not isinstance(arm, ArmedDecodeMigration):
+    def maybe_quiesce_decode_migration(self: "Scheduler", req: Req) -> bool:
+        prepared = self.decode_migrations.get_for_rid(req.rid)
+        if not isinstance(prepared, PreparedDecodeMigrationSource):
             return False
         if req.finished() or req.to_finish is not None:
-            self._clear_decode_migration_arm(arm.migration_id, req.rid)
+            self._clear_prepared_decode_migration(prepared.migration_id, req.rid)
             return False
-        target = arm.request.target_sequence_length
-        target_token_id = arm.request.target_token_id
-        logical_len = len(req.origin_input_ids) + len(req.output_ids)
-        sequence_reached = target is not None and logical_len >= target
-        token_reached = (
-            target_token_id is not None
-            and bool(req.output_ids)
-            and req.output_ids[-1] == target_token_id
-        )
-        if not (sequence_reached or token_reached):
+        if not prepared.quiesce_requested:
             return False
 
-        output = self._prepare_decode_migration_now(arm.request, req=req)
+        output = self._quiesce_decode_migration_now(
+            prepared,
+            QuiesceDecodeMigrationReqInput(
+                rid=req.rid,
+                migration_id=prepared.migration_id,
+                output_tokens_seen=prepared.output_tokens_seen,
+            ),
+            req=req,
+        )
         if not output.success:
             logger.error(
-                "Failed to park armed decode migration rid=%s migration_id=%s "
+                "Failed to quiesce prepared decode migration rid=%s migration_id=%s "
                 "status=%s error=%s",
                 req.rid,
-                arm.migration_id,
+                prepared.migration_id,
                 output.status,
                 output.error,
             )
@@ -353,52 +371,42 @@ class SchedulerDecodeMigrationMixin:
             self.decode_migrations.discard(record.migration_id)
         return ResultDisposition.DISCARD
 
-    def _armed_output(
+    def _prepared_source_output(
         self: "Scheduler",
         recv_req: PrepareDecodeMigrationReqInput,
-        arm: ArmedDecodeMigration,
-        logical_len: int,
+        prepared: PreparedDecodeMigrationSource,
     ) -> PrepareDecodeMigrationReqOutput:
         return PrepareDecodeMigrationReqOutput(
             rid=recv_req.rid,
-            migration_id=arm.migration_id,
+            migration_id=prepared.migration_id,
             success=True,
-            status="armed",
-            bootstrap_host=arm.request.bootstrap_host,
-            bootstrap_port=arm.request.bootstrap_port,
-            bootstrap_room=arm.request.bootstrap_room,
-            logical_len=logical_len,
-            output_tokens_seen=arm.request.output_tokens_seen,
+            status="ready",
             source_dp_rank=self.ps.dp_rank or 0,
         )
 
-    def _arm_decode_migration(
+    def _prepare_decode_migration_source(
         self: "Scheduler",
         recv_req: PrepareDecodeMigrationReqInput,
-        logical_len: int,
     ) -> PrepareDecodeMigrationReqOutput:
         try:
             sender = self._create_decode_migration_sender(recv_req)
         except Exception as exc:
             logger.exception(
-                "Failed to arm decode migration rid=%s migration_id=%s",
+                "Failed to prepare decode migration rid=%s migration_id=%s",
                 recv_req.rid,
                 recv_req.migration_id,
             )
             return self._prepare_failure(
                 recv_req, "error", f"Failed to create migration sender: {exc}"
             )
-        arm = self.decode_migrations.arm(recv_req, sender)
+        prepared = self.decode_migrations.prepare(recv_req, sender)
         logger.info(
-            "Armed decode migration rid=%s migration_id=%s sequence_target=%s "
-            "token_target=%s current=%d",
-            arm.rid,
-            arm.migration_id,
-            arm.request.target_sequence_length,
-            arm.request.target_token_id,
-            logical_len,
+            "Prepared decode migration source rid=%s migration_id=%s room=%d",
+            prepared.rid,
+            prepared.migration_id,
+            prepared.request.bootstrap_room,
         )
-        return self._armed_output(recv_req, arm, logical_len)
+        return self._prepared_source_output(recv_req, prepared)
 
     def _create_decode_migration_sender(
         self: "Scheduler", recv_req: PrepareDecodeMigrationReqInput
@@ -472,11 +480,13 @@ class SchedulerDecodeMigrationMixin:
                     "Migration source is no longer active",
                 )
             if existing.migration_id == recv_req.migration_id:
-                existing.output_tokens_seen = min(
-                    max(existing.output_tokens_seen, recv_req.output_tokens_seen),
-                    max(0, existing.logical_len - len(existing.req.origin_input_ids)),
+                return PrepareDecodeMigrationReqOutput(
+                    rid=recv_req.rid,
+                    migration_id=recv_req.migration_id,
+                    success=True,
+                    status="ready",
+                    source_dp_rank=self.ps.dp_rank or 0,
                 )
-                return self._prepared_output(recv_req, existing)
             return self._prepare_failure(
                 recv_req,
                 "busy",
@@ -484,13 +494,13 @@ class SchedulerDecodeMigrationMixin:
             )
 
         if (
-            isinstance(existing, ArmedDecodeMigration)
+            isinstance(existing, PreparedDecodeMigrationSource)
             and existing.migration_id != recv_req.migration_id
         ):
             return self._prepare_failure(
                 recv_req,
                 "busy",
-                f"Request already has armed migration {existing.migration_id}",
+                f"Request already has prepared migration {existing.migration_id}",
             )
 
         same_id = self.decode_migrations.get(recv_req.migration_id)
@@ -501,58 +511,93 @@ class SchedulerDecodeMigrationMixin:
                 f"Migration id already belongs to request {same_id.rid}",
             )
 
+        if isinstance(existing, PreparedDecodeMigrationSource):
+            return self._prepared_source_output(recv_req, existing)
+
         req = self._find_decode_migration_req(recv_req.rid)
-        target = recv_req.target_sequence_length
-        target_token_id = recv_req.target_token_id
-        logical_len = (
-            len(req.origin_input_ids) + len(req.output_ids) if req is not None else 0
-        )
-        if target is not None and target <= 0:
-            return self._prepare_failure(
-                recv_req, "error", "target_sequence_length must be positive"
-            )
-        if target_token_id is not None and target_token_id < 0:
-            return self._prepare_failure(
-                recv_req, "error", "target_token_id must be non-negative"
-            )
-        if target is not None and target_token_id is not None:
-            return self._prepare_failure(
-                recv_req, "error", "Only one decode migration trigger may be armed"
-            )
+        if req is not None and (req.finished() or req.to_finish is not None):
+            return self._prepare_failure(recv_req, "finished")
+        return self._prepare_decode_migration_source(recv_req)
 
-        if isinstance(existing, ArmedDecodeMigration):
-            return self._armed_output(recv_req, existing, logical_len)
-
-        # The overlap loop accepts controls before it consumes the previous
-        # decode result. That result already advances KV but has not yet added
-        # its sampled token to output_ids, so defer direct preparation to the
-        # next normal result frontier.
-        if req is not None and self._has_queued_decode_migration_result(req):
-            recv_req = replace(
-                recv_req,
-                target_sequence_length=max(logical_len + 1, target or 0),
-            )
-            target = recv_req.target_sequence_length
-
-        if (target is not None and target > logical_len) or target_token_id is not None:
-            return self._arm_decode_migration(recv_req, logical_len)
-
-        return self._prepare_decode_migration_now(recv_req, req=req)
-
-    def _prepare_decode_migration_now(
+    def quiesce_decode_migration(
         self: "Scheduler",
-        recv_req: PrepareDecodeMigrationReqInput,
+        recv_req: QuiesceDecodeMigrationReqInput,
+    ) -> QuiesceDecodeMigrationReqOutput:
+        if not self.server_args.enable_decode_migration:
+            return self._quiesce_failure(
+                recv_req,
+                "error",
+                "Decode migration requires --enable-decode-migration",
+            )
+
+        existing = self.decode_migrations.get_for_rid(recv_req.rid)
+        if isinstance(existing, DecodeMigrationTransfer):
+            if existing.state == DecodeMigrationState.AWAITING_STALE_RESULT:
+                return self._quiesce_failure(
+                    recv_req, "finished", "Migration source is no longer active"
+                )
+            if existing.migration_id != recv_req.migration_id:
+                return self._quiesce_failure(
+                    recv_req,
+                    "busy",
+                    f"Request already has active migration {existing.migration_id}",
+                )
+            existing.output_tokens_seen = min(
+                max(existing.output_tokens_seen, recv_req.output_tokens_seen),
+                max(0, existing.logical_len - len(existing.req.origin_input_ids)),
+            )
+            return self._quiesced_output(recv_req, existing)
+
+        if not isinstance(existing, PreparedDecodeMigrationSource):
+            return self._quiesce_failure(
+                recv_req, "not_found", "Migration source has not been prepared"
+            )
+        if existing.migration_id != recv_req.migration_id:
+            return self._quiesce_failure(
+                recv_req,
+                "busy",
+                f"Request already has prepared migration {existing.migration_id}",
+            )
+
+        existing.output_tokens_seen = max(
+            existing.output_tokens_seen, recv_req.output_tokens_seen
+        )
+        req = self._find_decode_migration_req(recv_req.rid)
+        if req is None or req.finished() or req.to_finish is not None:
+            self._discard_prepared_decode_migration(existing)
+            return self._quiesce_failure(recv_req, "finished")
+
+        # Under overlap scheduling, a launched result may have committed KV but
+        # not yet updated output_ids. Finish normal result processing before
+        # detaching the request so the exported frontier remains consistent.
+        if self._has_queued_decode_migration_result(req):
+            existing.quiesce_requested = True
+            return QuiesceDecodeMigrationReqOutput(
+                rid=recv_req.rid,
+                migration_id=recv_req.migration_id,
+                success=True,
+                status="quiescing",
+                output_tokens_seen=existing.output_tokens_seen,
+                source_dp_rank=self.ps.dp_rank or 0,
+            )
+
+        return self._quiesce_decode_migration_now(existing, recv_req, req=req)
+
+    def _quiesce_decode_migration_now(
+        self: "Scheduler",
+        prepared: PreparedDecodeMigrationSource,
+        recv_req: QuiesceDecodeMigrationReqInput,
         *,
         req: Optional[Req] = None,
-    ) -> PrepareDecodeMigrationReqOutput:
+    ) -> QuiesceDecodeMigrationReqOutput:
         if req is None:
             req = self._find_decode_migration_req(recv_req.rid)
         if req is None:
-            return self._prepare_failure(
+            return self._quiesce_failure(
                 recv_req, "not_found", "Request is not in the running decode batch"
             )
         if req.finished() or req.to_finish is not None:
-            return self._prepare_failure(
+            return self._quiesce_failure(
                 recv_req,
                 "finished",
                 prompt_len=len(req.origin_input_ids),
@@ -564,53 +609,23 @@ class SchedulerDecodeMigrationMixin:
         output_ids = list(req.output_ids)
         committed_len = req.kv_committed_len
         actual_logical_len = len(prompt_ids) + len(output_ids)
-        target = recv_req.target_sequence_length
-        if target is not None:
-            if target <= len(prompt_ids):
-                return self._prepare_failure(
+        if recv_req.output_tokens_seen > 0:
+            target_logical_len = len(prompt_ids) + recv_req.output_tokens_seen
+            if (
+                target_logical_len > actual_logical_len
+                or target_logical_len - 1 > committed_len
+            ):
+                return self._quiesce_failure(
                     recv_req,
                     "error",
-                    "target_sequence_length must extend beyond the prompt",
+                    "Source has not reached the acknowledged output frontier",
                     prompt_len=len(prompt_ids),
                     committed_len=committed_len,
                     logical_len=actual_logical_len,
                     output_tokens_seen=recv_req.output_tokens_seen,
                 )
-            if target > actual_logical_len or target - 1 > committed_len:
-                return self._prepare_failure(
-                    recv_req,
-                    "error",
-                    "Source has not reached the requested migration frontier",
-                    prompt_len=len(prompt_ids),
-                    committed_len=committed_len,
-                    logical_len=actual_logical_len,
-                    output_tokens_seen=recv_req.output_tokens_seen,
-                )
-            output_ids = output_ids[: target - len(prompt_ids)]
-            committed_len = target - 1
-        elif recv_req.target_token_id is not None:
-            if not output_ids or output_ids[-1] != recv_req.target_token_id:
-                return self._prepare_failure(
-                    recv_req,
-                    "error",
-                    "Source has not reached the requested token migration frontier",
-                    prompt_len=len(prompt_ids),
-                    committed_len=committed_len,
-                    logical_len=actual_logical_len,
-                    output_tokens_seen=recv_req.output_tokens_seen,
-                )
-            token_frontier = actual_logical_len - 1
-            if token_frontier > committed_len:
-                return self._prepare_failure(
-                    recv_req,
-                    "error",
-                    "Target token was sampled before its prefix KV was committed",
-                    prompt_len=len(prompt_ids),
-                    committed_len=committed_len,
-                    logical_len=actual_logical_len,
-                    output_tokens_seen=recv_req.output_tokens_seen,
-                )
-            committed_len = token_frontier
+            output_ids = output_ids[: recv_req.output_tokens_seen]
+            committed_len = target_logical_len - 1
         try:
             frontier = build_decode_migration_frontier(
                 prompt_ids,
@@ -619,7 +634,7 @@ class SchedulerDecodeMigrationMixin:
                 recv_req.output_tokens_seen,
             )
         except ValueError as exc:
-            return self._prepare_failure(
+            return self._quiesce_failure(
                 recv_req,
                 "error",
                 str(exc),
@@ -630,26 +645,20 @@ class SchedulerDecodeMigrationMixin:
             )
 
         if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
-            return self._prepare_failure(
+            return self._quiesce_failure(
                 recv_req, "error", "No metadata buffer is available for migration"
             )
-        room = recv_req.bootstrap_room
+        room = prepared.request.bootstrap_room
         if room <= 0:
-            return self._prepare_failure(
+            return self._quiesce_failure(
                 recv_req,
                 "error",
                 "bootstrap_room must be an opaque positive integer",
             )
 
         metadata_index = -1
-        sender = None
-        armed = self.decode_migrations.get(recv_req.migration_id)
+        sender = prepared.sender
         try:
-            sender = (
-                armed.sender
-                if isinstance(armed, ArmedDecodeMigration)
-                else self._create_decode_migration_sender(recv_req)
-            )
             allocated_index = self.req_to_metadata_buffer_idx_allocator.alloc()
             assert allocated_index is not None
             metadata_index = allocated_index
@@ -658,32 +667,21 @@ class SchedulerDecodeMigrationMixin:
             )
             self.disagg_metadata_buffers.cached_tokens[metadata_index].zero_()
             self.disagg_metadata_buffers.bootstrap_room[metadata_index][0] = room
-            # An armed migration reaches this method at its exact logical
-            # frontier. Emit an otherwise buffered partial stream chunk before
-            # removing the request so the controller can observe the trigger.
-            if (
-                frontier.logical_len == len(req.origin_input_ids) + len(req.output_ids)
-                and len(req.output_ids) > req.send_token_offset
-            ):
-                self.output_streamer.stream_output(
-                    [req], req.return_logprob, force_stream_req=req
-                )
             self._park_decode_migration_req(req)
         except Exception as exc:
             if sender is not None:
                 sender.clear()
-            if isinstance(armed, ArmedDecodeMigration):
-                self.decode_migrations.discard(armed.migration_id)
+            self.decode_migrations.discard(prepared.migration_id)
             if metadata_index >= 0:
                 self.req_to_metadata_buffer_idx_allocator.free(metadata_index)
             if all(candidate is not req for candidate in self.running_batch.reqs):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.exception(
-                "Failed to prepare decode migration rid=%s migration_id=%s",
+                "Failed to quiesce decode migration rid=%s migration_id=%s",
                 recv_req.rid,
                 recv_req.migration_id,
             )
-            return self._prepare_failure(
+            return self._quiesce_failure(
                 recv_req, "error", f"Failed to create migration transfer: {exc}"
             )
 
@@ -713,14 +711,11 @@ class SchedulerDecodeMigrationMixin:
             frontier.output_tokens_seen,
             room,
         )
-        return PrepareDecodeMigrationReqOutput(
+        return QuiesceDecodeMigrationReqOutput(
             rid=recv_req.rid,
             migration_id=recv_req.migration_id,
             success=True,
-            status="prepared",
-            bootstrap_host=recv_req.bootstrap_host,
-            bootstrap_port=recv_req.bootstrap_port,
-            bootstrap_room=room,
+            status="quiesced",
             committed_input_ids=frontier.committed_input_ids,
             pending_input_ids=frontier.pending_input_ids,
             unforwarded_committed_output_ids=(
@@ -733,11 +728,11 @@ class SchedulerDecodeMigrationMixin:
             source_dp_rank=self.ps.dp_rank or 0,
         )
 
-    def _prepared_output(
+    def _quiesced_output(
         self: "Scheduler",
-        recv_req: PrepareDecodeMigrationReqInput,
+        recv_req: QuiesceDecodeMigrationReqInput,
         record: DecodeMigrationTransfer,
-    ) -> PrepareDecodeMigrationReqOutput:
+    ) -> QuiesceDecodeMigrationReqOutput:
         req = record.req
         logical_ids = (list(req.origin_input_ids) + list(req.output_ids))[
             : record.logical_len
@@ -747,14 +742,11 @@ class SchedulerDecodeMigrationMixin:
         committed_output_count = max(0, record.committed_len - prompt_len)
         output_ids = logical_ids[prompt_len:]
         seen = record.output_tokens_seen
-        return PrepareDecodeMigrationReqOutput(
+        return QuiesceDecodeMigrationReqOutput(
             rid=recv_req.rid,
             migration_id=recv_req.migration_id,
             success=True,
-            status="prepared",
-            bootstrap_host=recv_req.bootstrap_host,
-            bootstrap_port=recv_req.bootstrap_port,
-            bootstrap_room=record.bootstrap_room,
+            status="quiesced",
             committed_input_ids=committed_input_ids,
             pending_input_ids=record.pending_input_ids,
             unforwarded_committed_output_ids=output_ids[
@@ -1014,9 +1006,12 @@ class SchedulerDecodeMigrationMixin:
                     transfer_status=finalization.transfer_status,
                     source_dp_rank=self.ps.dp_rank or 0,
                 )
-        if isinstance(entry, ArmedDecodeMigration) and entry.rid == recv_req.rid:
+        if (
+            isinstance(entry, PreparedDecodeMigrationSource)
+            and entry.rid == recv_req.rid
+        ):
             if recv_req.action == "cancel":
-                self._discard_decode_migration_arm(entry)
+                self._discard_prepared_decode_migration(entry)
                 return FinalizeDecodeMigrationReqOutput(
                     rid=recv_req.rid,
                     migration_id=recv_req.migration_id,
@@ -1032,7 +1027,7 @@ class SchedulerDecodeMigrationMixin:
                 success=False,
                 transfer_status="unknown",
                 source_dp_rank=self.ps.dp_rank or 0,
-                error="Migration source is armed but not yet parked",
+                error="Migration source is prepared but has not been quiesced",
             )
         if not isinstance(entry, DecodeMigrationTransfer) or entry.rid != recv_req.rid:
             return FinalizeDecodeMigrationReqOutput(
