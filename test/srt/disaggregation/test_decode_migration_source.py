@@ -14,6 +14,8 @@ from sglang.srt.disaggregation.decode_migration import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode, KVClassType
 from sglang.srt.managers.io_struct import (
+    BindDecodeMigrationReqInput,
+    BindDecodeMigrationReqOutput,
     FinalizeDecodeMigrationReqInput,
     FinalizeDecodeMigrationReqOutput,
     PrepareDecodeMigrationReqInput,
@@ -676,6 +678,40 @@ class DecodeMigrationWaiterRoutingTests(unittest.IsolatedAsyncioTestCase):
         )
         manager._handle_decode_migration_output(expected_prepare)
         self.assertIs(await prepare_task, expected_prepare)
+
+        bind = BindDecodeMigrationReqInput(
+            rid="request",
+            migration_id="migration",
+            bootstrap_room=17,
+            committed_input_ids=[1, 2, 3],
+            pending_input_ids=[4],
+            committed_len=3,
+            logical_len=4,
+            routed_dp_rank=3,
+        )
+        bind_task = asyncio.create_task(manager.bind_decode_migration_destination(bind))
+        await asyncio.sleep(0)
+
+        manager._handle_decode_migration_output(
+            BindDecodeMigrationReqOutput(
+                rid="request",
+                migration_id="migration",
+                success=True,
+                status="ready",
+                source_dp_rank=0,
+            )
+        )
+        self.assertFalse(bind_task.done())
+
+        expected_bind = BindDecodeMigrationReqOutput(
+            rid="request",
+            migration_id="migration",
+            success=True,
+            status="ready",
+            source_dp_rank=3,
+        )
+        manager._handle_decode_migration_output(expected_bind)
+        self.assertIs(await bind_task, expected_bind)
 
         finalize = FinalizeDecodeMigrationReqInput(
             rid="request",

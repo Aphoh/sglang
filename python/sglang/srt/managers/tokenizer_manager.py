@@ -1707,14 +1707,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     async def bind_decode_migration_destination(
         self, obj: BindDecodeMigrationReqInput
     ) -> BindDecodeMigrationReqOutput:
+        self.auto_create_handle_loop()
         key = self._decode_migration_waiter_key(obj)
         if key in self.decode_migration_futures:
-            raise RuntimeError(f"Decode migration control already pending for {key}")
-        future = self.auto_create_handle_loop.create_future()
+            raise RuntimeError(f"Migration waiter already exists for {key}")
+        future = asyncio.get_running_loop().create_future()
         self.decode_migration_futures[key] = future
-        self.send_to_scheduler.send_pyobj(obj)
         try:
-            return await future
+            await self.send_to_scheduler.send_pyobj(obj)
+            return await asyncio.wait_for(future, timeout=10.0)
         finally:
             self.decode_migration_futures.pop(key, None)
 
