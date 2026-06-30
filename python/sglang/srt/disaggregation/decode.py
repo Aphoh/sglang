@@ -1990,7 +1990,11 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
-                if req.has_prebuilt_kv and req.last_node is None:
+                if (
+                    req.has_prebuilt_kv
+                    and req.last_node is None
+                    and not self.tree_cache.is_chunk_cache()
+                ):
                     # Placeholder IDs deliberately skip radix matching. Exact IDs
                     # are installed before admission, so use the empty root match.
                     req.last_node = self.tree_cache.root_node

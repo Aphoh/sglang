@@ -43,7 +43,11 @@ class DecodeMigrationDestinationAdmissionTests(unittest.TestCase):
         running_batch = MagicMock()
         running_batch.batch_size.return_value = 0
         running_batch.is_empty.return_value = True
-        tree_cache = SimpleNamespace(root_node=object(), inc_lock_ref=MagicMock())
+        tree_cache = SimpleNamespace(
+            root_node=object(),
+            inc_lock_ref=MagicMock(),
+            is_chunk_cache=lambda: False,
+        )
         return SimpleNamespace(
             server_args=SimpleNamespace(
                 enable_decode_migration=True,
@@ -140,6 +144,41 @@ class DecodeMigrationDestinationAdmissionTests(unittest.TestCase):
         SchedulerDisaggregationDecodeMixin.admit_prebuilt_batch(scheduler, new_batch)
 
         req.init_next_round_input.assert_called_once_with(None)
+
+    @patch(
+        "sglang.srt.disaggregation.decode.set_time_batch",
+        autospec=True,
+    )
+    @patch(
+        "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+        autospec=True,
+    )
+    def test_chunk_cache_keeps_prebuilt_request_unanchored(
+        self, init_new, _set_time_batch
+    ):
+        req = SimpleNamespace(
+            has_prebuilt_kv=True,
+            last_node=None,
+            kv_committed_len=12,
+            prefix_indices=torch.empty(0, dtype=torch.int64),
+            init_next_round_input=MagicMock(),
+            set_extend_input_len=MagicMock(),
+            fill_len=0,
+        )
+        scheduler = self._scheduler(req)
+        scheduler.tree_cache = SimpleNamespace(
+            inc_lock_ref=MagicMock(),
+            is_chunk_cache=lambda: True,
+        )
+        init_new.return_value = _FakeBatch([req])
+
+        new_batch = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+            scheduler, prebuilt_kv_only=True
+        )
+        SchedulerDisaggregationDecodeMixin.admit_prebuilt_batch(scheduler, new_batch)
+
+        self.assertIsNone(req.last_node)
+        scheduler.tree_cache.inc_lock_ref.assert_not_called()
 
 
 class ResultDispositionHandlerTests(unittest.TestCase):
