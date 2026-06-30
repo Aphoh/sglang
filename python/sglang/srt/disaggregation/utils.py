@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.prebuilt_kv import PrebuiltKVFrontier
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 
@@ -349,7 +350,7 @@ class MetadataBuffers:
             committed_input_ids, dtype=torch.int32, device=row.device
         )
 
-    def get_decode_migration_frontier(self, idx: int) -> Optional[dict]:
+    def get_decode_migration_frontier(self, idx: int) -> Optional[PrebuiltKVFrontier]:
         row = self.output_ids[idx]
         if int(row[1].item()) != self._MIGRATION_MAGIC:
             return None
@@ -361,18 +362,16 @@ class MetadataBuffers:
 
         max_new_tokens = int(row[6].item())
         min_new_tokens = int(row[7].item())
-        return {
-            "committed_input_ids": row[
-                token_start : token_start + committed_len
-            ].tolist(),
-            "pending_input_ids": [int(row[0].item())],
-            "prompt_len": int(row[2].item()),
-            "committed_len": committed_len,
-            "logical_len": int(row[4].item()),
-            "output_tokens_seen": int(row[5].item()),
-            "max_new_tokens": max_new_tokens if max_new_tokens >= 0 else None,
-            "min_new_tokens": min_new_tokens if min_new_tokens >= 0 else None,
-        }
+        return PrebuiltKVFrontier(
+            committed_input_ids=row[token_start : token_start + committed_len].tolist(),
+            pending_input_id=int(row[0].item()),
+            prompt_len=int(row[2].item()),
+            committed_len=committed_len,
+            logical_len=int(row[4].item()),
+            output_tokens_seen=int(row[5].item()),
+            max_new_tokens=max_new_tokens if max_new_tokens >= 0 else None,
+            min_new_tokens=min_new_tokens if min_new_tokens >= 0 else None,
+        )
 
     def decode_migration_frontier_nbytes(self, committed_len: int) -> int:
         elements = self._MIGRATION_HEADER_SIZE + committed_len

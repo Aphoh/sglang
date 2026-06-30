@@ -27,6 +27,29 @@ class KVTransferMetric:
     transfer_total_bytes: Optional[int] = None
 
 
+@dataclasses.dataclass(frozen=True)
+class NixlTransportConfig:
+    enable_progress_thread: bool = True
+    thread_safe_agent: bool = False
+    sender_workers: Optional[int] = None
+    defer_sender_completion: bool = False
+    receiver_poll_interval_s: Optional[float] = None
+    ucx_split_batch_size: Optional[int] = None
+
+
+NIXL_LOW_LATENCY_SENDER = NixlTransportConfig(
+    thread_safe_agent=True,
+    sender_workers=1,
+    defer_sender_completion=True,
+    ucx_split_batch_size=16,
+)
+NIXL_LOW_LATENCY_RECEIVER = NixlTransportConfig(
+    enable_progress_thread=False,
+    thread_safe_agent=True,
+    receiver_poll_interval_s=0.001,
+)
+
+
 class KVArgs:
     engine_rank: int
     kv_data_ptrs: List[int]
@@ -66,8 +89,7 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
-    # Decode migration uses dedicated NIXL send/receive progress threads.
-    nixl_manual_progress: bool = False
+    nixl_transport_config: NixlTransportConfig = NixlTransportConfig()
 
 
 class KVPoll:

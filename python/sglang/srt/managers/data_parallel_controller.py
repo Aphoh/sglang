@@ -32,12 +32,9 @@ from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
-    BindDecodeMigrationReqInput,
     BlockReqInput,
-    FinalizeDecodeMigrationReqInput,
-    PrepareDecodeMigrationReqInput,
+    DecodeMigrationControlReqInput,
     ProfileReq,
-    QuiesceDecodeMigrationReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
@@ -262,22 +259,7 @@ class DataParallelController:
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateReqInput, self.dispatching_with_trace),
-                (
-                    PrepareDecodeMigrationReqInput,
-                    self.send_routed_control_message,
-                ),
-                (
-                    QuiesceDecodeMigrationReqInput,
-                    self.send_routed_control_message,
-                ),
-                (
-                    BindDecodeMigrationReqInput,
-                    self.send_routed_control_message,
-                ),
-                (
-                    FinalizeDecodeMigrationReqInput,
-                    self.send_routed_control_message,
-                ),
+                (DecodeMigrationControlReqInput, self.send_routed_control_message),
                 (TokenizedEmbeddingReqInput, self.dispatching_with_trace),
                 (BatchTokenizedGenerateReqInput, self.dispatch_batch_generate),
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),

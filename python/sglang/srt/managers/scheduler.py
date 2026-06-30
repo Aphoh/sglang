@@ -42,6 +42,10 @@ from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
+from sglang.srt.disaggregation.base.conn import (
+    NIXL_LOW_LATENCY_RECEIVER,
+    NixlTransportConfig,
+)
 from sglang.srt.disaggregation.decode import (
     SchedulerDisaggregationDecodeMixin,
     create_decode_transfer_queues,
@@ -51,6 +55,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 )
 from sglang.srt.disaggregation.decode_migration import SchedulerDecodeMigrationMixin
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.prebuilt_kv import PrebuiltKVState
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -92,7 +97,7 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
-    BindDecodeMigrationReqInput,
+    CancelDecodeMigrationReqInput,
     CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
@@ -107,7 +112,6 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
-    FinalizeDecodeMigrationReqInput,
     FlushCacheReqInput,
     FreezeGCReq,
     GetInternalStateReq,
@@ -208,9 +212,6 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 )
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
-)
-from sglang.srt.managers.scheduler_components.result_disposition import (
-    ResultDispositionHandler,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -1095,7 +1096,15 @@ class Scheduler(
             (
                 self.disagg_decode_prealloc_queue,
                 self.disagg_decode_transfer_queue,
-            ) = create_decode_transfer_queues(self, draft_token_to_kv_pool)
+            ) = create_decode_transfer_queues(
+                self,
+                draft_token_to_kv_pool,
+                nixl_transport_config=(
+                    NIXL_LOW_LATENCY_RECEIVER
+                    if self.server_args.enable_decode_migration
+                    else NixlTransportConfig()
+                ),
+            )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -1164,7 +1173,10 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue,
                 self.disagg_decode_transfer_queue,
             ) = create_decode_transfer_queues(
-                self, draft_token_to_kv_pool, enable_radix_cache=True
+                self,
+                draft_token_to_kv_pool,
+                enable_radix_cache=True,
+                nixl_transport_config=NIXL_LOW_LATENCY_RECEIVER,
             )
 
         # Init mm receiver for EPD disaggregation mode
@@ -1379,11 +1391,7 @@ class Scheduler(
                 (ContinueGenerationReqInput, self.continue_generation),
                 (PrepareDecodeMigrationReqInput, self.prepare_decode_migration),
                 (QuiesceDecodeMigrationReqInput, self.quiesce_decode_migration),
-                (
-                    BindDecodeMigrationReqInput,
-                    self.bind_decode_migration_destination,
-                ),
-                (FinalizeDecodeMigrationReqInput, self.finalize_decode_migration),
+                (CancelDecodeMigrationReqInput, self.cancel_decode_migration),
                 (ConfigureLoggingReq, self.configure_logging),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
@@ -1457,7 +1465,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
-            self.process_decode_migration_receives()
+            self.process_prebuilt_kv_receives()
             self.process_decode_migration_transfers()
             if self._engine_paused:
                 continue
@@ -1494,7 +1502,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
-            self.process_decode_migration_receives()
+            self.process_prebuilt_kv_receives()
             self.process_decode_migration_transfers()
             if self._engine_paused:
                 continue
@@ -1735,9 +1743,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
-            get_decode_migration_reqs=lambda: (
-                record.req for record in self.decode_migrations.transfers()
-            ),
+            get_decode_migration_reqs=self.decode_migrations.kv_owner_reqs,
         )
 
     def init_kv_events_publisher(self) -> None:
@@ -1818,12 +1824,10 @@ class Scheduler(
                 if self.server_args.enable_decode_migration
                 else None
             ),
-            result_disposition=ResultDispositionHandler(
-                get_disposition=(
-                    self.get_decode_migration_result_disposition
-                    if self.server_args.enable_decode_migration
-                    else None
-                )
+            should_process_result=(
+                self.should_process_decode_result
+                if self.server_args.enable_decode_migration
+                else None
             ),
         )
 
@@ -2033,9 +2037,8 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
-            req.decode_migration_id = recv_req.decode_migration_id
-            req.decode_migration_bound = recv_req.decode_migration_id is None
-            req.stream_output_start_offset = 0
+            if recv_req.decode_migration_id is not None:
+                req.prebuilt_kv = PrebuiltKVState(recv_req.decode_migration_id)
             req.tokenizer = self.tokenizer
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
@@ -2237,11 +2240,7 @@ class Scheduler(
         if not self._set_or_validate_priority(req):
             return
         if self.disaggregation_mode == DisaggregationMode.NULL:
-            if (
-                self.server_args.enable_decode_migration
-                and req.bootstrap_room is not None
-            ):
-                req.has_prebuilt_kv = True
+            if req.prebuilt_kv is not None:
                 self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
                 if not is_retracted:
                     req.time_stats.set_decode_prealloc_queue_entry_time()
@@ -2367,7 +2366,7 @@ class Scheduler(
                 )
                 if (
                     self.disaggregation_mode == DisaggregationMode.DECODE
-                    or req.has_prebuilt_kv
+                    or req.prebuilt_kv is not None
                 ):
                     release_kv_cache(req, self.tree_cache)
                 deleted_reqs.add(req)
@@ -2580,10 +2579,7 @@ class Scheduler(
         # Destination migrations arrive with their KV already populated. They
         # share the decode disaggregation prebuilt-admission path, while normal
         # requests continue through ordinary prefill below.
-        if self.server_args.enable_decode_migration:
-            self.admit_prebuilt_batch(
-                self.get_new_prebuilt_batch(prebuilt_kv_only=True)
-            )
+        self.admit_prebuilt_batch(self.get_new_prebuilt_batch(prebuilt_kv_only=True))
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
@@ -3507,9 +3503,8 @@ class Scheduler(
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
 
-            if (
-                self.disaggregation_mode == DisaggregationMode.DECODE
-                or self.server_args.enable_decode_migration
+            if self.disaggregation_mode == DisaggregationMode.DECODE or hasattr(
+                self, "disagg_decode_prealloc_queue"
             ):
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
@@ -3792,7 +3787,7 @@ class Scheduler(
             # Decode-mode and prebuilt-KV requests already own KV.
             if (
                 self.disaggregation_mode == DisaggregationMode.DECODE
-                or req.has_prebuilt_kv
+                or req.prebuilt_kv is not None
             ):
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index

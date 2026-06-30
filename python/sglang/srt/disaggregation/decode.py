@@ -34,7 +34,7 @@ from torch.distributed import ProcessGroup
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.base.conn import NixlTransportConfig, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.prebuilt_kv import bind_prebuilt_kv_from_transfer
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -293,6 +294,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
         enable_radix_cache: Optional[bool] = None,
+        nixl_transport_config: NixlTransportConfig = NixlTransportConfig(),
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -314,6 +316,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_rank = pp_rank
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
+        self.nixl_transport_config = nixl_transport_config
         self.enable_radix_cache = (
             scheduler.server_args.disaggregation_decode_enable_radix_cache
             if enable_radix_cache is None
@@ -442,9 +445,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
-        kv_args.nixl_manual_progress = (
-            self.scheduler.server_args.enable_decode_migration
-        )
+        kv_args.nixl_transport_config = self.nixl_transport_config
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -866,9 +867,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # TODO: add new_token ratio
             origin_input_len = len(decode_req.req.origin_input_ids)
             prefix_match: Optional[DecodePrefixMatch] = None
-            if self.enable_radix_cache and not getattr(
-                decode_req.req, "decode_migration_id", None
-            ):
+            if self.enable_radix_cache and decode_req.req.prebuilt_kv is None:
                 # Match prefix against decode's radix cache.
                 prefix_match = self._match_prefix_and_lock(decode_req.req)
                 prefix_indices = prefix_match.prefix_indices
@@ -1056,8 +1055,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_prefix_len=total_prefix_len,
             )
             if (
-                getattr(decode_req.req, "decode_migration_id", None)
-                and not getattr(decode_req.req, "decode_migration_bound", False)
+                decode_req.req.prebuilt_kv is not None
+                and not decode_req.req.prebuilt_kv.ready
                 and hasattr(decode_req.kv_receiver, "defer_waiting_timeout")
             ):
                 decode_req.kv_receiver.defer_waiting_timeout()
@@ -1536,8 +1535,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         # Case 3: Success - commit the transfer
         transferred_output_id = output_id[0].item()
-        expected_output_id = getattr(
-            decode_req.req, "decode_migration_pending_input_id", None
+        expected_output_id = (
+            decode_req.req.prebuilt_kv.pending_input_id
+            if decode_req.req.prebuilt_kv is not None
+            else None
         )
         if (
             expected_output_id is not None
@@ -1552,7 +1553,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.kv_receiver = None
             return
         decode_req.req.output_ids.append(transferred_output_id)
-        if getattr(decode_req.req, "decode_migration_id", None):
+        if expected_output_id is not None:
             # The pending frontier token was already emitted by the source.
             decode_req.req.send_token_offset = 1
             decode_req.req.stream_output_start_offset = 1
@@ -1693,14 +1694,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-                if getattr(decode_req.req, "decode_migration_id", None) and not getattr(
-                    decode_req.req, "decode_migration_bound", False
+                if (
+                    decode_req.req.prebuilt_kv is not None
+                    and not decode_req.req.prebuilt_kv.ready
                 ):
-                    error = (
-                        self.scheduler.bind_decode_migration_destination_from_transfer(
-                            decode_req
-                        )
-                    )
+                    error = bind_prebuilt_kv_from_transfer(self.scheduler, decode_req)
                     if error is not None:
                         prepare_abort(
                             decode_req.req,
@@ -1723,12 +1721,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ):
                     continue
                 self._commit_transfer_to_req(decode_req)
-                if getattr(decode_req.req, "decode_migration_id", None):
+                if decode_req.req.prebuilt_kv is not None:
                     logger.debug(
                         "Decode migration receiver admitted rid=%s migration_id=%s "
                         "room=%s",
                         decode_req.req.rid,
-                        decode_req.req.decode_migration_id,
+                        decode_req.req.prebuilt_kv.transfer_id,
                         decode_req.req.bootstrap_room,
                     )
                 indices_to_remove.add(i)
@@ -1791,6 +1789,7 @@ def create_decode_transfer_queues(
     draft_token_to_kv_pool: Optional[KVCache],
     *,
     enable_radix_cache: Optional[bool] = None,
+    nixl_transport_config: NixlTransportConfig = NixlTransportConfig(),
 ) -> tuple[DecodePreallocQueue, DecodeTransferQueue]:
     """Create the standard decode preallocation and transfer queues."""
     transfer_queue = DecodeTransferQueue(
@@ -1825,6 +1824,7 @@ def create_decode_transfer_queues(
         num_reserved_decode_tokens=scheduler.server_args.num_reserved_decode_tokens,
         transfer_backend=scheduler.transfer_backend,
         enable_radix_cache=enable_radix_cache,
+        nixl_transport_config=nixl_transport_config,
     )
     return prealloc_queue, transfer_queue
 
@@ -1974,7 +1974,7 @@ class SchedulerDisaggregationDecodeMixin:
         waiting_queue: List[Req] = []
 
         for req in self.waiting_queue:
-            if prebuilt_kv_only and not req.has_prebuilt_kv:
+            if prebuilt_kv_only and req.prebuilt_kv is None:
                 waiting_queue.append(req)
                 continue
             # We can only add as many requests as there are available slots.
@@ -1983,7 +1983,7 @@ class SchedulerDisaggregationDecodeMixin:
                 # A prebuilt-KV request has already established its exact
                 # ownership layout. Other decode requests retain their normal
                 # radix matching behavior.
-                if req.has_prebuilt_kv:
+                if req.prebuilt_kv is not None:
                     tree_cache = None
                 elif self.server_args.disaggregation_decode_enable_radix_cache:
                     tree_cache = self.tree_cache if req.last_node is None else None
@@ -1991,7 +1991,7 @@ class SchedulerDisaggregationDecodeMixin:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
                 if (
-                    req.has_prebuilt_kv
+                    req.prebuilt_kv is not None
                     and req.last_node is None
                     and not self.tree_cache.is_chunk_cache()
                 ):

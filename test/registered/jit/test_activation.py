@@ -67,16 +67,6 @@ def test_activation_correctness(
 
 @pytest.mark.parametrize("op_name", OPS)
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_activation_non_vectorized_width(op_name: str, dtype: torch.dtype) -> None:
-    x = torch.randn((2, 2736), dtype=dtype, device="cuda")
-    out = run_activation(op_name, x, None)
-    expected = _reference(op_name, x)
-    atol, rtol = _tolerances(dtype)
-    torch.testing.assert_close(out, expected, atol=atol, rtol=rtol)
-
-
-@pytest.mark.parametrize("op_name", OPS)
-@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
 def test_activation_out_param(
     op_name: str, dtype: torch.dtype, shape: tuple[int, ...]

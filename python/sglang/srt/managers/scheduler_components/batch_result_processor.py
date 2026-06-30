@@ -18,8 +18,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.scheduler_components.result_disposition import (
-    ResultDispositionHandler,
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    decode_metrics_batch_view,
 )
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
@@ -79,12 +79,29 @@ class SchedulerBatchResultProcessor:
     output_streamer: "SchedulerOutputStreamer"
     abort_request: Callable
     maybe_quiesce_decode_migration: Optional[Callable] = None
-    result_disposition: ResultDispositionHandler = ResultDispositionHandler()
+    should_process_result: Optional[Callable[[Req], bool]] = None
+
+    def _maybe_quiesce(self, req: Req) -> bool:
+        return (
+            self.maybe_quiesce_decode_migration is not None
+            and self.maybe_quiesce_decode_migration(req)
+        )
+
+    def _discard_result(self, req: Req) -> bool:
+        return (
+            self.should_process_result is not None
+            and not self.should_process_result(req)
+        )
+
+    @staticmethod
+    def _without_discarded(reqs: list[Req], discarded: list[Req]) -> list[Req]:
+        discarded_ids = {id(req) for req in discarded}
+        return [req for req in reqs if id(req) not in discarded_ids]
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         use_free_group = (
             self.server_args.disaggregation_decode_enable_radix_cache
-            or any(req.has_prebuilt_kv for req in batch.reqs)
+            or any(req.prebuilt_kv is not None for req in batch.reqs)
         )
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()
@@ -221,7 +238,7 @@ class SchedulerBatchResultProcessor:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                discarded_result = self.result_disposition.should_discard(req)
+                discarded_result = self._discard_result(req)
                 if req.finished() or req.is_retracted or discarded_result:
                     if discarded_result:
                         discarded_result_reqs.append(req)
@@ -237,11 +254,7 @@ class SchedulerBatchResultProcessor:
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
                     req.update_finish_state()
-                    parked = (
-                        self.maybe_quiesce_decode_migration(req)
-                        if self.maybe_quiesce_decode_migration is not None
-                        else False
-                    )
+                    parked = self._maybe_quiesce(req)
                     if req.finished() and not parked:
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
@@ -340,9 +353,7 @@ class SchedulerBatchResultProcessor:
                     req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        stream_reqs = self.result_disposition.without_discarded(
-            batch.reqs, discarded_result_reqs
-        )
+        stream_reqs = self._without_discarded(batch.reqs, discarded_result_reqs)
         if stream_reqs:
             self.output_streamer.stream_output(
                 stream_reqs, batch.return_logprob, skip_stream_req
@@ -651,31 +662,23 @@ class SchedulerBatchResultProcessor:
         self.token_to_kv_pool_allocator.free_group_begin()
         discarded_result_reqs: list[Req] = []
 
-        # Spec V1 handles output_ids, update_finish_state, grammar, and reasoning tokens
-        # in the verify phase. Non-spec and V2 handle them here in post-processing.
+        # Spec V1 post-processes tokens in verify; other modes do it below.
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
         for i, req in enumerate(batch.reqs):
-            req: Req
-
-            if self.result_disposition.should_discard(req):
+            if self._discard_result(req):
                 discarded_result_reqs.append(req)
                 continue
 
             if (self.enable_overlap or self.enable_overlap_mlx) and (
                 req.finished() or req.is_retracted
             ):
-                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
-                # And all the over-allocated tokens will be freed in `release_kv_cache`.
+                # release_kv_cache frees overlap scheduling's over-allocation.
                 continue
 
             if is_spec_v1:
                 req.time_stats.set_last_decode_finish_time()
-                parked = (
-                    self.maybe_quiesce_decode_migration(req)
-                    if self.maybe_quiesce_decode_migration is not None
-                    else False
-                )
+                parked = self._maybe_quiesce(req)
                 if not parked:
                     self._handle_finish_state_updated_req(
                         req, batch, result, i, logits_output
@@ -688,7 +691,6 @@ class SchedulerBatchResultProcessor:
                     req.grammar.finished = req.finished()
                 continue
 
-            # Non-spec and V2: full post-processing
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
@@ -702,11 +704,7 @@ class SchedulerBatchResultProcessor:
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accepted_len)
 
-            parked = (
-                self.maybe_quiesce_decode_migration(req)
-                if self.maybe_quiesce_decode_migration is not None
-                else False
-            )
+            parked = self._maybe_quiesce(req)
             if not parked:
                 self._handle_finish_state_updated_req(
                     req, batch, result, i, logits_output
@@ -732,9 +730,7 @@ class SchedulerBatchResultProcessor:
                     req=req, next_token_id=next_token_id, batch=batch
                 )
 
-        stream_reqs = self.result_disposition.without_discarded(
-            batch.reqs, discarded_result_reqs
-        )
+        stream_reqs = self._without_discarded(batch.reqs, discarded_result_reqs)
         if stream_reqs:
             self.output_streamer.stream_output(stream_reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -746,9 +742,7 @@ class SchedulerBatchResultProcessor:
         ) % (1 << 30)
         self.metrics_reporter.report_decode_stats(
             can_run_cuda_graph,
-            running_batch=self.result_disposition.decode_metrics_view(
-                batch, discarded_result_reqs
-            ),
+            running_batch=decode_metrics_batch_view(batch, discarded_result_reqs),
             num_correct_drafts=result.num_correct_drafts,
         )
 

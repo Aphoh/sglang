@@ -279,30 +279,27 @@ class NixlKVManager(CommonKVManager):
                 "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS must be a JSON object "
                 "with string keys and string values"
             )
-        manual_progress = args.nixl_manual_progress
+        transport_config = args.nixl_transport_config
         logger.info(
-            "Initializing NIXL manager mode=%s manual_progress=%s",
+            "Initializing NIXL manager mode=%s transport_config=%s",
             disaggregation_mode,
-            manual_progress,
+            transport_config,
         )
         agent_config = nixl_agent_config(
             backends=[],
-            # Source-side posting benefits from NIXL's progress thread. The
-            # destination instead uses the low-latency notification worker below.
-            enable_prog_thread=(
-                not manual_progress or disaggregation_mode == DisaggregationMode.PREFILL
-            ),
+            enable_prog_thread=transport_config.enable_progress_thread,
             num_threads=num_threads,
             sync_mode=(
-                nixl_thread_sync_t.NIXL_THREAD_SYNC_RW if manual_progress else None
+                nixl_thread_sync_t.NIXL_THREAD_SYNC_RW
+                if transport_config.thread_safe_agent
+                else None
             ),
         )
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
-        if manual_progress and backend == "UCX":
-            # Migration lists are typically a few hundred descriptors, below
-            # NIXL's large-transfer default of 1024. Use the existing posting
-            # pool for these latency-sensitive transfers unless overridden.
-            backend_params.setdefault("split_batch_size", "16")
+        if backend == "UCX" and transport_config.ucx_split_batch_size is not None:
+            backend_params.setdefault(
+                "split_batch_size", str(transport_config.ucx_split_batch_size)
+            )
         if num_threads > 0:
             # TODO: Remove this once NIXL passes thread parameters from
             # nixl_agent_config to explicitly-created backends.
@@ -338,17 +335,14 @@ class NixlKVManager(CommonKVManager):
             self._num_slots_src = (
                 self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
             )
-            # A dedicated migration sender uses one lane because concurrent
-            # transfer()/check_xfer_state() loops on the same NIXL agent cause
-            # severe posting contention. Normal P/D managers retain the
-            # configured queue count.
             transfer_queue_size = (
-                1 if manual_progress else envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
+                transport_config.sender_workers
+                or envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
             )
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
-            self._defer_transfer_completion = manual_progress
+            self._defer_transfer_completion = transport_config.defer_sender_completion
             self._transfer_completion_queue = Queue()
             self.exceptions: Dict[int, Exception] = {}
             # Mirror mooncake: one staging buffer per worker queue, all
@@ -386,8 +380,10 @@ class NixlKVManager(CommonKVManager):
                 self._staging_handler = None
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
                 self._start_decode_staging_thread()
-            if manual_progress and server_args.enable_decode_migration:
-                self._start_decode_progress_thread()
+            if transport_config.receiver_poll_interval_s is not None:
+                self._start_decode_progress_thread(
+                    transport_config.receiver_poll_interval_s
+                )
             self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
@@ -1771,11 +1767,11 @@ class NixlKVManager(CommonKVManager):
         )
         return None
 
-    def _start_decode_progress_thread(self):
+    def _start_decode_progress_thread(self, poll_interval_s: float):
         def progress_worker():
             while True:
                 self.update_transfer_status()
-                time.sleep(0.001)
+                time.sleep(poll_interval_s)
 
         threading.Thread(
             target=progress_worker,
@@ -1788,7 +1784,7 @@ class NixlKVManager(CommonKVManager):
 
         def process_notifications():
             # Keep notification retrieval and status mutation atomic. In
-            # manual-progress mode this runs on the dedicated progress thread.
+            # latency-optimized mode uses the dedicated progress thread.
             notif_map = self.agent.get_new_notifs()
             for _peer_name, messages in notif_map.items():
                 for msg in messages:

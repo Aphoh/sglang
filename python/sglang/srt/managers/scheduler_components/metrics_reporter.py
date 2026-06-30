@@ -56,6 +56,34 @@ class DecodeMetricsBatch(Protocol):
     def batch_size(self) -> int: ...
 
 
+@dataclass(frozen=True)
+class DecodeMetricsBatchView:
+    reqs: list[Req]
+    seq_lens_cpu: torch.Tensor | None
+    dp_cooperation_info: DPCooperationInfo | None
+    forward_iter: int | None
+
+    def batch_size(self) -> int:
+        return len(self.reqs)
+
+
+def decode_metrics_batch_view(
+    batch: DecodeMetricsBatch, excluded: list[Req]
+) -> DecodeMetricsBatch:
+    if not excluded:
+        return batch
+    excluded_ids = {id(req) for req in excluded}
+    keep = [i for i, req in enumerate(batch.reqs) if id(req) not in excluded_ids]
+    return DecodeMetricsBatchView(
+        reqs=[batch.reqs[i] for i in keep],
+        seq_lens_cpu=(
+            batch.seq_lens_cpu[keep] if batch.seq_lens_cpu is not None else None
+        ),
+        dp_cooperation_info=batch.dp_cooperation_info,
+        forward_iter=batch.forward_iter,
+    )
+
+
 def _decode_total_seq_lens(batch: DecodeMetricsBatch) -> int:
     """Sync-free sum of seq_lens for decode metrics."""
     if batch.seq_lens_cpu is not None:

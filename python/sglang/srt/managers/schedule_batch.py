@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sglang.srt.disaggregation.prebuilt_kv import PrebuiltKVState
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import (
@@ -712,9 +713,7 @@ class Req(ReqDllmMixin):
         self.kv_allocated_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
-        # This request already owns a complete KV layout and must enter decode
-        # through the prebuilt admission path rather than ordinary prefill.
-        self.has_prebuilt_kv = False
+        self.prebuilt_kv: Optional[PrebuiltKVState] = None
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -852,6 +851,7 @@ class Req(ReqDllmMixin):
 
         # Incremental streamining
         self.send_token_offset: int = 0
+        self.stream_output_start_offset: int = 0
         self.send_decode_id_offset: int = 0
         # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
         # because the decode server does not have the first output token logprobs

@@ -60,13 +60,11 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
-    BindDecodeMigrationReqInput,
-    BindDecodeMigrationReqOutput,
+    CancelDecodeMigrationReqInput,
+    CancelDecodeMigrationReqOutput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     EmbeddingReqInput,
-    FinalizeDecodeMigrationReqInput,
-    FinalizeDecodeMigrationReqOutput,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -419,7 +417,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
-        self.decode_migration_futures: Dict[Tuple[str, int], asyncio.Future] = {}
+        self.decode_migration_futures: Dict[Tuple[str, int, str], asyncio.Future] = {}
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -575,11 +573,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._handle_decode_migration_output,
                 ),
                 (
-                    BindDecodeMigrationReqOutput,
-                    self._handle_decode_migration_output,
-                ),
-                (
-                    FinalizeDecodeMigrationReqOutput,
+                    CancelDecodeMigrationReqOutput,
                     self._handle_decode_migration_output,
                 ),
                 (
@@ -1684,7 +1678,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
 
-    def _decode_migration_waiter_key(self, obj) -> Tuple[str, int]:
+    @staticmethod
+    def _decode_migration_control_kind(obj) -> str:
+        if isinstance(
+            obj, (PrepareDecodeMigrationReqInput, PrepareDecodeMigrationReqOutput)
+        ):
+            return "prepare"
+        if isinstance(
+            obj, (QuiesceDecodeMigrationReqInput, QuiesceDecodeMigrationReqOutput)
+        ):
+            return "quiesce"
+        if isinstance(
+            obj, (CancelDecodeMigrationReqInput, CancelDecodeMigrationReqOutput)
+        ):
+            return "cancel"
+        raise TypeError(f"Unsupported decode migration control: {type(obj).__name__}")
+
+    def _decode_migration_waiter_key(self, obj) -> Tuple[str, int, str]:
         dp_rank = obj.routed_dp_rank
         if dp_rank is None:
             if self.server_args.dp_size > 1:
@@ -1697,67 +1707,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"routed_dp_rank={dp_rank} out of range "
                 f"[0, {self.server_args.dp_size})"
             )
-        return obj.migration_id, dp_rank
+        return obj.migration_id, dp_rank, self._decode_migration_control_kind(obj)
+
+    async def _send_decode_migration_control(self, obj):
+        self.auto_create_handle_loop()
+        key = self._decode_migration_waiter_key(obj)
+        if key in self.decode_migration_futures:
+            raise RuntimeError(f"Migration waiter already exists for {key}")
+        future = asyncio.get_running_loop().create_future()
+        self.decode_migration_futures[key] = future
+        try:
+            await self.send_to_scheduler.send_pyobj(obj)
+            return await asyncio.wait_for(future, timeout=10.0)
+        finally:
+            self.decode_migration_futures.pop(key, None)
 
     async def prepare_decode_migration(
         self, obj: PrepareDecodeMigrationReqInput
     ) -> PrepareDecodeMigrationReqOutput:
-        self.auto_create_handle_loop()
-        key = self._decode_migration_waiter_key(obj)
-        if key in self.decode_migration_futures:
-            raise RuntimeError(f"Migration waiter already exists for {key}")
-        future = asyncio.get_running_loop().create_future()
-        self.decode_migration_futures[key] = future
-        try:
-            await self.send_to_scheduler.send_pyobj(obj)
-            return await asyncio.wait_for(future, timeout=10.0)
-        finally:
-            self.decode_migration_futures.pop(key, None)
+        return await self._send_decode_migration_control(obj)
 
     async def quiesce_decode_migration(
         self, obj: QuiesceDecodeMigrationReqInput
     ) -> QuiesceDecodeMigrationReqOutput:
-        self.auto_create_handle_loop()
-        key = self._decode_migration_waiter_key(obj)
-        if key in self.decode_migration_futures:
-            raise RuntimeError(f"Migration waiter already exists for {key}")
-        future = asyncio.get_running_loop().create_future()
-        self.decode_migration_futures[key] = future
-        try:
-            await self.send_to_scheduler.send_pyobj(obj)
-            return await asyncio.wait_for(future, timeout=10.0)
-        finally:
-            self.decode_migration_futures.pop(key, None)
+        return await self._send_decode_migration_control(obj)
 
-    async def bind_decode_migration_destination(
-        self, obj: BindDecodeMigrationReqInput
-    ) -> BindDecodeMigrationReqOutput:
-        self.auto_create_handle_loop()
-        key = self._decode_migration_waiter_key(obj)
-        if key in self.decode_migration_futures:
-            raise RuntimeError(f"Migration waiter already exists for {key}")
-        future = asyncio.get_running_loop().create_future()
-        self.decode_migration_futures[key] = future
-        try:
-            await self.send_to_scheduler.send_pyobj(obj)
-            return await asyncio.wait_for(future, timeout=10.0)
-        finally:
-            self.decode_migration_futures.pop(key, None)
-
-    async def finalize_decode_migration(
-        self, obj: FinalizeDecodeMigrationReqInput
-    ) -> FinalizeDecodeMigrationReqOutput:
-        self.auto_create_handle_loop()
-        key = self._decode_migration_waiter_key(obj)
-        if key in self.decode_migration_futures:
-            raise RuntimeError(f"Migration waiter already exists for {key}")
-        future = asyncio.get_running_loop().create_future()
-        self.decode_migration_futures[key] = future
-        try:
-            await self.send_to_scheduler.send_pyobj(obj)
-            return await asyncio.wait_for(future, timeout=10.0)
-        finally:
-            self.decode_migration_futures.pop(key, None)
+    async def cancel_decode_migration(
+        self, obj: CancelDecodeMigrationReqInput
+    ) -> CancelDecodeMigrationReqOutput:
+        return await self._send_decode_migration_control(obj)
 
     async def update_weights_from_disk(
         self,
@@ -2779,7 +2757,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             future.set_result(recv_obj.session_id if recv_obj.success else None)
 
     def _handle_decode_migration_output(self, recv_obj):
-        key = (recv_obj.migration_id, recv_obj.source_dp_rank)
+        key = (
+            recv_obj.migration_id,
+            recv_obj.source_dp_rank,
+            self._decode_migration_control_kind(recv_obj),
+        )
         future = self.decode_migration_futures.get(key)
         if future is None:
             logger.warning(
@@ -2787,6 +2769,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 recv_obj.migration_id,
                 recv_obj.source_dp_rank,
             )
+            return
+        if (
+            isinstance(recv_obj, QuiesceDecodeMigrationReqOutput)
+            and recv_obj.status == "quiescing"
+        ):
             return
         if not future.done():
             future.set_result(recv_obj)

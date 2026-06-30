@@ -28,7 +28,7 @@ from sglang.srt.managers.data_parallel_controller import (
     LoadBalanceMethod,
 )
 from sglang.srt.managers.io_struct import (
-    FinalizeDecodeMigrationReqInput,
+    CancelDecodeMigrationReqInput,
     PrepareDecodeMigrationReqInput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
@@ -213,7 +213,7 @@ class TestRoundRobinScheduler(CustomTestCase):
 
 
 class TestRoutedMigrationControl(CustomTestCase):
-    def test_prepare_and_finalize_target_nonzero_dp_ranks(self):
+    def test_prepare_and_cancel_target_nonzero_dp_ranks(self):
         controller = _make_controller(dp_size=4)
         controller.init_dispatcher()
 
@@ -230,14 +230,13 @@ class TestRoutedMigrationControl(CustomTestCase):
         for rank in (0, 1, 2):
             controller.workers[rank].send_pyobj.assert_not_called()
 
-        finalize = FinalizeDecodeMigrationReqInput(
+        cancel = CancelDecodeMigrationReqInput(
             rid="request",
             migration_id="migration",
-            action="commit",
             routed_dp_rank=2,
         )
-        controller._request_dispatcher(finalize)
-        controller.workers[2].send_pyobj.assert_called_once_with(finalize)
+        controller._request_dispatcher(cancel)
+        controller.workers[2].send_pyobj.assert_called_once_with(cancel)
         for rank in (0, 1):
             controller.workers[rank].send_pyobj.assert_not_called()
 

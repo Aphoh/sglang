@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.base.conn import NixlTransportConfig, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -106,7 +106,7 @@ def create_prefill_kv_manager(
     scheduler: Scheduler,
     tp_rank: int,
     pp_rank: int,
-    nixl_manual_progress: bool = False,
+    nixl_transport_config: NixlTransportConfig = NixlTransportConfig(),
 ) -> CommonKVManager:
     """Create the sender-side manager shared by prefill and decode migration."""
     is_mla = is_mla_backend(token_to_kv_pool)
@@ -148,7 +148,7 @@ def create_prefill_kv_manager(
     )
     kv_args.ib_device = scheduler.server_args.disaggregation_ib_device
     kv_args.gpu_id = scheduler.ps.gpu_id
-    kv_args.nixl_manual_progress = nixl_manual_progress
+    kv_args.nixl_transport_config = nixl_transport_config
     setup_state_kv_args(
         kv_args,
         token_to_kv_pool,

@@ -1593,15 +1593,20 @@ class UpdateExpertBackupReq(BaseReq):
 
 
 @dataclass
-class PrepareDecodeMigrationReqInput(BaseReq):
-    """Prepare a source request to transfer to an existing destination."""
+class DecodeMigrationControlReqInput(BaseReq):
+    """Control request routed to one data-parallel scheduler."""
 
     migration_id: str
+    routed_dp_rank: Optional[int] = field(default=None, kw_only=True)
+
+
+@dataclass
+class PrepareDecodeMigrationReqInput(DecodeMigrationControlReqInput):
+    """Prepare a source request to transfer to an existing destination."""
+
     bootstrap_host: str
     bootstrap_port: int
     bootstrap_room: int
-
-    routed_dp_rank: Optional[int] = None
 
 
 @dataclass
@@ -1614,13 +1619,10 @@ class PrepareDecodeMigrationReqOutput(BaseReq):
 
 
 @dataclass
-class QuiesceDecodeMigrationReqInput(BaseReq):
+class QuiesceDecodeMigrationReqInput(DecodeMigrationControlReqInput):
     """Stop a prepared source request at its next safe decode boundary."""
 
-    migration_id: str
     output_tokens_seen: int = 0
-
-    routed_dp_rank: Optional[int] = None
 
 
 @dataclass
@@ -1628,8 +1630,6 @@ class QuiesceDecodeMigrationReqOutput(BaseReq):
     migration_id: str
     success: bool
     status: Literal["quiescing", "quiesced", "finished", "not_found", "busy", "error"]
-    committed_input_ids: List[int] = field(default_factory=list)
-    pending_input_ids: List[int] = field(default_factory=list)
     unforwarded_committed_output_ids: List[int] = field(default_factory=list)
     prompt_len: int = 0
     committed_len: int = 0
@@ -1640,60 +1640,15 @@ class QuiesceDecodeMigrationReqOutput(BaseReq):
 
 
 @dataclass
-class BindDecodeMigrationReqInput(BaseReq):
-    """Replace a destination reservation's placeholders with exact source state."""
-
-    migration_id: str
-    bootstrap_room: int
-    committed_input_ids: List[int]
-    pending_input_ids: List[int]
-    committed_len: int
-    logical_len: int
-    max_new_tokens: Optional[int] = None
-    min_new_tokens: Optional[int] = None
-
-    routed_dp_rank: Optional[int] = None
+class CancelDecodeMigrationReqInput(DecodeMigrationControlReqInput):
+    """Discard a prepared source before quiescence becomes irreversible."""
 
 
 @dataclass
-class BindDecodeMigrationReqOutput(BaseReq):
+class CancelDecodeMigrationReqOutput(BaseReq):
     migration_id: str
     success: bool
-    status: Literal["ready", "not_found", "error"]
-    source_dp_rank: int = 0
-    pending_token_suppressed: bool = False
-    error: Optional[str] = None
-
-
-@dataclass
-class FinalizeDecodeMigrationReqInput(BaseReq):
-    """Commit or cancel a prepared decode migration."""
-
-    migration_id: str
-    action: Literal["commit", "cancel"]
-
-    routed_dp_rank: Optional[int] = None
-
-    def __post_init__(self):
-        allowed = ["commit", "cancel"]
-        if self.action not in allowed:
-            raise ValueError(
-                f"Invalid migration finalization action: {self.action!r}. "
-                f"Expected one of {allowed}."
-            )
-
-
-@dataclass
-class FinalizeDecodeMigrationReqOutput(BaseReq):
-    migration_id: str
-    action: str
-    success: bool
-    transfer_status: Literal[
-        "bootstrapping", "transferring", "transferred", "failed", "unknown"
-    ] = "unknown"
-    # A source commit may be accepted before its scheduler observes local NIXL
-    # completion. The source retains KV ownership until that transition.
-    commit_pending: bool = False
+    status: Literal["cancelled", "not_found", "quiesced", "error"]
     source_dp_rank: int = 0
     error: Optional[str] = None
 

@@ -7,26 +7,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.decode_migration import (
+from sglang.srt.disaggregation.decode_migration import SchedulerDecodeMigrationMixin
+from sglang.srt.disaggregation.decode_migration_state import (
+    AwaitingStaleDecodeResult,
     DecodeMigrationRegistry,
-    DecodeMigrationState,
-    SchedulerDecodeMigrationMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode, KVClassType
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
-    BindDecodeMigrationReqInput,
-    BindDecodeMigrationReqOutput,
-    FinalizeDecodeMigrationReqInput,
-    FinalizeDecodeMigrationReqOutput,
+    CancelDecodeMigrationReqInput,
+    CancelDecodeMigrationReqOutput,
     PrepareDecodeMigrationReqInput,
     PrepareDecodeMigrationReqOutput,
     QuiesceDecodeMigrationReqInput,
     QuiesceDecodeMigrationReqOutput,
 )
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.result_disposition import (
-    ResultDisposition,
-)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 
@@ -39,8 +34,7 @@ class _Batch:
 
     def filter_batch(self, keep_indices=None, **_kwargs):
         self.filter_calls += 1
-        if keep_indices is None:
-            keep_indices = list(range(len(self.reqs)))
+        keep_indices = keep_indices or []
         self.reqs = [self.reqs[index] for index in keep_indices]
 
 
@@ -53,6 +47,7 @@ class _Req:
         self.req_pool_idx = 1
         self.send_token_offset = 0
         self.return_logprob = False
+        self.sampling_params = SimpleNamespace(max_new_tokens=128, min_new_tokens=0)
         self.to_finish = None
         self._finished = False
 
@@ -78,11 +73,34 @@ class _Allocator:
 
 
 class _Sender:
-    def __init__(self, **_kwargs):
+    def __init__(self):
         self.clear_count = 0
+        self.aux_transfer_lens = None
 
     def clear(self):
         self.clear_count += 1
+
+    def set_aux_transfer_lens(self, aux_transfer_lens):
+        self.aux_transfer_lens = aux_transfer_lens
+
+
+class _MetadataBuffers:
+    def __init__(self):
+        self.output_ids = torch.zeros((8, 64), dtype=torch.int64)
+        self.cached_tokens = torch.zeros((8, 1), dtype=torch.int64)
+        self.bootstrap_room = torch.zeros((8, 1), dtype=torch.int64)
+
+    def set_decode_migration_frontier(
+        self, index, *, committed_input_ids, pending_input_id, **_state
+    ):
+        self.output_ids[index].zero_()
+        self.output_ids[index][0] = pending_input_id
+        self.output_ids[index][1 : 1 + len(committed_input_ids)] = torch.tensor(
+            committed_input_ids
+        )
+
+    def decode_migration_frontier_nbytes(self, committed_len):
+        return (8 + committed_len) * self.output_ids.element_size()
 
 
 class _Scheduler(SchedulerDecodeMigrationMixin):
@@ -96,11 +114,7 @@ class _Scheduler(SchedulerDecodeMigrationMixin):
         self.last_batch = self.running_batch
         self.cur_batch = self.running_batch
         self.req_to_metadata_buffer_idx_allocator = _Allocator()
-        self.disagg_metadata_buffers = SimpleNamespace(
-            output_ids=torch.zeros((8, 1), dtype=torch.int64),
-            cached_tokens=torch.zeros((8, 1), dtype=torch.int64),
-            bootstrap_room=torch.zeros((8, 1), dtype=torch.int64),
-        )
+        self.disagg_metadata_buffers = _MetadataBuffers()
         self.transfer_backend = object()
         self.spec_algorithm = SimpleNamespace(is_none=lambda: True)
         self.ps = SimpleNamespace(tp_rank=0, pp_rank=0, dp_rank=dp_rank)
@@ -109,6 +123,9 @@ class _Scheduler(SchedulerDecodeMigrationMixin):
         self.tree_cache = object()
         self.process_batch_result = MagicMock()
         self.output_streamer = MagicMock()
+        self.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(send_output=MagicMock())
+        )
         self.created_senders = []
 
     def _get_decode_migration_kv_manager(self):
@@ -138,11 +155,7 @@ class _Scheduler(SchedulerDecodeMigrationMixin):
         return removed
 
 
-def _prepare(
-    rid,
-    migration_id,
-    room,
-):
+def _prepare(rid="request", migration_id="migration", room=17):
     return PrepareDecodeMigrationReqInput(
         rid=rid,
         migration_id=migration_id,
@@ -152,7 +165,7 @@ def _prepare(
     )
 
 
-def _quiesce(rid, migration_id, output_tokens_seen=0):
+def _quiesce(rid="request", migration_id="migration", output_tokens_seen=0):
     return QuiesceDecodeMigrationReqInput(
         rid=rid,
         migration_id=migration_id,
@@ -160,16 +173,12 @@ def _quiesce(rid, migration_id, output_tokens_seen=0):
     )
 
 
-class DecodeMigrationSourceTests(unittest.TestCase):
-    def _sender_patch(self):
-        return patch(
-            "sglang.srt.disaggregation.decode_migration.get_kv_class",
-            side_effect=lambda _backend, kind: (
-                _Sender if kind == KVClassType.SENDER else object
-            ),
-        )
+def _cancel(rid="request", migration_id="migration"):
+    return CancelDecodeMigrationReqInput(rid=rid, migration_id=migration_id)
 
-    def test_scheduler_batches_deferred_request_detaches(self):
+
+class DecodeMigrationSourceTests(unittest.TestCase):
+    def test_scheduler_detaches_many_requests_in_one_batch_filter(self):
         reqs = [_Req(str(index)) for index in range(8)]
         running_batch = _Batch(reqs)
         running_batch.decoding_reqs = list(reqs)
@@ -182,8 +191,6 @@ class DecodeMigrationSourceTests(unittest.TestCase):
 
         for req in reqs[:6]:
             self.assertTrue(Scheduler.detach_request_from_scheduling(scheduler, req))
-        self.assertEqual(running_batch.reqs, reqs)
-
         removed = Scheduler._detach_requests_from_scheduling(
             scheduler, list(scheduler._deferred_detach_requests.values())
         )
@@ -194,480 +201,233 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         self.assertEqual(running_batch.filter_calls, 1)
         self.assertFalse(running_batch.batch_is_full)
 
-    def test_quiesce_uses_the_frontend_acknowledged_frontier(self):
-        target = _Req("target", output_ids=[20, 21])
-        other = _Req("other")
-        scheduler = _Scheduler([target, other], overlap=True)
-        with self._sender_patch():
-            prepared = scheduler.prepare_decode_migration(
-                _prepare("target", "migration-1", 17)
-            )
-            output = scheduler.quiesce_decode_migration(
-                _quiesce("target", "migration-1", output_tokens_seen=1)
-            )
+    def test_prepare_keeps_request_running_until_quiesce(self):
+        req = _Req("request", output_ids=[20])
+        scheduler = _Scheduler([req], overlap=True)
 
+        prepared = scheduler.prepare_decode_migration(_prepare())
         self.assertTrue(prepared.success)
+        self.assertEqual(scheduler.running_batch.reqs, [req])
+
+        req.output_ids.append(21)
+        req.kv_committed_len += 1
+        quiesced = scheduler.quiesce_decode_migration(_quiesce(output_tokens_seen=2))
+
+        self.assertTrue(quiesced.success)
+        self.assertEqual(quiesced.status, "quiesced")
+        self.assertEqual(scheduler.running_batch.reqs, [])
+        self.assertFalse(scheduler.running_batch.batch_is_full)
+
+    def test_quiesce_uses_frontend_acknowledged_frontier(self):
+        req = _Req("request", output_ids=[20, 21])
+        scheduler = _Scheduler([req], overlap=True)
+        scheduler.prepare_decode_migration(_prepare())
+
+        output = scheduler.quiesce_decode_migration(_quiesce(output_tokens_seen=1))
+
         self.assertTrue(output.success)
-        # Token 21 was decoded ahead of the frontend's stream watermark. The
-        # destination resumes from the last emitted token (20) and regenerates
-        # 21 instead of silently suppressing an unseen token.
-        self.assertEqual(output.pending_input_ids, [20])
+        self.assertEqual(output.committed_len, 2)
         self.assertEqual(output.logical_len, 3)
         self.assertEqual(output.output_tokens_seen, 1)
-        self.assertEqual(scheduler.running_batch.reqs, [other])
-        self.assertEqual(len(scheduler.result_queue), 0)
-        scheduler.process_batch_result.assert_not_called()
+        self.assertEqual(scheduler.disagg_metadata_buffers.output_ids[0][0], 20)
 
-    def test_overlap_prepare_defers_to_the_next_completed_frontier(self):
+    def test_overlap_quiesce_waits_for_completed_frontier(self):
         req = _Req("request", output_ids=[20])
         scheduler = _Scheduler([req], overlap=True)
-        # The in-flight forward has already advanced KV, but its sampled token
-        # has not yet been processed into output_ids.
         req.kv_committed_len += 1
         scheduler.result_queue.append((_Batch([req]), object()))
+        scheduler.prepare_decode_migration(_prepare())
 
-        scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-        output = scheduler.quiesce_decode_migration(_quiesce("request", "migration"))
-
-        self.assertTrue(output.success)
+        request = _quiesce()
+        request.http_worker_ipc = "tokenizer-3"
+        output = scheduler.quiesce_decode_migration(request)
         self.assertEqual(output.status, "quiescing")
-        prepared = scheduler.decode_migrations.get("migration")
-        self.assertTrue(prepared.quiesce_requested)
 
         req.output_ids.append(21)
-        with self._sender_patch():
-            self.assertTrue(scheduler.maybe_quiesce_decode_migration(req))
+        self.assertTrue(scheduler.maybe_quiesce_decode_migration(req))
+        self.assertEqual(scheduler.running_batch.reqs, [])
+        completion = (
+            scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+        )
+        self.assertEqual(completion.status, "quiesced")
+        routed_request = (
+            scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[1]
+        )
+        self.assertIs(routed_request, request)
+        self.assertEqual(routed_request.http_worker_ipc, "tokenizer-3")
 
-    def test_unrelated_overlap_result_does_not_defer_prepare(self):
+    def test_overlap_finish_notifies_pending_quiesce(self):
         req = _Req("request", output_ids=[20])
-        other = _Req("other")
         scheduler = _Scheduler([req], overlap=True)
-        scheduler.result_queue.append((_Batch([other]), object()))
-
-        with self._sender_patch():
-            scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-            output = scheduler.quiesce_decode_migration(
-                _quiesce("request", "migration")
-            )
-
-        self.assertTrue(output.success)
-        self.assertEqual(output.status, "quiesced")
-
-    def test_prepare_rejects_speculative_decoding(self):
-        req = _Req("request")
-        scheduler = _Scheduler([req])
-        scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: False)
-
-        output = scheduler.prepare_decode_migration(
-            _prepare("request", "migration", 17)
+        scheduler.result_queue.append((_Batch([req]), object()))
+        scheduler.prepare_decode_migration(_prepare())
+        self.assertEqual(
+            scheduler.quiesce_decode_migration(_quiesce()).status, "quiescing"
         )
 
-        self.assertFalse(output.success)
-        self.assertIn("speculative", output.error)
+        req._finished = True
+        self.assertFalse(scheduler.maybe_quiesce_decode_migration(req))
+
+        completion = (
+            scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+        )
+        self.assertEqual(completion.status, "finished")
+        self.assertIsNone(scheduler.decode_migrations.get("migration"))
 
     @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
-    def test_cancel_keeps_overlap_tombstone_until_stale_result_is_consumed(
-        self, release_kv_cache
+    @patch(
+        "sglang.srt.disaggregation.decode_migration.poll_and_all_reduce_attn_cp_tp_group"
+    )
+    def test_transfer_success_releases_source(self, poll_transfers, release_kv_cache):
+        req = _Req("request")
+        scheduler = _Scheduler([req])
+        scheduler.prepare_decode_migration(_prepare())
+        scheduler.quiesce_decode_migration(_quiesce())
+        poll_transfers.return_value = [KVPoll.Success]
+
+        scheduler.process_decode_migration_transfers()
+
+        self.assertIsNone(scheduler.decode_migrations.get("migration"))
+        release_kv_cache.assert_called_once_with(
+            req, scheduler.tree_cache, is_insert=False
+        )
+
+    @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
+    @patch(
+        "sglang.srt.disaggregation.decode_migration.poll_and_all_reduce_attn_cp_tp_group"
+    )
+    def test_overlap_discards_one_stale_result_before_release(
+        self, poll_transfers, release_kv_cache
     ):
         req = _Req("request", output_ids=[20])
         scheduler = _Scheduler([req], overlap=True)
-        scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
+        scheduler.prepare_decode_migration(_prepare())
         req.output_ids.append(21)
         req.kv_committed_len += 1
         scheduler.result_queue.append((_Batch([req]), object()))
-        scheduler.quiesce_decode_migration(_quiesce("request", "migration", 2))
-        with self._sender_patch():
-            self.assertTrue(scheduler.maybe_quiesce_decode_migration(req))
+        scheduler.quiesce_decode_migration(_quiesce(output_tokens_seen=2))
+        self.assertTrue(scheduler.maybe_quiesce_decode_migration(req))
+        self.assertEqual(scheduler.decode_migrations.kv_owner_reqs(), (req,))
+        poll_transfers.return_value = [KVPoll.Success]
 
-        output = scheduler.finalize_decode_migration(
-            FinalizeDecodeMigrationReqInput(
-                rid="request", migration_id="migration", action="cancel"
-            )
-        )
+        scheduler.process_decode_migration_transfers()
 
-        self.assertTrue(output.success)
         record = scheduler.decode_migrations.get("migration")
-        self.assertEqual(record.state, DecodeMigrationState.AWAITING_STALE_RESULT)
+        self.assertIsInstance(record, AwaitingStaleDecodeResult)
+        self.assertEqual(scheduler.decode_migrations.kv_owner_reqs(), (req,))
         release_kv_cache.assert_not_called()
-        retry = scheduler.finalize_decode_migration(
-            FinalizeDecodeMigrationReqInput(
-                rid="request", migration_id="migration", action="cancel"
-            )
-        )
-        self.assertTrue(retry.success)
-        self.assertEqual(retry.transfer_status, "bootstrapping")
-        self.assertEqual(
-            scheduler.get_decode_migration_result_disposition(req),
-            ResultDisposition.DISCARD,
-        )
+        self.assertFalse(scheduler.should_process_decode_result(req))
         self.assertIsNone(scheduler.decode_migrations.get("migration"))
+        self.assertEqual(scheduler.decode_migrations.kv_owner_reqs(), ())
         release_kv_cache.assert_called_once_with(
             req, scheduler.tree_cache, is_insert=False
         )
+        self.assertTrue(scheduler.should_process_decode_result(req))
 
     @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
-    def test_commit_retry_preserves_transferred_status_while_tombstoned(
-        self, release_kv_cache
-    ):
-        req = _Req("request", output_ids=[20])
-        scheduler = _Scheduler([req], overlap=True)
-        scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-        req.output_ids.append(21)
-        req.kv_committed_len += 1
-        scheduler.result_queue.append((_Batch([req]), object()))
-        scheduler.quiesce_decode_migration(_quiesce("request", "migration", 2))
-        with self._sender_patch():
-            self.assertTrue(scheduler.maybe_quiesce_decode_migration(req))
-        scheduler.decode_migrations.get("migration").state = (
-            DecodeMigrationState.TRANSFERRED
-        )
-
-        first = scheduler.finalize_decode_migration(
-            FinalizeDecodeMigrationReqInput(
-                rid="request", migration_id="migration", action="commit"
-            )
-        )
-        retry = scheduler.finalize_decode_migration(
-            FinalizeDecodeMigrationReqInput(
-                rid="request", migration_id="migration", action="commit"
-            )
-        )
-
-        self.assertTrue(first.success)
-        self.assertTrue(retry.success)
-        self.assertEqual(retry.transfer_status, "transferred")
-        self.assertEqual(
-            scheduler.get_decode_migration_result_disposition(req),
-            ResultDisposition.DISCARD,
-        )
-        release_kv_cache.assert_called_once_with(
-            req, scheduler.tree_cache, is_insert=False
-        )
-
-    @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
-    def test_unrelated_overlap_result_does_not_create_a_tombstone(
-        self, release_kv_cache
-    ):
-        req = _Req("request", output_ids=[20])
-        other = _Req("other")
-        scheduler = _Scheduler([req], overlap=True)
-        scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-        req.output_ids.append(21)
-        req.kv_committed_len += 1
-        scheduler.result_queue.append((_Batch([other]), object()))
-        with self._sender_patch():
-            output = scheduler.quiesce_decode_migration(
-                _quiesce("request", "migration", 2)
-            )
-        self.assertEqual(output.status, "quiesced")
-
-        output = scheduler.finalize_decode_migration(
-            FinalizeDecodeMigrationReqInput(
-                rid="request", migration_id="migration", action="cancel"
-            )
-        )
-
-        self.assertTrue(output.success)
-        self.assertIsNone(scheduler.decode_migrations.get("migration"))
-        release_kv_cache.assert_called_once_with(
-            req, scheduler.tree_cache, is_insert=False
-        )
-
-    @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
-    def test_failed_transfer_releases_source_and_stops_counting_as_active(
-        self, release_kv_cache
-    ):
+    def test_failed_transfer_releases_source(self, release_kv_cache):
         req = _Req("request")
         scheduler = _Scheduler([req])
-        with self._sender_patch():
-            scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-            scheduler.quiesce_decode_migration(_quiesce("request", "migration"))
-            scheduler.quiesce_decode_migration(_quiesce("request", "migration"))
+        scheduler.prepare_decode_migration(_prepare())
+        scheduler.quiesce_decode_migration(_quiesce())
 
         scheduler._fail_decode_migration(
             scheduler.decode_migrations.get("migration"), "test failure"
         )
 
         self.assertFalse(scheduler.decode_migrations.has_active_transfers())
-        self.assertIsNone(scheduler.decode_migrations.get("migration"))
         release_kv_cache.assert_called_once_with(
             req, scheduler.tree_cache, is_insert=False
         )
+
+    def test_cancel_only_discards_prepared_source(self):
+        req = _Req("request")
+        scheduler = _Scheduler([req], dp_rank=3)
+        prepared = scheduler.prepare_decode_migration(_prepare())
+
+        cancelled = scheduler.cancel_decode_migration(_cancel())
+
+        self.assertEqual(prepared.source_dp_rank, 3)
+        self.assertTrue(cancelled.success)
+        self.assertEqual(cancelled.status, "cancelled")
+        self.assertEqual(cancelled.source_dp_rank, 3)
+        self.assertEqual(scheduler.running_batch.reqs, [req])
+        self.assertEqual(scheduler.created_senders[0].clear_count, 1)
+
+    def test_cancel_completes_pending_quiesce(self):
+        req = _Req("request", output_ids=[20])
+        scheduler = _Scheduler([req], overlap=True)
+        scheduler.result_queue.append((_Batch([req]), object()))
+        scheduler.prepare_decode_migration(_prepare())
+        self.assertEqual(
+            scheduler.quiesce_decode_migration(_quiesce()).status, "quiescing"
+        )
+
+        cancelled = scheduler.cancel_decode_migration(_cancel())
+
+        self.assertEqual(cancelled.status, "cancelled")
+        completion = (
+            scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+        )
+        self.assertEqual(completion.status, "finished")
+        self.assertEqual(
+            scheduler.ipc_channels.send_to_tokenizer.send_output.call_count, 1
+        )
+
+    def test_abort_completes_pending_quiesce(self):
+        req = _Req("request", output_ids=[20])
+        scheduler = _Scheduler([req], overlap=True)
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.result_queue.append((_Batch([req]), object()))
+        scheduler.prepare_decode_migration(_prepare())
+        scheduler.quiesce_decode_migration(_quiesce())
+
+        scheduler.abort_decode_migration_receive(
+            SimpleNamespace(rid="request", abort_all=False)
+        )
+
+        completion = (
+            scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+        )
+        self.assertEqual(completion.status, "finished")
+
+    def test_cancel_rejects_quiesced_source(self):
+        req = _Req("request")
+        scheduler = _Scheduler([req])
+        scheduler.prepare_decode_migration(_prepare())
+        scheduler.quiesce_decode_migration(_quiesce())
+
+        output = scheduler.cancel_decode_migration(_cancel())
+
+        self.assertFalse(output.success)
+        self.assertEqual(output.status, "quiesced")
+        self.assertIsNotNone(scheduler.decode_migrations.get("migration"))
 
     def test_concurrent_requests_are_parked_independently(self):
         first = _Req("first")
         second = _Req("second")
         scheduler = _Scheduler([first, second])
-        with self._sender_patch():
-            one = scheduler.prepare_decode_migration(_prepare("first", "one", 17))
-            two = scheduler.prepare_decode_migration(_prepare("second", "two", 18))
-            scheduler.quiesce_decode_migration(_quiesce("first", "one"))
-            scheduler.quiesce_decode_migration(_quiesce("second", "two"))
+        scheduler.prepare_decode_migration(_prepare("first", "one", 17))
+        scheduler.prepare_decode_migration(_prepare("second", "two", 18))
+        scheduler.quiesce_decode_migration(_quiesce("first", "one"))
+        scheduler.quiesce_decode_migration(_quiesce("second", "two"))
 
-        self.assertTrue(one.success)
-        self.assertTrue(two.success)
         self.assertEqual(scheduler.running_batch.reqs, [])
         self.assertEqual(
             {record.migration_id for record in scheduler.decode_migrations.transfers()},
             {"one", "two"},
         )
 
-    def test_prepare_keeps_request_running_until_explicit_quiesce(self):
+    def test_finished_request_discards_preparation(self):
         req = _Req("request", output_ids=[20])
         scheduler = _Scheduler([req], overlap=True)
-        output = scheduler.prepare_decode_migration(
-            _prepare("request", "migration", 17)
-        )
-
-        self.assertTrue(output.success)
-        self.assertEqual(output.status, "ready")
-        self.assertEqual(scheduler.running_batch.reqs, [req])
-
-        req.output_ids.append(21)
-        req.kv_committed_len += 1
-        with self._sender_patch():
-            quiesced = scheduler.quiesce_decode_migration(
-                _quiesce("request", "migration", output_tokens_seen=2)
-            )
-
-        self.assertTrue(quiesced.success)
-        self.assertEqual(quiesced.status, "quiesced")
-        self.assertEqual(len(req.origin_input_ids) + len(req.output_ids), 4)
-        self.assertEqual(scheduler.running_batch.reqs, [])
-        self.assertIsNotNone(scheduler.decode_migrations.get_for_rid(req.rid))
-        self.assertEqual(scheduler.decode_migrations.get("migration").committed_len, 3)
-
-    def test_prepare_can_precede_request_admission(self):
-        scheduler = _Scheduler([])
-
-        prepared = scheduler.prepare_decode_migration(
-            _prepare("request", "migration", 17)
-        )
-
-        self.assertTrue(prepared.success)
-        self.assertEqual(prepared.status, "ready")
-        self.assertEqual(len(scheduler.created_senders), 1)
-
-        req = _Req("request", output_ids=[20])
-        scheduler.running_batch.reqs.append(req)
-        with self._sender_patch():
-            quiesced = scheduler.quiesce_decode_migration(
-                _quiesce("request", "migration", output_tokens_seen=1)
-            )
-
-        self.assertTrue(quiesced.success)
-        self.assertEqual(quiesced.status, "quiesced")
-        self.assertEqual(scheduler.running_batch.reqs, [])
-
-    def test_quiesce_does_not_override_normal_stream_interval(self):
-        req = _Req("request", output_ids=[20, 21, 22, 23, 24, 25])
-        req.send_token_offset = 5
-        scheduler = _Scheduler([req], overlap=True)
-        scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-
-        with self._sender_patch():
-            output = scheduler.quiesce_decode_migration(
-                _quiesce("request", "migration", output_tokens_seen=6)
-            )
-
-        self.assertTrue(output.success)
-        scheduler.output_streamer.stream_output.assert_not_called()
-
-    def test_quiesce_exports_acknowledged_frontier_after_overlap_overshoot(self):
-        req = _Req("request", output_ids=[20])
-        scheduler = _Scheduler([req], overlap=True)
-        scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-
-        req.output_ids.extend([21, 22, 23])
-        req.kv_committed_len += 3
-        with self._sender_patch():
-            output = scheduler.quiesce_decode_migration(
-                _quiesce("request", "migration", output_tokens_seen=2)
-            )
-
-        self.assertTrue(output.success)
-        record = scheduler.decode_migrations.get("migration")
-        self.assertEqual(record.committed_len, 3)
-        self.assertEqual(record.logical_len, 4)
-        self.assertEqual(record.pending_input_ids, [21])
-        output = scheduler.quiesce_decode_migration(
-            _quiesce("request", "migration", output_tokens_seen=4)
-        )
-        self.assertEqual(output.committed_input_ids, [10, 11, 20])
-        self.assertEqual(output.pending_input_ids, [21])
-        self.assertEqual(output.unforwarded_committed_output_ids, [])
-        self.assertEqual(output.committed_len, 3)
-        self.assertEqual(output.logical_len, 4)
-        self.assertEqual(output.output_tokens_seen, 2)
-        scheduler.output_streamer.stream_output.assert_not_called()
-
-    @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
-    def test_failed_overlap_transfer_discards_stale_result_without_tombstone(
-        self, release_kv_cache
-    ):
-        req = _Req("request", output_ids=[20])
-        scheduler = _Scheduler([req], overlap=True)
-        scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-        req.output_ids.append(21)
-        req.kv_committed_len += 1
-        scheduler.result_queue.append((_Batch([req]), object()))
-        scheduler.quiesce_decode_migration(
-            _quiesce("request", "migration", output_tokens_seen=2)
-        )
-        with self._sender_patch():
-            self.assertTrue(scheduler.maybe_quiesce_decode_migration(req))
-
-        scheduler._fail_decode_migration(
-            scheduler.decode_migrations.get("migration"), "test failure"
-        )
-        self.assertEqual(
-            scheduler.get_decode_migration_result_disposition(req),
-            ResultDisposition.DISCARD,
-        )
-        self.assertIsNone(scheduler.decode_migrations.get("migration"))
-        release_kv_cache.assert_called_once_with(
-            req, scheduler.tree_cache, is_insert=False
-        )
-
-    def test_control_responses_report_actual_dp_rank(self):
-        req = _Req("request", output_ids=[20])
-        scheduler = _Scheduler([req], dp_rank=3)
-        prepared = scheduler.prepare_decode_migration(
-            _prepare("request", "migration", 17)
-        )
-
-        self.assertTrue(prepared.success)
-        self.assertEqual(prepared.source_dp_rank, 3)
-
-        finalized = scheduler.finalize_decode_migration(
-            FinalizeDecodeMigrationReqInput(
-                rid="request", migration_id="migration", action="cancel"
-            )
-        )
-        self.assertTrue(finalized.success)
-        self.assertEqual(finalized.source_dp_rank, 3)
-
-    def test_cancel_discards_prepared_source(self):
-        req = _Req("request", output_ids=[20])
-        scheduler = _Scheduler([req])
-        scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-
-        output = scheduler.finalize_decode_migration(
-            FinalizeDecodeMigrationReqInput(
-                rid="request", migration_id="migration", action="cancel"
-            )
-        )
-
-        self.assertTrue(output.success)
-        self.assertEqual(scheduler.decode_migrations.prepared_sources(), ())
-        self.assertEqual(scheduler.running_batch.reqs, [req])
-
-    def test_repeated_prepare_does_not_quiesce_request(self):
-        req = _Req("request", output_ids=[20])
-        scheduler = _Scheduler([req], overlap=True)
-        scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-
-        output = scheduler.prepare_decode_migration(
-            _prepare("request", "migration", 17)
-        )
-
-        self.assertTrue(output.success)
-        self.assertEqual(output.status, "ready")
-        self.assertEqual(scheduler.running_batch.reqs, [req])
-        self.assertIsNotNone(scheduler.decode_migrations.get("migration"))
-
-    def test_finished_request_discards_prepared_migration(self):
-        req = _Req("request", output_ids=[20])
-        scheduler = _Scheduler([req], overlap=True)
-        scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-        req.output_ids.append(21)
-        req.kv_committed_len += 1
+        scheduler.prepare_decode_migration(_prepare())
         req._finished = True
 
         self.assertFalse(scheduler.maybe_quiesce_decode_migration(req))
+        self.assertIsNone(scheduler.decode_migrations.get("migration"))
         self.assertEqual(scheduler.running_batch.reqs, [req])
-        self.assertIsNone(scheduler.decode_migrations.get("migration"))
-
-    def test_commit_is_accepted_before_transfer_completion(self):
-        req = _Req("request")
-        scheduler = _Scheduler([req])
-        with self._sender_patch():
-            scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-            scheduler.quiesce_decode_migration(_quiesce("request", "migration"))
-        output = scheduler.finalize_decode_migration(
-            FinalizeDecodeMigrationReqInput(
-                rid="request", migration_id="migration", action="commit"
-            )
-        )
-        self.assertTrue(output.success)
-        self.assertTrue(output.commit_pending)
-        self.assertEqual(output.transfer_status, "bootstrapping")
-        self.assertTrue(scheduler.decode_migrations.get("migration").commit_requested)
-
-    @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
-    @patch(
-        "sglang.srt.disaggregation.decode_migration.poll_and_all_reduce_attn_cp_tp_group"
-    )
-    def test_pending_commit_releases_after_transfer_and_is_idempotent(
-        self, poll_transfers, release_kv_cache
-    ):
-        req = _Req("request")
-        scheduler = _Scheduler([req])
-        with self._sender_patch():
-            scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-            scheduler.quiesce_decode_migration(_quiesce("request", "migration"))
-        accepted = scheduler.finalize_decode_migration(
-            FinalizeDecodeMigrationReqInput(
-                rid="request", migration_id="migration", action="commit"
-            )
-        )
-        self.assertTrue(accepted.success)
-        self.assertTrue(accepted.commit_pending)
-
-        poll_transfers.return_value = [KVPoll.Success]
-        scheduler.process_decode_migration_transfers()
-
-        release_kv_cache.assert_called_once_with(
-            req, scheduler.tree_cache, is_insert=False
-        )
-        self.assertIsNone(scheduler.decode_migrations.get("migration"))
-        retry = scheduler.finalize_decode_migration(
-            FinalizeDecodeMigrationReqInput(
-                rid="request", migration_id="migration", action="commit"
-            )
-        )
-        self.assertTrue(retry.success)
-        self.assertFalse(retry.commit_pending)
-        self.assertEqual(retry.transfer_status, "transferred")
-
-    @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
-    def test_commit_releases_parked_source_and_invalidates_full_batch_cache(
-        self, release_kv_cache
-    ):
-        req = _Req("request")
-        scheduler = _Scheduler([req])
-        with self._sender_patch():
-            scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-            scheduler.quiesce_decode_migration(_quiesce("request", "migration"))
-        # The request is parked but retains its request-pool slot until commit.
-        # A prefill pass during transfer can therefore cache the empty batch as full.
-        scheduler.running_batch.batch_is_full = True
-        scheduler.decode_migrations.get("migration").state = (
-            DecodeMigrationState.TRANSFERRED
-        )
-
-        output = scheduler.finalize_decode_migration(
-            FinalizeDecodeMigrationReqInput(
-                rid="request", migration_id="migration", action="commit"
-            )
-        )
-
-        self.assertTrue(output.success)
-        release_kv_cache.assert_called_once_with(
-            req, scheduler.tree_cache, is_insert=False
-        )
-        self.assertFalse(scheduler.running_batch.batch_is_full)
-        self.assertEqual(scheduler.decode_migrations.transfers(), ())
 
     @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
     def test_abort_cleans_matching_parked_source(self, release_kv_cache):
@@ -675,9 +435,8 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         scheduler = _Scheduler([req])
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(queue=[])
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
-        with self._sender_patch():
-            scheduler.prepare_decode_migration(_prepare("request", "migration", 17))
-            scheduler.quiesce_decode_migration(_quiesce("request", "migration"))
+        scheduler.prepare_decode_migration(_prepare())
+        scheduler.quiesce_decode_migration(_quiesce())
 
         scheduler.abort_decode_migration_receive(
             SimpleNamespace(rid="request", abort_all=False)
@@ -698,37 +457,85 @@ class DecodeMigrationWaiterRoutingTests(unittest.IsolatedAsyncioTestCase):
         manager.send_to_scheduler = SimpleNamespace(send_pyobj=AsyncMock())
         return manager
 
-    async def test_waiters_ignore_responses_from_other_dp_ranks(self):
-        manager = self.manager()
-        prepare = _prepare("request", "migration", 17)
-        prepare.routed_dp_rank = 3
-        prepare_task = asyncio.create_task(manager.prepare_decode_migration(prepare))
+    async def _assert_rank_routing(self, request, send, wrong, expected):
+        task = asyncio.create_task(send(request))
         await asyncio.sleep(0)
+        self.manager_under_test._handle_decode_migration_output(wrong)
+        self.assertFalse(task.done())
+        self.manager_under_test._handle_decode_migration_output(expected)
+        self.assertIs(await task, expected)
 
-        manager._handle_decode_migration_output(
+    async def test_controls_ignore_responses_from_other_dp_ranks(self):
+        manager = self.manager_under_test = self.manager()
+        prepare = _prepare()
+        prepare.routed_dp_rank = 3
+        await self._assert_rank_routing(
+            prepare,
+            manager.prepare_decode_migration,
             PrepareDecodeMigrationReqOutput(
                 rid="request",
                 migration_id="migration",
                 success=True,
                 status="ready",
                 source_dp_rank=0,
-            )
+            ),
+            PrepareDecodeMigrationReqOutput(
+                rid="request",
+                migration_id="migration",
+                success=True,
+                status="ready",
+                source_dp_rank=3,
+            ),
         )
-        self.assertFalse(prepare_task.done())
 
-        expected_prepare = PrepareDecodeMigrationReqOutput(
-            rid="request",
-            migration_id="migration",
-            success=True,
-            status="ready",
-            source_dp_rank=3,
-        )
-        manager._handle_decode_migration_output(expected_prepare)
-        self.assertIs(await prepare_task, expected_prepare)
-
-        quiesce = _quiesce("request", "migration", output_tokens_seen=2)
+        quiesce = _quiesce(output_tokens_seen=2)
         quiesce.routed_dp_rank = 3
-        quiesce_task = asyncio.create_task(manager.quiesce_decode_migration(quiesce))
+        await self._assert_rank_routing(
+            quiesce,
+            manager.quiesce_decode_migration,
+            QuiesceDecodeMigrationReqOutput(
+                rid="request",
+                migration_id="migration",
+                success=True,
+                status="quiesced",
+                source_dp_rank=0,
+            ),
+            QuiesceDecodeMigrationReqOutput(
+                rid="request",
+                migration_id="migration",
+                success=True,
+                status="quiesced",
+                source_dp_rank=3,
+            ),
+        )
+
+        cancel = _cancel()
+        cancel.routed_dp_rank = 3
+        await self._assert_rank_routing(
+            cancel,
+            manager.cancel_decode_migration,
+            CancelDecodeMigrationReqOutput(
+                rid="request",
+                migration_id="migration",
+                success=True,
+                status="cancelled",
+                source_dp_rank=0,
+            ),
+            CancelDecodeMigrationReqOutput(
+                rid="request",
+                migration_id="migration",
+                success=True,
+                status="cancelled",
+                source_dp_rank=3,
+            ),
+        )
+        self.assertEqual(manager.decode_migration_futures, {})
+
+    async def test_quiescing_waits_for_event_driven_completion(self):
+        manager = self.manager_under_test = self.manager()
+        request = _quiesce(output_tokens_seen=2)
+        request.routed_dp_rank = 3
+        task = asyncio.create_task(manager.quiesce_decode_migration(request))
         await asyncio.sleep(0)
 
         manager._handle_decode_migration_output(
@@ -736,104 +543,51 @@ class DecodeMigrationWaiterRoutingTests(unittest.IsolatedAsyncioTestCase):
                 rid="request",
                 migration_id="migration",
                 success=True,
-                status="quiesced",
-                source_dp_rank=0,
+                status="quiescing",
+                source_dp_rank=3,
             )
         )
-        self.assertFalse(quiesce_task.done())
+        self.assertFalse(task.done())
 
-        expected_quiesce = QuiesceDecodeMigrationReqOutput(
+        completed = QuiesceDecodeMigrationReqOutput(
             rid="request",
             migration_id="migration",
             success=True,
             status="quiesced",
             source_dp_rank=3,
         )
-        manager._handle_decode_migration_output(expected_quiesce)
-        self.assertIs(await quiesce_task, expected_quiesce)
+        manager._handle_decode_migration_output(completed)
+        self.assertIs(await task, completed)
 
-        bind = BindDecodeMigrationReqInput(
-            rid="request",
-            migration_id="migration",
-            bootstrap_room=17,
-            committed_input_ids=[1, 2, 3],
-            pending_input_ids=[4],
-            committed_len=3,
-            logical_len=4,
-            routed_dp_rank=3,
-        )
-        bind_task = asyncio.create_task(manager.bind_decode_migration_destination(bind))
+    async def test_cancel_can_overlap_quiesce_for_same_migration(self):
+        manager = self.manager_under_test = self.manager()
+        quiesce = _quiesce()
+        quiesce.routed_dp_rank = 3
+        cancel = _cancel()
+        cancel.routed_dp_rank = 3
+        quiesce_task = asyncio.create_task(manager.quiesce_decode_migration(quiesce))
+        cancel_task = asyncio.create_task(manager.cancel_decode_migration(cancel))
         await asyncio.sleep(0)
 
-        manager._handle_decode_migration_output(
-            BindDecodeMigrationReqOutput(
-                rid="request",
-                migration_id="migration",
-                success=True,
-                status="ready",
-                source_dp_rank=0,
-            )
-        )
-        self.assertFalse(bind_task.done())
-
-        expected_bind = BindDecodeMigrationReqOutput(
+        cancelled = CancelDecodeMigrationReqOutput(
             rid="request",
             migration_id="migration",
             success=True,
-            status="ready",
+            status="cancelled",
             source_dp_rank=3,
         )
-        manager._handle_decode_migration_output(expected_bind)
-        self.assertIs(await bind_task, expected_bind)
-
-        finalize = FinalizeDecodeMigrationReqInput(
+        quiesced = QuiesceDecodeMigrationReqOutput(
             rid="request",
             migration_id="migration",
-            action="commit",
-            routed_dp_rank=3,
-        )
-        finalize_task = asyncio.create_task(manager.finalize_decode_migration(finalize))
-        await asyncio.sleep(0)
-
-        manager._handle_decode_migration_output(
-            FinalizeDecodeMigrationReqOutput(
-                rid="request",
-                migration_id="migration",
-                action="commit",
-                success=True,
-                source_dp_rank=0,
-            )
-        )
-        self.assertFalse(finalize_task.done())
-
-        expected_finalize = FinalizeDecodeMigrationReqOutput(
-            rid="request",
-            migration_id="migration",
-            action="commit",
-            success=True,
+            success=False,
+            status="finished",
             source_dp_rank=3,
         )
-        manager._handle_decode_migration_output(expected_finalize)
-        self.assertIs(await finalize_task, expected_finalize)
-        self.assertEqual(manager.decode_migration_futures, {})
+        manager._handle_decode_migration_output(cancelled)
+        manager._handle_decode_migration_output(quiesced)
 
-    async def test_result_dispatcher_routes_bind_output(self):
-        manager = self.manager()
-        manager.init_communicators = MagicMock()
-        manager.init_request_dispatcher()
-        future = asyncio.get_running_loop().create_future()
-        manager.decode_migration_futures[("migration", 3)] = future
-        expected = BindDecodeMigrationReqOutput(
-            rid="request",
-            migration_id="migration",
-            success=True,
-            status="ready",
-            source_dp_rank=3,
-        )
-
-        manager._result_dispatcher(expected)
-
-        self.assertIs(await future, expected)
+        self.assertIs(await cancel_task, cancelled)
+        self.assertIs(await quiesce_task, quiesced)
 
 
 if __name__ == "__main__":

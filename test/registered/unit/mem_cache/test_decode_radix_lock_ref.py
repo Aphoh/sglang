@@ -303,6 +303,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.output_ids = [99]
         req.last_node = object()
         req.finished_reason = None
+        req.prebuilt_kv = None
         req.cache_protected_len = 0
         req.sampling_params.max_new_tokens = 16
 
