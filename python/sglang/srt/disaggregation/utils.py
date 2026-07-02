@@ -756,6 +756,58 @@ def setup_state_kv_args(
             )
 
 
+def build_state_transfer_indices(
+    *,
+    state_types,
+    req_to_token_pool,
+    token_to_kv_pool_allocator,
+    req_pool_idx: int,
+    seq_len: int,
+    sliding_window_size: Optional[int],
+    dsa_page_size: Optional[int] = None,
+) -> List:
+    """Build source or destination indices for every advertised state component."""
+    from sglang.srt.disaggregation.base.conn import StateType
+    from sglang.srt.mem_cache.common import kv_to_page_indices, page_align_floor
+
+    token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
+    page_size = token_to_kv_pool.page_size
+    state_indices = []
+    for state_type in state_types:
+        if state_type == StateType.MAMBA:
+            state_indices.append(
+                [
+                    req_to_token_pool.req_index_to_mamba_index_mapping[req_pool_idx]
+                    .cpu()
+                    .numpy()
+                ]
+            )
+        elif state_type == StateType.SWA:
+            window_start = max(0, seq_len - sliding_window_size)
+            window_start = page_align_floor(window_start, page_size)
+            window_kv_indices_full = req_to_token_pool.req_to_token[
+                req_pool_idx, window_start:seq_len
+            ]
+            window_kv_indices_swa = (
+                token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    window_kv_indices_full
+                )
+            )
+            state_indices.append(
+                kv_to_page_indices(window_kv_indices_swa.cpu().numpy(), page_size)
+            )
+        elif state_type == StateType.DSA:
+            kv_indices_full = req_to_token_pool.req_to_token[req_pool_idx, :seq_len]
+            state_indices.append(
+                kv_to_page_indices(
+                    kv_indices_full.cpu().numpy(), dsa_page_size or page_size
+                )
+            )
+        else:
+            state_indices.append(None)
+    return state_indices
+
+
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 

@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.base.conn import NixlTransportConfig, StateType
+from sglang.srt.disaggregation.base.conn import NixlTransportConfig
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    build_state_transfer_indices,
     get_kv_class,
     is_aborted,
     is_mla_backend,
@@ -977,50 +978,17 @@ class SchedulerDisaggregationPrefillMixin:
             # group_concurrent_contiguous.
             seq_len = min(req.fill_len, len(req.origin_input_ids))
 
-            def _mamba_payload():
-                return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
-                ]
-
-            def _swa_payload():
-                window_size = self.sliding_window_size
-                window_start = max(0, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, window_start:seq_len
-                ]
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        window_kv_indices_full
-                    )
-                )
-                return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
-                )
-
-            def _dsa_payload():
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :seq_len
-                ]
-                return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
-
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
-            state_indices = []
-            for st in state_types:
-                if st == StateType.MAMBA:
-                    state_indices.append(_mamba_payload())
-                elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
-                elif st == StateType.DSA:
-                    state_indices.append(_dsa_payload())
-                else:
-                    state_indices.append(None)
+            state_indices = build_state_transfer_indices(
+                state_types=state_types,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                req_pool_idx=req.req_pool_idx,
+                seq_len=seq_len,
+                sliding_window_size=self.sliding_window_size,
+            )
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):

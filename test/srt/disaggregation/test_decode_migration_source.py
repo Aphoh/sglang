@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.decode_migration import SchedulerDecodeMigrationMixin
 from sglang.srt.disaggregation.decode_migration_state import (
     AwaitingStaleDecodeResult,
@@ -76,12 +77,23 @@ class _Sender:
     def __init__(self):
         self.clear_count = 0
         self.aux_transfer_lens = None
+        self.init_calls = []
+        self.send_calls = []
 
     def clear(self):
         self.clear_count += 1
 
     def set_aux_transfer_lens(self, aux_transfer_lens):
         self.aux_transfer_lens = aux_transfer_lens
+
+    def pop_decode_prefix_len(self):
+        return 0
+
+    def init(self, num_pages, metadata_buffer_index):
+        self.init_calls.append((num_pages, metadata_buffer_index))
+
+    def send(self, page_indices, state_indices):
+        self.send_calls.append((page_indices, state_indices))
 
 
 class _MetadataBuffers:
@@ -104,7 +116,7 @@ class _MetadataBuffers:
 
 
 class _Scheduler(SchedulerDecodeMigrationMixin):
-    def __init__(self, reqs, *, overlap=False, dp_rank=0):
+    def __init__(self, reqs, *, overlap=False, dp_rank=0, state_types=None):
         self.server_args = SimpleNamespace(enable_decode_migration=True)
         self.disaggregation_mode = DisaggregationMode.NULL
         self.enable_overlap = overlap
@@ -121,6 +133,17 @@ class _Scheduler(SchedulerDecodeMigrationMixin):
         self.attn_cp_cpu_group = None
         self.attn_tp_cpu_group = None
         self.tree_cache = object()
+        self.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(8 * 64, dtype=torch.int64).reshape(8, 64),
+            req_index_to_mamba_index_mapping=torch.arange(8, dtype=torch.int32),
+        )
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            get_kvcache=lambda: SimpleNamespace(page_size=16)
+        )
+        self.sliding_window_size = None
+        self._kv_manager = SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=list(state_types or []))
+        )
         self.process_batch_result = MagicMock()
         self.output_streamer = MagicMock()
         self.ipc_channels = SimpleNamespace(
@@ -129,7 +152,7 @@ class _Scheduler(SchedulerDecodeMigrationMixin):
         self.created_senders = []
 
     def _get_decode_migration_kv_manager(self):
-        return object()
+        return self._kv_manager
 
     def _create_decode_migration_sender(self, _recv_req):
         sender = _Sender()
@@ -291,6 +314,23 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         release_kv_cache.assert_called_once_with(
             req, scheduler.tree_cache, is_insert=False
         )
+
+    @patch(
+        "sglang.srt.disaggregation.decode_migration.poll_and_all_reduce_attn_cp_tp_group"
+    )
+    def test_transfer_sends_advertised_mamba_state(self, poll_transfers):
+        req = _Req("request")
+        scheduler = _Scheduler([req], state_types=[StateType.MAMBA])
+        scheduler.prepare_decode_migration(_prepare())
+        scheduler.quiesce_decode_migration(_quiesce())
+        poll_transfers.return_value = [KVPoll.WaitingForInput]
+
+        scheduler.process_decode_migration_transfers()
+
+        _, state_indices = scheduler.created_senders[0].send_calls[0]
+        self.assertEqual(len(state_indices), 1)
+        self.assertEqual(len(state_indices[0]), 1)
+        self.assertEqual(state_indices[0][0].item(), req.req_pool_idx)
 
     @patch("sglang.srt.disaggregation.decode_migration.release_kv_cache")
     @patch(

@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.prefill import create_prefill_kv_manager
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
+    build_state_transfer_indices,
     get_kv_class,
     poll_and_all_reduce_attn_cp_tp_group,
 )
@@ -704,8 +705,19 @@ class SchedulerDecodeMigrationMixin:
                 page_indices = kv_to_page_indices(
                     kv_indices.cpu().numpy(), token_to_kv_pool.page_size
                 )
+                state_indices = build_state_transfer_indices(
+                    state_types=(
+                        self._get_decode_migration_kv_manager().kv_args.state_types
+                    ),
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    req_pool_idx=record.req.req_pool_idx,
+                    seq_len=record.committed_len,
+                    sliding_window_size=self.sliding_window_size,
+                    dsa_page_size=token_to_kv_pool.page_size,
+                )
                 record.sender.init(len(page_indices), record.metadata_buffer_index)
-                record.sender.send(page_indices, [])
+                record.sender.send(page_indices, state_indices)
                 record.state = DecodeMigrationState.TRANSFERRING
                 logger.info(
                     "Started decode migration transfer rid=%s migration_id=%s "

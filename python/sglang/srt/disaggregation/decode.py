@@ -34,7 +34,7 @@ from torch.distributed import ProcessGroup
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.base.conn import NixlTransportConfig, StateType
+from sglang.srt.disaggregation.base.conn import NixlTransportConfig
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
+    build_state_transfer_indices,
     get_kv_class,
     is_mla_backend,
     poll_and_all_reduce,
@@ -70,7 +71,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
-    page_align_floor,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -996,52 +996,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             seq_len = len(decode_req.req.origin_input_ids)
 
-            def _mamba_payload():
-                return [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        decode_req.req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
-                ]
-
-            def _swa_payload():
-                window_size = self.scheduler.sliding_window_size
-                window_start = max(0, seq_len - window_size)
-                window_start = page_align_floor(window_start, page_size)
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, window_start:seq_len
-                ]
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        window_kv_indices_full
-                    )
-                )
-                return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
-                )
-
-            def _dsa_payload():
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, :seq_len
-                ]
-                # Indexer lives on device pool; always use device page_size
-                device_page_size = self.token_to_kv_pool.page_size
-                return kv_to_page_indices(
-                    kv_indices_full.cpu().numpy(), device_page_size
-                )
-
             state_types = self.kv_manager.kv_args.state_types
-            state_indices: Optional[List] = []
-            for st in state_types:
-                if st == StateType.MAMBA:
-                    state_indices.append(_mamba_payload())
-                elif st == StateType.SWA:
-                    state_indices.append(_swa_payload())
-                elif st == StateType.DSA:
-                    state_indices.append(_dsa_payload())
-                else:
-                    state_indices.append(None)
+            state_indices = build_state_transfer_indices(
+                state_types=state_types,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                req_pool_idx=decode_req.req.req_pool_idx,
+                seq_len=seq_len,
+                sliding_window_size=self.scheduler.sliding_window_size,
+                # Indexer lives on the device pool even with HiCache enabled.
+                dsa_page_size=self.token_to_kv_pool.page_size,
+            )
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
