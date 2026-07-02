@@ -1126,13 +1126,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
             if self.enable_radix_cache:
-                available_size += self.tree_cache.evictable_size()
+                available_size += self.tree_cache.full_evictable_size()
         else:
             available_size = self.token_to_kv_pool_allocator.available_size()
             # Include evictable decode-radix cache entries in the budget -- they
             # can be freed on demand before allocation.
             if self.enable_radix_cache:
-                available_size += self.tree_cache.evictable_size()
+                if self.tree_cache.supports_mamba():
+                    available_size += self.tree_cache.full_evictable_size()
+                else:
+                    available_size += self.tree_cache.evictable_size()
         allocatable_tokens = available_size - max(
             reserved_tokens, need_space_for_single_req
         )

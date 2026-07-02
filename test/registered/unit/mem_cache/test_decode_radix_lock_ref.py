@@ -364,6 +364,28 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
         self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
 
+    def test_mamba_preallocation_budget_uses_full_cache_size(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.enable_radix_cache = True
+        queue.retracted_queue = []
+        queue.scheduler = MagicMock(last_batch=None)
+        queue.scheduler.enable_hisparse = False
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.supports_mamba.return_value = True
+        queue.tree_cache.full_evictable_size.return_value = 24
+        queue.tree_cache.evictable_size.side_effect = AssertionError(
+            "hybrid caches do not expose a scalar evictable_size"
+        )
+        queue.token_to_kv_pool_allocator = MagicMock()
+        queue.token_to_kv_pool_allocator.available_size.return_value = 100
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._need_space_for_single_req = MagicMock(return_value=0)
+        queue._active_reserved_tokens = MagicMock(return_value=0)
+
+        self.assertEqual(queue._allocatable_token_budgets(), 124)
+        queue.tree_cache.full_evictable_size.assert_called_once_with()
+        queue.tree_cache.evictable_size.assert_not_called()
+
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""
         cache, req_to_token = _make_cache_with_pools()
