@@ -241,7 +241,7 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         self.assertEqual(scheduler.running_batch.reqs, [])
         self.assertFalse(scheduler.running_batch.batch_is_full)
 
-    def test_quiesce_uses_frontend_acknowledged_frontier(self):
+    def test_quiesce_exports_latest_safe_frontier_and_unforwarded_tokens(self):
         req = _Req("request", output_ids=[20, 21])
         scheduler = _Scheduler([req], overlap=True)
         scheduler.prepare_decode_migration(_prepare())
@@ -249,10 +249,11 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         output = scheduler.quiesce_decode_migration(_quiesce(output_tokens_seen=1))
 
         self.assertTrue(output.success)
-        self.assertEqual(output.committed_len, 2)
-        self.assertEqual(output.logical_len, 3)
+        self.assertEqual(output.committed_len, 3)
+        self.assertEqual(output.logical_len, 4)
         self.assertEqual(output.output_tokens_seen, 1)
-        self.assertEqual(scheduler.disagg_metadata_buffers.output_ids[0][0], 20)
+        self.assertEqual(output.unforwarded_output_ids, [21])
+        self.assertEqual(scheduler.disagg_metadata_buffers.output_ids[0][0], 21)
 
     def test_overlap_quiesce_waits_for_completed_frontier(self):
         req = _Req("request", output_ids=[20])

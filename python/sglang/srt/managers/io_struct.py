@@ -1631,6 +1631,7 @@ class QuiesceDecodeMigrationReqOutput(BaseReq):
     success: bool
     status: Literal["quiescing", "quiesced", "finished", "not_found", "busy", "error"]
     unforwarded_committed_output_ids: List[int] = field(default_factory=list)
+    unforwarded_output_ids: List[int] = field(default_factory=list)
     prompt_len: int = 0
     committed_len: int = 0
     logical_len: int = 0

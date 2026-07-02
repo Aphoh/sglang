@@ -164,6 +164,7 @@ class DecodeMigrationFrontier:
     committed_input_ids: list[int]
     pending_input_id: int
     unforwarded_committed_output_ids: list[int]
+    unforwarded_output_ids: list[int]
     prompt_len: int
     committed_len: int
     logical_len: int
@@ -200,6 +201,7 @@ def build_decode_migration_frontier(
         unforwarded_committed_output_ids=output_ids[
             min(seen, unforwarded_end) : unforwarded_end
         ],
+        unforwarded_output_ids=output_ids[seen:],
         prompt_len=prompt_len,
         committed_len=committed_len,
         logical_len=logical_len,

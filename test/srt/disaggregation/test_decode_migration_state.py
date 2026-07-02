@@ -16,6 +16,7 @@ class DecodeMigrationFrontierTests(unittest.TestCase):
         self.assertEqual(frontier.committed_input_ids, [10, 11, 20, 21, 22])
         self.assertEqual(frontier.pending_input_id, 23)
         self.assertEqual(frontier.unforwarded_committed_output_ids, [])
+        self.assertEqual(frontier.unforwarded_output_ids, [])
 
     def test_stream_interval_tail_is_returned_from_committed_range(self):
         frontier = build_decode_migration_frontier(
@@ -25,6 +26,7 @@ class DecodeMigrationFrontierTests(unittest.TestCase):
             output_tokens_seen=1,
         )
         self.assertEqual(frontier.unforwarded_committed_output_ids, [21, 22])
+        self.assertEqual(frontier.unforwarded_output_ids, [21, 22, 23])
         self.assertEqual(frontier.pending_input_id, 23)
 
     def test_frontend_watermark_is_clamped(self):
@@ -36,6 +38,7 @@ class DecodeMigrationFrontierTests(unittest.TestCase):
         )
         self.assertEqual(frontier.output_tokens_seen, 2)
         self.assertEqual(frontier.unforwarded_committed_output_ids, [])
+        self.assertEqual(frontier.unforwarded_output_ids, [])
 
     def test_rejects_ambiguous_kv_frontier(self):
         with self.assertRaisesRegex(ValueError, "exactly one sampled token"):

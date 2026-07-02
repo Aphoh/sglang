@@ -500,11 +500,7 @@ class SchedulerDecodeMigrationMixin:
         committed_len = req.kv_committed_len
         actual_logical_len = len(prompt_ids) + len(output_ids)
         if recv_req.output_tokens_seen > 0:
-            target_logical_len = len(prompt_ids) + recv_req.output_tokens_seen
-            if (
-                target_logical_len > actual_logical_len
-                or target_logical_len - 1 > committed_len
-            ):
+            if recv_req.output_tokens_seen > len(output_ids):
                 return self._quiesce_failure(
                     recv_req,
                     "error",
@@ -514,8 +510,6 @@ class SchedulerDecodeMigrationMixin:
                     logical_len=actual_logical_len,
                     output_tokens_seen=recv_req.output_tokens_seen,
                 )
-            output_ids = output_ids[: recv_req.output_tokens_seen]
-            committed_len = target_logical_len - 1
         try:
             frontier = build_decode_migration_frontier(
                 prompt_ids,
@@ -632,6 +626,7 @@ class SchedulerDecodeMigrationMixin:
             unforwarded_committed_output_ids=(
                 frontier.unforwarded_committed_output_ids
             ),
+            unforwarded_output_ids=frontier.unforwarded_output_ids,
             prompt_len=frontier.prompt_len,
             committed_len=committed_len,
             logical_len=frontier.logical_len,
@@ -649,6 +644,7 @@ class SchedulerDecodeMigrationMixin:
         committed_output_count = max(0, record.committed_len - prompt_len)
         output_ids = list(req.output_ids)[: record.logical_len - prompt_len]
         seen = record.output_tokens_seen
+        logical_output_count = record.logical_len - prompt_len
         return QuiesceDecodeMigrationReqOutput(
             rid=recv_req.rid,
             migration_id=recv_req.migration_id,
@@ -657,6 +653,7 @@ class SchedulerDecodeMigrationMixin:
             unforwarded_committed_output_ids=output_ids[
                 min(seen, committed_output_count) : committed_output_count
             ],
+            unforwarded_output_ids=output_ids[min(seen, logical_output_count) :],
             prompt_len=prompt_len,
             committed_len=record.committed_len,
             logical_len=record.logical_len,
