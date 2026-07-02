@@ -22,6 +22,8 @@ DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 SHAPES = get_ci_test_range(
     full_range=[
         (7, 16),
+        (3, 22),
+        (2, 2736),
         (83, 1024),
         (3, 5, 16),
         (2, 3, 512),
@@ -29,7 +31,7 @@ SHAPES = get_ci_test_range(
         *[(2**x, 2048) for x in range(0, 15, 2)],
         *[(2**x, 65536) for x in range(0, 5, 2)],
     ],
-    ci_range=[(7, 16), (2, 3, 512)],
+    ci_range=[(7, 16), (3, 22), (2, 2736), (2, 3, 512)],
 )
 
 
@@ -81,8 +83,8 @@ def test_activation_out_param(
 
 
 FILTER_SHAPES = get_ci_test_range(
-    full_range=[(83, 1024), (256, 2048), (1024, 4096)],
-    ci_range=[(83, 1024)],
+    full_range=[(7, 22), (83, 1024), (256, 2048), (1024, 4096)],
+    ci_range=[(7, 22), (83, 1024)],
 )
 EXPERT_STEPS = [1, 16]
 

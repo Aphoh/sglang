@@ -55,11 +55,10 @@ struct ActivationParams {
   uint32_t expert_step;
 };
 
-template <typename T, ActivationKind kAct, bool kUsePDL, bool kFilterExpert>
+template <typename T, ActivationKind kAct, bool kUsePDL, bool kFilterExpert, uint32_t kVecSize>
 __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams params) {
   using namespace device;
-  constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
-  using vec_t = AlignedVector<T, kMaxVecBytes / sizeof(T)>;
+  using vec_t = AlignedVector<T, kVecSize>;
   const auto num_vecs = params.hidden_dim / kVecSize;  // per token
   const auto tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto token_id = tid / num_vecs;
@@ -114,26 +113,61 @@ struct ActivationKernel {
   static constexpr auto kVecSize = device::kMaxVecBytes / sizeof(T);
   static constexpr auto kBlockSize = 256u;
 
-  using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false>);
+  using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false, kVecSize>);
 
-  template <ActivationKind kAct, bool kFilterExpert>
-  static constexpr kernel_fn_t activation_kernel = act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert>;
+  template <ActivationKind kAct, bool kFilterExpert, uint32_t kSelectedVecSize>
+  static constexpr kernel_fn_t activation_kernel =
+      act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert, kSelectedVecSize>;
 
   static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
 
-  template <bool kFilterExpert>
+  template <bool kFilterExpert, uint32_t kSelectedVecSize>
   static kernel_fn_t select_kernel(const std::string& type) {
     using namespace host;
     if (type == "silu") {
-      return activation_kernel<ActivationKind::kSiLU, kFilterExpert>;
+      return activation_kernel<ActivationKind::kSiLU, kFilterExpert, kSelectedVecSize>;
     } else if (type == "gelu") {
-      return activation_kernel<ActivationKind::kGELU, kFilterExpert>;
+      return activation_kernel<ActivationKind::kGELU, kFilterExpert, kSelectedVecSize>;
     } else if (type == "gelu_tanh") {
-      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert>;
+      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert, kSelectedVecSize>;
     } else {
       Panic("unsupported activation type: ", type);
     }
     return nullptr;
+  }
+
+  template <bool kFilterExpert>
+  static kernel_fn_t select_kernel_for_hidden_size(
+      const std::string& type, uint32_t hidden_size, uint32_t* selected_vec_size) {
+    // Blackwell permits 32-byte vector operations, but tensor-parallel
+    // partitioning does not guarantee that each local hidden width retains
+    // 32-byte alignment. Select the widest aligned implementation rather
+    // than rejecting otherwise valid shapes. The scalar specialization also
+    // keeps the generic activation API correct for odd hidden widths.
+    if (hidden_size % kVecSize == 0) {
+      *selected_vec_size = kVecSize;
+      return select_kernel<kFilterExpert, kVecSize>(type);
+    }
+    if constexpr (kVecSize > 8) {
+      if (hidden_size % 8 == 0) {
+        *selected_vec_size = 8;
+        return select_kernel<kFilterExpert, 8>(type);
+      }
+    }
+    if constexpr (kVecSize > 4) {
+      if (hidden_size % 4 == 0) {
+        *selected_vec_size = 4;
+        return select_kernel<kFilterExpert, 4>(type);
+      }
+    }
+    if constexpr (kVecSize > 2) {
+      if (hidden_size % 2 == 0) {
+        *selected_vec_size = 2;
+        return select_kernel<kFilterExpert, 2>(type);
+      }
+    }
+    *selected_vec_size = 1;
+    return select_kernel<kFilterExpert, 1>(type);
   }
 
   static void launch(
@@ -164,9 +198,16 @@ struct ActivationKernel {
     const auto device = device_.unwrap();
     if (num_tokens == 0) return;
     RuntimeCheck(hidden_size * 2 == D_in.unwrap(), "invalid activation dimension");
-    RuntimeCheck(hidden_size % kVecSize == 0, "hidden size must be divisible by vector size");
+    uint32_t selected_vec_size;
+    kernel_fn_t kernel;
+    if (expert_ids != nullptr) {
+      RuntimeCheck(expert_step > 0, "expert_step must be positive");
+      kernel = select_kernel_for_hidden_size<true>(type, hidden_size, &selected_vec_size);
+    } else {
+      kernel = select_kernel_for_hidden_size<false>(type, hidden_size, &selected_vec_size);
+    }
     // only get once to avoid overhead
-    const auto num_total_items = num_tokens * (hidden_size / kVecSize);
+    const auto num_total_items = num_tokens * (hidden_size / selected_vec_size);
     RuntimeCheck(num_total_items <= std::numeric_limits<uint32_t>::max(), "too many items for 32-bit indexing");
     const auto num_blocks = div_ceil(static_cast<uint32_t>(num_total_items), kBlockSize);
     const auto params = ActivationParams{
@@ -177,14 +218,7 @@ struct ActivationKernel {
         .expert_ids = expert_ids,
         .expert_step = expert_step,
     };
-    if (expert_ids != nullptr) {
-      RuntimeCheck(expert_step > 0, "expert_step must be positive");
-      const auto kernel = select_kernel<true>(type);
-      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
-    } else {
-      const auto kernel = select_kernel<false>(type);
-      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
-    }
+    LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
   }
 
   static void run_activation(const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type) {
