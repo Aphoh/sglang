@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeRequest,
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
+    _ensure_prebuilt_root_lock,
 )
 from sglang.srt.disaggregation.prebuilt_kv import (
     PrebuiltKVFrontier,
@@ -61,6 +62,20 @@ class DecodeMetricsBatchViewTests(unittest.TestCase):
 
 
 class DecodeMigrationDestinationAdmissionTests(unittest.TestCase):
+    def test_prebuilt_request_is_anchored_before_transfer_can_fail(self):
+        req = SimpleNamespace(prebuilt_kv=object(), last_node=None)
+        root = object()
+        tree_cache = SimpleNamespace(
+            root_node=root,
+            inc_lock_ref=MagicMock(),
+            is_chunk_cache=lambda: False,
+        )
+
+        _ensure_prebuilt_root_lock(req, tree_cache)
+
+        self.assertIs(req.last_node, root)
+        tree_cache.inc_lock_ref.assert_called_once_with(root)
+
     def _scheduler(self, req):
         running_batch = MagicMock()
         running_batch.batch_size.return_value = 0

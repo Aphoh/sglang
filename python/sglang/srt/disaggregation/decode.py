@@ -102,6 +102,17 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
+def _ensure_prebuilt_root_lock(req: Req, tree_cache: BasePrefixCache) -> None:
+    """Anchor a prebuilt request that deliberately skipped radix matching."""
+    if (
+        req.prebuilt_kv is not None
+        and req.last_node is None
+        and not tree_cache.is_chunk_cache()
+    ):
+        req.last_node = tree_cache.root_node
+        tree_cache.inc_lock_ref(req.last_node)
+
+
 class DecodeReqToTokenPool:
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
@@ -947,6 +958,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
+            # Transfer failure can release this request before normal admission.
+            _ensure_prebuilt_root_lock(decode_req.req, self.tree_cache)
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1958,15 +1971,9 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     tree_cache = self.tree_cache
                 req.init_next_round_input(tree_cache)
-                if (
-                    req.prebuilt_kv is not None
-                    and req.last_node is None
-                    and not self.tree_cache.is_chunk_cache()
-                ):
-                    # Placeholder IDs deliberately skip radix matching. Exact IDs
-                    # are installed before admission, so use the empty root match.
-                    req.last_node = self.tree_cache.root_node
-                    self.tree_cache.inc_lock_ref(req.last_node)
+                # Placeholder IDs deliberately skip radix matching. Exact IDs
+                # are installed before admission, so use the empty root match.
+                _ensure_prebuilt_root_lock(req, self.tree_cache)
                 # Truncate fill_len to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
