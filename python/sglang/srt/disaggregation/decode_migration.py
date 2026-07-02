@@ -13,7 +13,7 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.base.conn import NIXL_LOW_LATENCY_SENDER
+from sglang.srt.disaggregation.base.conn import NIXL_LOW_LATENCY_SENDER, StateType
 from sglang.srt.disaggregation.decode_migration_state import (
     AwaitingStaleDecodeResult,
     DecodeMigrationRegistry,
@@ -510,6 +510,25 @@ class SchedulerDecodeMigrationMixin:
                     logical_len=actual_logical_len,
                     output_tokens_seen=recv_req.output_tokens_seen,
                 )
+        state_types = self._get_decode_migration_kv_manager().kv_args.state_types
+        if (
+            committed_len > 0
+            and actual_logical_len == committed_len
+            and StateType.MAMBA not in state_types
+        ):
+            # Overlap scheduling may have committed the newest logical token
+            # before its successor is sampled. KV-like caches can export the
+            # preceding frontier and replay that newest token as pending input.
+            # Recurrent Mamba state cannot be rolled back this way.
+            committed_len -= 1
+            logger.info(
+                "Rolled back decode migration KV frontier by one token "
+                "rid=%s migration_id=%s committed=%d logical=%d",
+                recv_req.rid,
+                recv_req.migration_id,
+                committed_len,
+                actual_logical_len,
+            )
         try:
             frontier = build_decode_migration_frontier(
                 prompt_ids,

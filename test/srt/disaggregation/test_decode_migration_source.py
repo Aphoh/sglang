@@ -255,6 +255,32 @@ class DecodeMigrationSourceTests(unittest.TestCase):
         self.assertEqual(output.unforwarded_output_ids, [21])
         self.assertEqual(scheduler.disagg_metadata_buffers.output_ids[0][0], 21)
 
+    def test_quiesce_rolls_back_equal_non_recurrent_frontier(self):
+        req = _Req("request", output_ids=[20, 21])
+        req.kv_committed_len += 1
+        scheduler = _Scheduler([req], overlap=True)
+        scheduler.prepare_decode_migration(_prepare())
+
+        output = scheduler.quiesce_decode_migration(_quiesce(output_tokens_seen=1))
+
+        self.assertTrue(output.success)
+        self.assertEqual(output.committed_len, 3)
+        self.assertEqual(output.logical_len, 4)
+        self.assertEqual(output.unforwarded_output_ids, [21])
+        self.assertEqual(scheduler.disagg_metadata_buffers.output_ids[0][0], 21)
+
+    def test_quiesce_does_not_roll_back_equal_mamba_frontier(self):
+        req = _Req("request", output_ids=[20, 21])
+        req.kv_committed_len += 1
+        scheduler = _Scheduler([req], overlap=True, state_types=[StateType.MAMBA])
+        scheduler.prepare_decode_migration(_prepare())
+
+        output = scheduler.quiesce_decode_migration(_quiesce(output_tokens_seen=1))
+
+        self.assertFalse(output.success)
+        self.assertEqual(output.status, "error")
+        self.assertIn("exactly one sampled token", output.error)
+
     def test_overlap_quiesce_waits_for_completed_frontier(self):
         req = _Req("request", output_ids=[20])
         scheduler = _Scheduler([req], overlap=True)
