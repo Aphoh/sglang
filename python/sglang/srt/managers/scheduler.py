@@ -303,6 +303,24 @@ class Scheduler(
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
+    # Compatibility views for existing call sites. New long-lived components must
+    # retain the corresponding GroupCoordinator instead of caching these values.
+    @property
+    def tp_cpu_group(self) -> torch.distributed.ProcessGroup:
+        return self.tp_group.cpu_group
+
+    @property
+    def attn_tp_cpu_group(self) -> torch.distributed.ProcessGroup:
+        return self.attn_tp_group.cpu_group
+
+    @property
+    def attn_cp_cpu_group(self) -> torch.distributed.ProcessGroup:
+        return self.attn_cp_group.cpu_group
+
+    @property
+    def dp_tp_cpu_group(self) -> torch.distributed.ProcessGroup:
+        return self.dp_tp_group.cpu_group
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -916,11 +934,8 @@ class Scheduler(
             )
 
         self.tp_group = get_tp_group()
-        self.tp_cpu_group = self.tp_group.cpu_group
         self.attn_tp_group = get_attention_tp_group()
-        self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
         self.attn_cp_group = get_attention_cp_group()
-        self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
@@ -934,7 +949,6 @@ class Scheduler(
             if self.server_args.enable_dp_attention
             else self.tp_group
         )
-        self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
         # TODO(Jialin): Migrate pad_input_ids implementations to return array.
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
@@ -1048,8 +1062,7 @@ class Scheduler(
                 self.prefill_delayer = PrefillDelayer(
                     dp_size=self.ps.dp_size,
                     attn_tp_size=self.ps.attn_tp_size,
-                    cpu_group=self.tp_cpu_group,
-                    device_group=self.tp_group.device_group,
+                    tp_group=self.tp_group,
                     server_args=self.server_args,
                     metrics_collector=(
                         self.metrics_collector
@@ -1668,7 +1681,7 @@ class Scheduler(
     def init_profiler(self) -> None:
         self.profiler_manager = SchedulerProfilerManager(
             ps=self.ps,
-            dp_tp_cpu_group=self.dp_tp_cpu_group,
+            dp_tp_group=self.dp_tp_group,
             get_forward_ct=lambda: self.forward_ct,
         )
 
@@ -1676,7 +1689,7 @@ class Scheduler(
         self.weight_updater = SchedulerWeightUpdaterManager(
             tp_worker=self.tp_worker,
             draft_worker=self.draft_worker,
-            tp_cpu_group=self.tp_cpu_group,
+            tp_group=self.tp_group,
             memory_saver_adapter=self.memory_saver_adapter,
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
@@ -1724,11 +1737,8 @@ class Scheduler(
             mm_receiver=self.mm_receiver,
             ps=self.ps,
             tp_group=self.tp_group,
-            tp_cpu_group=self.tp_cpu_group,
             attn_tp_group=self.attn_tp_group,
-            attn_tp_cpu_group=self.attn_tp_cpu_group,
             attn_cp_group=self.attn_cp_group,
-            attn_cp_cpu_group=self.attn_cp_cpu_group,
             world_group=self.world_group,
             server_args=self.server_args,
             model_config=self.model_config,

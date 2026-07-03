@@ -41,7 +41,7 @@ def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):
     scheduler.server_args.constrained_json_disable_any_whitespace = False
 
     # Distributed group mocks
-    scheduler.dp_tp_cpu_group = MagicMock()
+    scheduler.dp_tp_group.cpu_group = MagicMock()
     scheduler.dp_tp_group.world_size = 1
     scheduler.dp_tp_group.first_rank = 0
     scheduler.dp_tp_group.is_first_rank = True
@@ -579,6 +579,8 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         """With multiple ranks, ready = intersection, failed = union."""
         mgr = self._make_mgr()
         mgr.grammar_sync_size = 2  # Enable multi-rank path
+        replacement_group = object()
+        mgr.grammar_sync_coordinator.cpu_group = replacement_group
 
         # Two requests: idx 0 ready on both ranks, idx 1 ready only on rank 0
         grammar_obj = MagicMock(spec=BaseGrammarObject)
@@ -601,6 +603,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
 
         # Simulate all_gather: rank 0 has {0} ready, rank 1 has {0,1} ready
         def fake_all_gather(output_list, _obj, group=None):  # noqa: ARG001
+            self.assertIs(group, replacement_group)
             output_list[0] = ({0}, set())  # rank 0: only idx 0 ready
             output_list[1] = ({0, 1}, set())  # rank 1: both ready
 

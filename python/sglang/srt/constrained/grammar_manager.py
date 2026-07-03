@@ -44,7 +44,7 @@ class GrammarManager:
             else False
         )
 
-        self.grammar_sync_group = scheduler.dp_tp_cpu_group
+        self.grammar_sync_coordinator = scheduler.dp_tp_group
         self.grammar_sync_size = scheduler.dp_tp_group.world_size
         self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
         self.is_grammar_sync_entry = scheduler.dp_tp_group.is_first_rank
@@ -193,7 +193,7 @@ class GrammarManager:
             torch.distributed.all_gather_object(
                 all_gather_output,
                 (ready_req_idxs, failed_req_idxs),
-                group=self.grammar_sync_group,
+                group=self.grammar_sync_coordinator.cpu_group,
             )
             synced_ready_req_idxs = set.intersection(*[x[0] for x in all_gather_output])
             synced_failed_req_idxs = set.union(*[x[1] for x in all_gather_output])

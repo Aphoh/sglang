@@ -4,7 +4,7 @@ import time
 from abc import ABC
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 import torch
 
@@ -15,6 +15,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 _is_npu = is_npu()
 if _is_npu:
@@ -54,13 +57,13 @@ def export_cuda_graph_capture_trace(prof_context, *, runner_name: str, tp_rank: 
 
 
 class ProfileManager:
-    def __init__(self, ps: ParallelState, cpu_group):
+    def __init__(self, ps: ParallelState, group: "GroupCoordinator"):
         self.stage_based_trigger = _StageBasedTrigger(
             on_start=self._do_start,
             on_stop=self._do_stop,
         )
         self.ps = ps
-        self.cpu_group = cpu_group
+        self.group = group
         self.first_rank_in_node = ps.gpu_id == get_global_server_args().base_gpu_id
         self.profiler_kwargs = None
         self.profiler = None
@@ -132,7 +135,7 @@ class ProfileManager:
         self.profiler = _ProfilerBase.create(
             **self.profiler_kwargs,
             ps=self.ps,
-            cpu_group=self.cpu_group,
+            group=self.group,
             first_rank_in_node=self.first_rank_in_node,
             output_suffix=f"-{stage}" if stage else "",
         )
@@ -267,7 +270,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         output_suffix: str,
         profile_id: str,
         ps: ParallelState,
-        cpu_group,
+        group: "GroupCoordinator",
         first_rank_in_node: bool,
     ):
         self.output_dir = output_dir
@@ -275,7 +278,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         self.output_suffix = output_suffix
         self.profile_id = profile_id
         self.ps = ps
-        self.cpu_group = cpu_group
+        self.group = group
         self.first_rank_in_node = first_rank_in_node
 
 
@@ -335,7 +338,7 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             self.torch_profiler.export_chrome_trace(
                 os.path.join(self.output_dir, filename)
             )
-        torch.distributed.barrier(self.cpu_group)
+        torch.distributed.barrier(self.group.cpu_group)
 
         # TODO: migrate `_merge_profile_traces`
 
@@ -395,7 +398,7 @@ class _ProfilerRPD(_ProfilerConcreteBase):
             schema.writeSchema(connection)
             connection.commit()
             del connection
-        torch.distributed.barrier(self.cpu_group)
+        torch.distributed.barrier(self.group.cpu_group)
 
         self.rpd_profiler = rpdTracerControl()
         self.rpd_profiler.setPythonTrace(True)
@@ -407,7 +410,7 @@ class _ProfilerRPD(_ProfilerConcreteBase):
         self.rpd_profiler.stop()
         self.rpd_profiler.flush()
 
-        torch.distributed.barrier(self.cpu_group)
+        torch.distributed.barrier(self.group.cpu_group)
         if self.ps.tp_rank == 0:
             from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 

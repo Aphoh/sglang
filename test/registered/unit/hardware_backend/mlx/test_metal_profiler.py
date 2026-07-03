@@ -197,7 +197,7 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
             gpu_id = 0
 
         mgr = SchedulerProfilerManager(
-            ps=FakePS(), dp_tp_cpu_group=None, get_forward_ct=lambda: 0
+            ps=FakePS(), dp_tp_group=MagicMock(), get_forward_ct=lambda: 0
         )
         mgr._init_profile(output_dir, None, None, None, None, None, False, "test")
         return mgr

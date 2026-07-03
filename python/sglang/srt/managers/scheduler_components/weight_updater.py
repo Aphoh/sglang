@@ -6,7 +6,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, Optional, Tuple
 
 import torch
 
@@ -39,6 +39,9 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +77,7 @@ def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
     draft_worker: Any
-    tp_cpu_group: Any
+    tp_group: GroupCoordinator
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
@@ -160,7 +163,7 @@ class SchedulerWeightUpdaterManager:
                 self.flush_cache_after_weight_update(recv_req)
             else:
                 logger.error(message)
-            torch.distributed.barrier(group=self.tp_cpu_group)
+            torch.distributed.barrier(group=self.tp_group.cpu_group)
             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
@@ -174,7 +177,7 @@ class SchedulerWeightUpdaterManager:
                 self.flush_cache_after_weight_update(recv_req)
             if not success:
                 logger.error(message)
-            torch.distributed.barrier(group=self.tp_cpu_group)
+            torch.distributed.barrier(group=self.tp_group.cpu_group)
             return UpdateWeightsFromIPCReqOutput(success=success, message=message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
@@ -216,7 +219,7 @@ class SchedulerWeightUpdaterManager:
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.model_runner.model
             )
-            torch.distributed.barrier(self.tp_cpu_group)
+            torch.distributed.barrier(self.tp_group.cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
@@ -240,7 +243,7 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
-            torch.distributed.barrier(self.tp_cpu_group)
+            torch.distributed.barrier(self.tp_group.cpu_group)
             _import_static_state(
                 self.tp_worker.model_runner.model,
                 self.stashed_model_static_state,
@@ -277,11 +280,11 @@ class SchedulerWeightUpdaterManager:
                     if payload is not None and draft_payload is not None:
                         payload = _merge_checksum_payloads(payload, draft_payload)
 
-            tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+            tp_size = torch.distributed.get_world_size(group=self.tp_group.cpu_group)
             if tp_size > 1 and payload is not None:
                 all_payloads = [None] * tp_size
                 torch.distributed.all_gather_object(
-                    all_payloads, payload, group=self.tp_cpu_group
+                    all_payloads, payload, group=self.tp_group.cpu_group
                 )
                 payload = all_payloads
             return CheckWeightsReqOutput(
