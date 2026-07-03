@@ -34,7 +34,6 @@ from collections import namedtuple
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
-from enum import Enum, auto
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from unittest.mock import patch
@@ -109,56 +108,6 @@ class GraphCaptureContext:
 class P2PWork:
     work: Optional[torch.distributed.Work]
     payload: Optional[torch.Tensor]
-
-
-class DeviceGroupBinding(Enum):
-    """How a coordinator resolves its device process group."""
-
-    OWNED = auto()
-    WORLD = auto()
-    CPU_ALIAS = auto()
-
-
-@dataclass(frozen=True)
-class _CpuGroupSpec:
-    """Recipe for recreating the CPU process group owned by a coordinator."""
-
-    group_ranks: Tuple[Tuple[int, ...], ...]
-    torch_distributed_backend: Union[str, Backend]
-    gloo_timeout: timedelta
-    model_parallel_timeout: Optional[timedelta]
-    recovered_rank: bool
-
-    def create_group(
-        self, ranks: Union[Tuple[int, ...], List[int]]
-    ) -> Tuple[ProcessGroup, torch.Tensor]:
-        active_ranks = torch.ones(len(ranks), dtype=torch.int32)
-        if "mooncake" in str(self.torch_distributed_backend):
-            from mooncake.ep import MooncakeBackendOptions
-
-            group = torch.distributed.new_group(
-                list(ranks),
-                backend="mooncake-cpu",
-                pg_options=MooncakeBackendOptions(active_ranks, self.recovered_rank),
-                timeout=self.model_parallel_timeout,
-            )
-        else:
-            group = torch.distributed.new_group(
-                list(ranks), backend="gloo", timeout=self.gloo_timeout
-            )
-        return group, active_ranks
-
-    def create_for_rank(self, rank: int) -> Tuple[ProcessGroup, torch.Tensor]:
-        active_group = None
-        active_ranks = None
-        for ranks in self.group_ranks:
-            group, group_active_ranks = self.create_group(ranks)
-            if rank in ranks:
-                active_group = group
-                active_ranks = group_active_ranks
-        if active_group is None or active_ranks is None:
-            raise RuntimeError(f"Rank {rank} has no configured CPU subgroup")
-        return active_group, active_ranks
 
 
 def _split_tensor_dict(
@@ -288,8 +237,8 @@ class GroupCoordinator:
     #   3     |   1  |  3   |     1      |       3
     local_rank: int  # local rank used to assign devices
     rank_in_group: int  # rank inside the group
-    # Process groups are exposed through properties so a coordinator remains a
-    # stable handle when its underlying groups are renewed.
+    cpu_group: ProcessGroup  # group for CPU communication
+    device_group: ProcessGroup  # group for device communication
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_pymscclpp: bool  # a hint of whether to use PyMsccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
@@ -321,39 +270,18 @@ class GroupCoordinator:
         group_name: Optional[str] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
         recovered_rank: bool = False,
-        device_group_binding: DeviceGroupBinding = DeviceGroupBinding.OWNED,
     ):
         # Set group info
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
+        _register_group(self)
 
         # Set rank info
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
-        self.device_group_binding = device_group_binding
-        self._owned_device_group: Optional[ProcessGroup] = None
-        self._cpu_group: Optional[ProcessGroup] = None
-        self._cpu_group_generation = 0
-        self._destroyed = False
-        self._cpu_group_spec = _CpuGroupSpec(
-            group_ranks=tuple(tuple(ranks) for ranks in group_ranks),
-            torch_distributed_backend=torch_distributed_backend,
-            gloo_timeout=gloo_timeout,
-            model_parallel_timeout=_MODEL_PARALLEL_GROUP_TIMEOUT,
-            recovered_rank=recovered_rank,
-        )
+        self.device_group = None
+        self.cpu_group = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
-
-        if not isinstance(device_group_binding, DeviceGroupBinding):
-            raise TypeError("device_group_binding must be a DeviceGroupBinding")
-        if device_group_binding is DeviceGroupBinding.WORLD:
-            active_group_ranks = [ranks for ranks in group_ranks if self.rank in ranks]
-            if len(active_group_ranks) != 1 or tuple(active_group_ranks[0]) != tuple(
-                range(torch.distributed.get_world_size())
-            ):
-                raise ValueError(
-                    "WORLD binding requires exactly the ranks in the default group"
-                )
 
         if is_cuda_alike():
             device_id = (
@@ -372,47 +300,47 @@ class GroupCoordinator:
 
         for ranks in group_ranks:
             active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
+            active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
-            if "mooncake" in str(torch_distributed_backend):
+            if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
 
-                device_group = (
-                    torch.distributed.new_group(
-                        ranks,
-                        backend="mooncake",
-                        pg_options=MooncakeBackendOptions(active_ranks, recovered_rank),
-                        timeout=subgroup_timeout,
-                    )
-                    if device_group_binding is DeviceGroupBinding.OWNED
-                    else None
+                device_group = torch.distributed.new_group(
+                    ranks,
+                    backend="mooncake",
+                    pg_options=MooncakeBackendOptions(active_ranks, recovered_rank),
+                    timeout=subgroup_timeout,
+                )
+                cpu_group = torch.distributed.new_group(
+                    ranks,
+                    backend="mooncake-cpu",
+                    pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank),
+                    timeout=subgroup_timeout,
                 )
             else:
                 pg_options = get_torch_distributed_pg_options(group_name)
-                device_group = (
-                    torch.distributed.new_group(
-                        ranks,
-                        backend=torch_distributed_backend,
-                        pg_options=pg_options,
-                        timeout=subgroup_timeout,
-                    )
-                    if device_group_binding is DeviceGroupBinding.OWNED
-                    else None
+                device_group = torch.distributed.new_group(
+                    ranks,
+                    backend=torch_distributed_backend,
+                    pg_options=pg_options,
+                    timeout=subgroup_timeout,
                 )
-            # A CPU group allows direct coordination between processes.
-            cpu_group, active_ranks_cpu = self._cpu_group_spec.create_group(ranks)
+                # a group with `gloo` backend, to allow direct coordination
+                # between processes through the CPU.
+                cpu_group = torch.distributed.new_group(
+                    ranks, backend="gloo", timeout=gloo_timeout
+                )
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
                 self.rank_in_group = ranks.index(self.rank)
-                self._owned_device_group = device_group
-                self._cpu_group = cpu_group
+                self.device_group = device_group
+                self.cpu_group = cpu_group
                 self.active_ranks = active_ranks
                 self.active_ranks_cpu = active_ranks_cpu
 
-        if self._cpu_group is None:
-            raise RuntimeError(f"Rank {self.rank} has no configured subgroup")
-        if not self.has_device_group:
-            raise RuntimeError("The configured device process group is unavailable")
+        assert self.cpu_group is not None
+        assert self.device_group is not None
 
         # Import communicators
         self.use_pynccl = use_pynccl
@@ -532,140 +460,22 @@ class GroupCoordinator:
         if use_npu_communicator and self.world_size > 1:
             self.npu_communicator = NpuCommunicator(group=self.device_group)
 
-        # Recovered ranks create their mq_broadcaster in elastic_ep.py.
-        self.mq_broadcaster: Optional[Any] = None
-        self._create_message_queue()
-
-        # Custom ops must never observe a partially initialized coordinator.
-        _register_group(self)
-
-    def _resolve_device_group(self) -> Optional[ProcessGroup]:
-        if self._destroyed:
-            return None
-        if self.device_group_binding is DeviceGroupBinding.OWNED:
-            return self._owned_device_group
-        if self.device_group_binding is DeviceGroupBinding.CPU_ALIAS:
-            return self._cpu_group
-        if not torch.distributed.is_initialized():
-            return None
-        return torch.distributed.group.WORLD
-
-    @property
-    def has_device_group(self) -> bool:
-        return self._resolve_device_group() is not None
-
-    @property
-    def device_group(self) -> ProcessGroup:
-        group = self._resolve_device_group()
-        if group is None:
-            raise RuntimeError(
-                f"Device process group for {self.unique_name} is unavailable"
-            )
-        return group
-
-    @property
-    def has_cpu_group(self) -> bool:
-        return self._cpu_group is not None
-
-    @property
-    def cpu_group(self) -> ProcessGroup:
-        if self._cpu_group is None:
-            raise RuntimeError(
-                f"CPU process group for {self.unique_name} is unavailable"
-            )
-        return self._cpu_group
-
-    @property
-    def cpu_group_generation(self) -> int:
-        return self._cpu_group_generation
-
-    def release_cpu_group(self) -> None:
-        """Destroy the CPU group after group-derived resources are detached.
-
-        External holders are not tracked; lifecycle orchestrators must quiesce
-        and release them first. Coordinator-owned communicators fail closed.
-        Invoke lifecycle operations in the same coordinator order on every
-        default-world rank so a later renewal can recreate all subgroups.
-        """
-        group = self._cpu_group
-        if group is None:
-            return
-        dependent_communicators = []
-        for name in (
-            "pynccl_comm",
-            "pymscclpp_comm",
-            "ca_comm",
-            "qr_comm",
-            "torch_symm_mem_comm",
-            "hpu_communicator",
-            "xpu_communicator",
-            "npu_communicator",
-        ):
-            communicator = getattr(self, name, None)
-            if communicator is not None and (
-                getattr(communicator, "group", None) is group
-                or getattr(communicator, "control_group", None) is group
-            ):
-                dependent_communicators.append(name)
-        if dependent_communicators:
-            raise RuntimeError(
-                "Cannot release CPU process group while communicators retain it: "
-                + ", ".join(dependent_communicators)
-            )
-        self._close_message_queue()
-        torch.distributed.destroy_process_group(group)
-        self._cpu_group = None
-
-    def renew_cpu_group(self) -> ProcessGroup:
-        """Recreate a released CPU group from its construction recipe.
-
-        This is collective over the default world: every rank, including ranks
-        outside this coordinator's active subgroup, must call it in the same
-        global coordinator order.
-        """
-        if self._destroyed:
-            raise RuntimeError(f"Group coordinator {self.unique_name} is destroyed")
-        if self._cpu_group is not None:
-            return self._cpu_group
-        group, active_ranks = self._cpu_group_spec.create_for_rank(self.rank)
-        self._cpu_group = group
-        self.active_ranks_cpu = active_ranks
-        try:
-            self._create_message_queue()
-        except Exception:
-            self._close_message_queue()
-            torch.distributed.destroy_process_group(group)
-            self._cpu_group = None
-            raise
-        self._cpu_group_generation += 1
-        return group
-
-    def _create_message_queue(self) -> None:
-        if (
-            not self.use_message_queue_broadcaster
-            or self.world_size <= 1
-            or self._cpu_group_spec.recovered_rank
-        ):
-            return
+        # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
             MessageQueue,
         )
 
-        self.mq_broadcaster = MessageQueue.create_from_process_group(
-            self.cpu_group, 1 << 22, 6
-        )
-
-    def _close_message_queue(self) -> None:
-        broadcaster = self.mq_broadcaster
-        if broadcaster is not None:
-            broadcaster.close()
-            self.mq_broadcaster = None
+        self.mq_broadcaster: Optional[MessageQueue] = None
+        if use_message_queue_broadcaster and self.world_size > 1 and not recovered_rank:
+            # Recovered ranks create their mq_broadcaster in elastic_ep.py
+            self.mq_broadcaster = MessageQueue.create_from_process_group(
+                self.cpu_group, 1 << 22, 6
+            )
 
     def __repr__(self):
-        device_group = self._resolve_device_group()
         return (
             f"ranks={self.ranks} rank={self.rank} local_rank={self.local_rank} use_pynccl={self.use_pynccl} "
-            f"device_group={device_group} cpu_group={self._cpu_group} unique_name={self.unique_name} "
+            f"device_group={self.device_group} cpu_group={self.cpu_group} unique_name={self.unique_name} "
             f"world_size={self.world_size} rank_in_group={self.rank_in_group}"
         )
 
@@ -1773,28 +1583,20 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
-        _groups.pop(self.unique_name, None)
+        if self.device_group is not None:
+            torch.distributed.destroy_process_group(self.device_group)
+            self.device_group = None
+        if self.cpu_group is not None:
+            torch.distributed.destroy_process_group(self.cpu_group)
+            self.cpu_group = None
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
         if self.pymscclpp_comm is not None:
             self.pymscclpp_comm.destroy()
-            self.pymscclpp_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
-        if self.qr_comm is not None:
-            self.qr_comm.close()
-            self.qr_comm = None
-        if self.torch_symm_mem_comm is not None:
-            self.torch_symm_mem_comm = None
-        self.hpu_communicator = None
-        self.xpu_communicator = None
-        self.npu_communicator = None
-        self._close_message_queue()
-        if self._owned_device_group is not None:
-            torch.distributed.destroy_process_group(self._owned_device_group)
-            self._owned_device_group = None
-        self.release_cpu_group()
-        self._destroyed = True
+        if self.mq_broadcaster is not None:
+            self.mq_broadcaster = None
 
 
 _WORLD: Optional[GroupCoordinator] = None
@@ -1806,11 +1608,7 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int],
-    local_rank: int,
-    backend: str,
-    recovered_rank: bool = False,
-    device_group_binding: DeviceGroupBinding = DeviceGroupBinding.OWNED,
+    ranks: List[int], local_rank: int, backend: str, recovered_rank: bool = False
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -1825,7 +1623,6 @@ def init_world_group(
         use_npu_communicator=False,
         group_name="world",
         recovered_rank=recovered_rank,
-        device_group_binding=device_group_binding,
     )
 
 
@@ -1840,7 +1637,6 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
-    device_group_binding: DeviceGroupBinding = DeviceGroupBinding.OWNED,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1866,7 +1662,6 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         recovered_rank=recovered_rank,
-        device_group_binding=device_group_binding,
     )
 
 

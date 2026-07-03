@@ -303,20 +303,22 @@ class Scheduler(
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
+    # Compatibility views for existing call sites. New long-lived components must
+    # retain the corresponding GroupCoordinator instead of caching these values.
     @property
-    def tp_cpu_group(self):
+    def tp_cpu_group(self) -> torch.distributed.ProcessGroup:
         return self.tp_group.cpu_group
 
     @property
-    def attn_tp_cpu_group(self):
+    def attn_tp_cpu_group(self) -> torch.distributed.ProcessGroup:
         return self.attn_tp_group.cpu_group
 
     @property
-    def attn_cp_cpu_group(self):
+    def attn_cp_cpu_group(self) -> torch.distributed.ProcessGroup:
         return self.attn_cp_group.cpu_group
 
     @property
-    def dp_tp_cpu_group(self):
+    def dp_tp_cpu_group(self) -> torch.distributed.ProcessGroup:
         return self.dp_tp_group.cpu_group
 
     def __init__(
@@ -1918,7 +1920,7 @@ class Scheduler(
             if (
                 torch.distributed.is_available()
                 and torch.distributed.is_initialized()
-                and self.dp_tp_group.has_cpu_group
+                and self.dp_tp_cpu_group is not None
             ):
                 group_world_size = torch.distributed.get_world_size(
                     group=self.dp_tp_cpu_group
