@@ -13,6 +13,9 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
+from sglang.srt.distributed.device_communicators.checkpoint_vmm import (
+    CheckpointableVmmBuffer,
+)
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
@@ -68,6 +71,13 @@ class CustomAllreduce:
         self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
         self.original_disabled = True  # To store the original state
         self.use_amd_deterministic_impl = _use_amd_deterministic_impl()
+        self.checkpointable = (
+            _is_cuda and envs.SGLANG_CRIU_SUSPEND_DEVICE_PROCESS_GROUP.get()
+        )
+        if self.checkpointable:
+            max_size = envs.SGLANG_CRIU_ALL_REDUCE_MAX_BYTES.get()
+            if max_size <= 0:
+                raise ValueError("SGLANG_CRIU_ALL_REDUCE_MAX_BYTES must be positive")
 
         if not ops.IS_CUSTOM_AR_AVAILABLE:
             # disable because of missing custom allreduce library
@@ -94,6 +104,7 @@ class CustomAllreduce:
             return  # fail to get nvlink status
 
         self.group = group
+        self.control_group = group
         self.max_size = max_size
         self.rank = rank
         self.world_size = world_size
@@ -103,12 +114,26 @@ class CustomAllreduce:
             # Buffers memory are owned by this Python class and passed to C++.
             # Meta data composes of two parts: meta data for synchronization and a
             # temporary buffer for storing intermediate allreduce results.
-            self.meta_ptrs = self.create_shared_buffer(
-                ops.meta_size() + max_size, group=group
-            )
+            if self.checkpointable:
+                self.meta_memory = CheckpointableVmmBuffer(
+                    ops.meta_size() + max_size, group, self.device
+                )
+                self.meta_ptrs = list(self.meta_memory.ptrs)
+            else:
+                self.meta_memory = None
+                self.meta_ptrs = self.create_shared_buffer(
+                    ops.meta_size() + max_size, group=group
+                )
             # This is a pre-registered IPC buffer. In eager mode, input tensors
             # are first copied into this buffer before allreduce is performed
-            self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
+            if self.checkpointable:
+                self.buffer_memory = CheckpointableVmmBuffer(
+                    max_size, group, self.device
+                )
+                self.buffer_ptrs = list(self.buffer_memory.ptrs)
+            else:
+                self.buffer_memory = None
+                self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
             # This is a buffer for storing the tuples of pointers pointing to
             # IPC buffers from all ranks. Each registered tuple has size of
             # 8*world_size bytes where world_size is at most 8. Allocating 8MB
@@ -190,7 +215,7 @@ class CustomAllreduce:
             yield
         finally:
             self._IS_CAPTURING = False
-            if not self.disabled:
+            if not self.disabled and not self.checkpointable:
                 self.register_graph_buffers()
 
     def _get_ipc_meta(self, inp: torch.Tensor):
@@ -306,6 +331,35 @@ class CustomAllreduce:
                 ops.all_reduce_unreg(self._ptr, inp, self.buffer, out)
         return out
 
+    def prepare_checkpoint(self) -> None:
+        if not self.checkpointable or self.disabled:
+            return
+        torch.cuda.synchronize(self.device)
+        self.buffer_memory.detach()
+        self.meta_memory.detach()
+
+    def set_control_group(self, group: Optional[ProcessGroup]) -> None:
+        self.control_group = group
+        if self.checkpointable and not self.disabled:
+            # The CPU group is destroyed before CRIU and recreated afterwards.
+            # Drop every strong reference to the old group, including the one
+            # retained for the non-checkpointable shared-buffer cleanup path.
+            self.group = group
+            self.meta_memory.set_control_group(group)
+            self.buffer_memory.set_control_group(group)
+
+    def restore_after_checkpoint(self) -> None:
+        if not self.checkpointable or self.disabled or self.meta_memory.attached:
+            return
+        if self.control_group is None:
+            raise RuntimeError("custom all-reduce has no restored control group")
+        self.meta_memory.restore()
+        self.buffer_memory.restore()
+        dist.barrier(group=self.control_group)
+
+    def status(self) -> list[int]:
+        return [0, 0, 0, 0]
+
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
         """The main allreduce API that provides support for cuda graph."""
         # When custom allreduce is disabled, this will be None.
@@ -313,7 +367,10 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self._all_reduce_impl(input, registered=not self.tms_cudagraph)
+                return self._all_reduce_impl(
+                    input,
+                    registered=not self.tms_cudagraph and not self.checkpointable,
+                )
             else:
                 # Could be warmup OR piecewise cuda graph split op execution.
                 # In piecewise cuda graph, split ops run eagerly outside the graph
@@ -333,8 +390,12 @@ class CustomAllreduce:
             if ops is not None:
                 ops.dispose(self._ptr)
             if _is_cuda:
-                self.free_shared_buffer(self.meta_ptrs)
-                self.free_shared_buffer(self.buffer_ptrs)
+                if self.checkpointable:
+                    self.meta_memory.close()
+                    self.buffer_memory.close()
+                else:
+                    self.free_shared_buffer(self.meta_ptrs, self.group)
+                    self.free_shared_buffer(self.buffer_ptrs, self.group)
             self._ptr = 0
 
     def __del__(self):
@@ -355,7 +416,11 @@ def dispatch_custom_allreduce(
     Note: ServerArgs._handle_environment_variables forces this env to "0" when
     nnodes > 1 since custom AR is intra-node only.
     """
-    if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
+    if (
+        _is_cuda
+        and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get()
+        and not envs.SGLANG_CRIU_SUSPEND_DEVICE_PROCESS_GROUP.get()
+    ):
         from .custom_all_reduce_v2 import (
             CustomAllReduceV2,
             can_use_custom_all_reduce_v2,

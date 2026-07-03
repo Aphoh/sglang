@@ -3646,7 +3646,7 @@ class Scheduler(
     def save_sharded_model(self, **kwargs):
         self.weight_updater.save_sharded_model(kwargs)
 
-    def log_movin_nixl_status(
+    def log_checkpoint_collective_status(
         self,
         phase: str = "",
         require_clean: bool = False,

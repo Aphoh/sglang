@@ -60,7 +60,7 @@ class FakeManager:
 
 class FakeGroup:
     def __init__(self, manager):
-        self.movin_collectives = manager
+        self.checkpoint_collectives = manager
 
 
 def make_coordinator(monkeypatch, groups):

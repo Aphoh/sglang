@@ -34,7 +34,8 @@ def make_server_args(**overrides):
         "hicache_storage_backend": None,
         "enable_hisparse": False,
         "disable_radix_cache": True,
-        "disable_custom_all_reduce": True,
+        "disable_custom_all_reduce": False,
+        "enable_flashinfer_allreduce_fusion": False,
         "enable_symm_mem": False,
     }
     values.update(overrides)
@@ -60,7 +61,12 @@ def test_dense_tp_configuration_is_supported():
         ("enable_hierarchical_cache", True, "hierarchical cache"),
         ("enable_hisparse", True, "HiSparse"),
         ("disable_radix_cache", False, "radix cache"),
-        ("disable_custom_all_reduce", False, "custom all-reduce"),
+        ("disable_custom_all_reduce", True, "disabled custom all-reduce"),
+        (
+            "enable_flashinfer_allreduce_fusion",
+            True,
+            "FlashInfer all-reduce fusion",
+        ),
     ],
 )
 def test_unsupported_configuration_is_rejected(override, value, message):
@@ -100,7 +106,7 @@ def test_checkpoint_requires_complete_tp_collective_coverage(manager):
         group_name="tp",
         world_size=2,
         unique_name="tp:0",
-        movin_collectives=manager,
+        checkpoint_collectives=manager,
     )
 
     with pytest.raises(RuntimeError, match="missing checkpointable coverage"):
@@ -112,7 +118,7 @@ def test_checkpoint_accepts_complete_tp_collective_coverage():
         group_name="tp",
         world_size=2,
         unique_name="tp:0",
-        movin_collectives=SimpleNamespace(
+        checkpoint_collectives=SimpleNamespace(
             has_all_reduce=True,
             has_all_gather=True,
         ),

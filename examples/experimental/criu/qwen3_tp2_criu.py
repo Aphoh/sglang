@@ -1,4 +1,4 @@
-"""Checkpoint/restore workload for Qwen3 TP2 with Movin collectives."""
+"""Checkpoint/restore workload for Qwen3 TP2 with native collectives."""
 
 import argparse
 import json
@@ -7,7 +7,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
-
 
 GSM8K_URL = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
 
@@ -119,9 +118,11 @@ def run_gsm8k(
     return result, texts
 
 
-def log_movin_status(engine: Any, phase: str) -> None:
-    print(f"requesting_movin_status={phase}", flush=True)
-    engine.collective_rpc("log_movin_nixl_status", phase=phase, require_clean=True)
+def log_collective_status(engine: Any, phase: str) -> None:
+    print(f"requesting_collective_status={phase}", flush=True)
+    engine.collective_rpc(
+        "log_checkpoint_collective_status", phase=phase, require_clean=True
+    )
 
 
 def main() -> None:
@@ -193,7 +194,7 @@ def main() -> None:
         disable_prefill_cuda_graph=True,
         disable_overlap_schedule=True,
         disable_radix_cache=True,
-        disable_custom_all_reduce=True,
+        disable_custom_all_reduce=False,
         enable_flashinfer_allreduce_fusion=(
             not args.disable_flashinfer_allreduce_fusion
         ),
@@ -203,12 +204,12 @@ def main() -> None:
         random_seed=7,
         log_level="info",
     )
-    log_movin_status(engine, "after_engine_init")
+    log_collective_status(engine, "after_engine_init")
     prompt = "The first three prime numbers are"
     sampling = {"temperature": 0, "max_new_tokens": 4}
     baseline = engine.generate(prompt, sampling)["text"]
     print(f"baseline={baseline!r}", flush=True)
-    log_movin_status(engine, "after_smoke")
+    log_collective_status(engine, "after_smoke")
 
     assert_no_io_uring()
     after_quiesce = engine.generate(prompt, sampling)["text"]
@@ -226,7 +227,7 @@ def main() -> None:
         args.gsm8k_max_new_tokens,
     )
     print(f"gsm8k_before={json.dumps(gsm8k_before, sort_keys=True)}", flush=True)
-    log_movin_status(engine, "before_checkpoint")
+    log_collective_status(engine, "before_checkpoint")
 
     if args.checkpoint_backend == "none":
         restored = after_quiesce
@@ -240,12 +241,12 @@ def main() -> None:
         (args.rendezvous / "job-ready").touch()
         wait_for(args.rendezvous / "phase", args.timeout)
         engine.collective_rpc("restore_after_criu")
-        log_movin_status(engine, "after_restore_before_generation")
+        log_collective_status(engine, "after_restore_before_generation")
         restored = engine.generate(prompt, sampling)["text"]
 
     print(f"restored={restored!r}", flush=True)
     if args.checkpoint_backend != "none":
-        log_movin_status(engine, "after_restore_smoke")
+        log_collective_status(engine, "after_restore_smoke")
     if not restored:
         raise AssertionError("post-restore generation was empty")
     if restored != after_quiesce:
@@ -262,7 +263,7 @@ def main() -> None:
             gsm8k_labels,
             args.gsm8k_max_new_tokens,
         )
-        log_movin_status(engine, "after_restore_gsm8k")
+        log_collective_status(engine, "after_restore_gsm8k")
     mismatched_predictions = [
         index
         for index, (before, after) in enumerate(

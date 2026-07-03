@@ -38,6 +38,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int reg_buffer_sz_bytes) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
 
+  m.def("custom_all_gather_workspace_size", &custom_all_gather_workspace_size);
+  m.def("custom_all_gather_initialize(Tensor anchor, int local_ptr, int max_bytes, int world_size) -> ()");
+  m.impl("custom_all_gather_initialize", torch::kCUDA, &custom_all_gather_initialize);
+  m.def("custom_all_gather(Tensor input, Tensor! output, Tensor! ticket, int[] peer_ptrs, int rank, int max_bytes) -> ()");
+  m.impl("custom_all_gather", torch::kCUDA, &custom_all_gather);
+  m.def("custom_all_gather_status(Tensor anchor, int local_ptr, int max_bytes, int world_size) -> int[]");
+  m.impl("custom_all_gather_status", torch::kCUDA, &custom_all_gather_status);
+
   /*
    * From csrc/attention
    */

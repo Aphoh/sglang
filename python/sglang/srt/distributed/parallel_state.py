@@ -313,7 +313,7 @@ class GroupCoordinator:
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
     torch_symm_mem_comm: Optional[Any]  # Torch symm mem communicator
-    movin_collectives: Optional[Any]
+    checkpoint_collectives: Optional[Any]
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
     def __init__(
@@ -514,16 +514,17 @@ class GroupCoordinator:
                 device=self.device,
             )
 
-        self.movin_collectives = None
+        self.checkpoint_collectives = None
         if self.world_size > 1:
-            from sglang.srt.distributed.device_communicators.movin_nixl import (
-                create_movin_collectives,
+            from sglang.srt.distributed.device_communicators.checkpoint_collectives import (
+                create_checkpoint_collectives,
             )
 
-            self.movin_collectives = create_movin_collectives(
+            self.checkpoint_collectives = create_checkpoint_collectives(
                 group=self.cpu_group,
                 device=self.device,
                 group_name=group_name,
+                all_reduce=self.ca_comm,
             )
 
         # Create communicator for other hardware backends
@@ -623,9 +624,11 @@ class GroupCoordinator:
         # is already collected in init() and we can capture the quick allreduce directly.
         ca_comm = self.ca_comm
         maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
-        movin_collectives = self.movin_collectives
-        maybe_movin_context = (
-            nullcontext() if movin_collectives is None else movin_collectives.capture()
+        checkpoint_collectives = self.checkpoint_collectives
+        maybe_checkpoint_context = (
+            nullcontext()
+            if checkpoint_collectives is None
+            else checkpoint_collectives.capture()
         )
 
         # ensure all initialization operations complete before attempting to
@@ -637,7 +640,7 @@ class GroupCoordinator:
         with (
             self.device_module.stream(stream),
             maybe_ca_context,
-            maybe_movin_context,
+            maybe_checkpoint_context,
         ):
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
@@ -729,26 +732,20 @@ class GroupCoordinator:
 
         outplace_all_reduce_method = None
         if (
-            self.movin_collectives is not None
-            and self.movin_collectives.should_all_reduce(input_)
-        ):
-            outplace_all_reduce_method = "movin"
-        elif (
-            self.movin_collectives is not None
-            and self.movin_collectives.has_all_reduce
-            and envs.SGLANG_CRIU_SUSPEND_DEVICE_PROCESS_GROUP.get()
-        ):
-            raise RuntimeError(
-                "Checkpointable all-reduce backend does not support tensor "
-                f"shape={tuple(input_.shape)} dtype={input_.dtype}"
-            )
-        elif (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and not should_use_pymscclpp_allreduce
             and self.ca_comm.should_custom_ar(input_)
         ):
             outplace_all_reduce_method = "ca"
+        elif (
+            self.checkpoint_collectives is not None
+            and self.checkpoint_collectives.has_all_reduce
+        ):
+            raise RuntimeError(
+                "Native checkpointable all-reduce does not support tensor "
+                f"shape={tuple(input_.shape)} dtype={input_.dtype}"
+            )
         elif (
             self.qr_comm is not None
             and not self.qr_comm.disabled
@@ -859,7 +856,6 @@ class GroupCoordinator:
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
         pynccl_comm = self.pynccl_comm
-        movin_collectives = self.movin_collectives
         assert any(
             [
                 qr_comm,
@@ -867,12 +863,9 @@ class GroupCoordinator:
                 pymscclpp_comm,
                 torch_symm_mem_comm,
                 pynccl_comm,
-                movin_collectives,
             ]
         )
-        if outplace_all_reduce_method == "movin":
-            out = movin_collectives.all_reduce(input_)
-        elif outplace_all_reduce_method == "ca":
+        if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "qr":
@@ -1007,13 +1000,13 @@ class GroupCoordinator:
                 ca_comm.all_gather_unreg(input, out=output, dim=0)
                 return
 
-        movin_collectives = self.movin_collectives
-        if movin_collectives is not None:
-            if movin_collectives.should_all_gather(input, output):
-                movin_collectives.all_gather(input, output=output)
+        checkpoint_collectives = self.checkpoint_collectives
+        if checkpoint_collectives is not None:
+            if checkpoint_collectives.should_all_gather(input, output):
+                checkpoint_collectives.all_gather(input, output=output)
                 return
             if (
-                movin_collectives.has_all_gather
+                checkpoint_collectives.has_all_gather
                 and envs.SGLANG_CRIU_SUSPEND_DEVICE_PROCESS_GROUP.get()
             ):
                 raise RuntimeError(
@@ -1628,9 +1621,9 @@ class GroupCoordinator:
             self.cpu_group = None
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
-        if self.movin_collectives is not None:
-            self.movin_collectives.close()
-            self.movin_collectives = None
+        if self.checkpoint_collectives is not None:
+            self.checkpoint_collectives.close()
+            self.checkpoint_collectives = None
         if self.pymscclpp_comm is not None:
             self.pymscclpp_comm.destroy()
         if self.ca_comm is not None:
@@ -1639,21 +1632,25 @@ class GroupCoordinator:
             self.mq_broadcaster = None
 
     def _set_communicator_cpu_group(self, cpu_group) -> None:
-        if self.movin_collectives is not None:
-            self.movin_collectives.set_control_group(cpu_group)
+        if self.checkpoint_collectives is not None:
+            self.checkpoint_collectives.set_control_group(cpu_group)
 
     def validate_checkpoint_lifecycle(self) -> None:
         unsupported = []
         for communicator_name in (
             "pynccl_comm",
             "pymscclpp_comm",
-            "ca_comm",
             "qr_comm",
             "torch_symm_mem_comm",
         ):
             communicator = getattr(self, communicator_name, None)
             if communicator is not None:
                 unsupported.append(communicator_name)
+        if self.ca_comm is not None and (
+            self.checkpoint_collectives is None
+            or self.checkpoint_collectives.all_reduce is not self.ca_comm
+        ):
+            unsupported.append("ca_comm")
         for communicator_name in (
             "hpu_communicator",
             "xpu_communicator",

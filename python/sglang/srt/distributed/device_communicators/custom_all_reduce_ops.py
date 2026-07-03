@@ -33,6 +33,41 @@ if not IS_CUSTOM_AR_AVAILABLE:
 elif _is_cuda or _is_musa:
     # CUDA custom allreduce
 
+    def custom_all_gather_workspace_size(max_bytes: int, world_size: int) -> int:
+        return _custom_ar.custom_all_gather_workspace_size(max_bytes, world_size)
+
+    def custom_all_gather_initialize(
+        anchor: torch.Tensor,
+        local_ptr: int,
+        max_bytes: int,
+        world_size: int,
+    ) -> None:
+        _custom_ar.custom_all_gather_initialize(
+            anchor, local_ptr, max_bytes, world_size
+        )
+
+    def custom_all_gather(
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        ticket: torch.Tensor,
+        peer_ptrs: List[int],
+        rank: int,
+        max_bytes: int,
+    ) -> None:
+        _custom_ar.custom_all_gather(
+            inp, out, ticket, peer_ptrs, rank, max_bytes
+        )
+
+    def custom_all_gather_status(
+        anchor: torch.Tensor,
+        local_ptr: int,
+        max_bytes: int,
+        world_size: int,
+    ) -> List[int]:
+        return _custom_ar.custom_all_gather_status(
+            anchor, local_ptr, max_bytes, world_size
+        )
+
     def init_custom_ar(
         ipc_tensors: List[torch.Tensor],
         rank_data: torch.Tensor,

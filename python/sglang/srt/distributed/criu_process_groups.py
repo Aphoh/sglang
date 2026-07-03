@@ -127,7 +127,11 @@ def validate_checkpoint_configuration(
         ),
         ("HiSparse", server_args.enable_hisparse),
         ("radix cache", not server_args.disable_radix_cache),
-        ("custom all-reduce", not server_args.disable_custom_all_reduce),
+        ("disabled custom all-reduce", server_args.disable_custom_all_reduce),
+        (
+            "FlashInfer all-reduce fusion",
+            server_args.enable_flashinfer_allreduce_fusion,
+        ),
         ("symmetric memory", server_args.enable_symm_mem),
     )
     unsupported = [name for name, enabled in checks if enabled]
@@ -136,7 +140,7 @@ def validate_checkpoint_configuration(
     if unsupported:
         raise RuntimeError(
             "CRIU checkpoint mode currently supports dense TP with PP=DP=EP=CP=1, "
-            "radix cache disabled, and checkpointable Movin/FlashInfer collectives; "
+            "radix cache disabled, and native checkpointable collectives; "
             f"unsupported configuration: {', '.join(unsupported)}"
         )
 
@@ -176,7 +180,7 @@ def validate_checkpoint_collective_coverage(
     for group in groups:
         if group.group_name != "tp" or group.world_size <= 1:
             continue
-        collectives = group.movin_collectives
+        collectives = group.checkpoint_collectives
         if collectives is None or not collectives.has_all_reduce:
             missing.append(f"{group.unique_name}: all-reduce")
         if collectives is None or not collectives.has_all_gather:

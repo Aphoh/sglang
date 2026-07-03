@@ -7,8 +7,6 @@ ARG CRIU_REPOSITORY=https://github.com/galletas1712/criu.git
 ARG CRIU_REF=00b4a49d17a0bb7d9f69c0164148c0c46f0ca928
 ARG CUDA_CHECKPOINT_REF=1c71b048c779d30921f01172dda96e04033bb8ac
 ARG DYNAMO_REF=eab08859f1f48f3ff7dceab57c849caf105a275c
-ARG FLASHINFER_REPOSITORY=https://github.com/Aphoh/flashinfer.git
-ARG FLASHINFER_REF=1ac01069632461c4a84110d2c9c630a95a4c77e3
 ARG RUST_TOOLCHAIN=1.90.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -60,20 +58,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 RUN curl -LsSf https://astral.sh/uv/0.11.16/install.sh | \
       env UV_INSTALL_DIR=/usr/local/bin sh \
     && uv pip install --system --break-system-packages --no-deps \
-      'flashinfer_cubin==0.6.13' \
-      'nixl-cu13==1.1.0' \
+      'cmake>=3.31' \
+      'flashinfer_python[cu13]==0.6.12' \
+      'flashinfer_cubin==0.6.12' \
+      'ninja' \
       'sglang-kernel==0.4.3' \
-    && git init /tmp/flashinfer \
-    && git -C /tmp/flashinfer remote add origin "${FLASHINFER_REPOSITORY}" \
-    && git -C /tmp/flashinfer fetch --depth 1 origin "${FLASHINFER_REF}" \
-    && git -C /tmp/flashinfer checkout FETCH_HEAD \
-    && git -C /tmp/flashinfer submodule update --init --recursive \
-    && uv pip install --system --break-system-packages --no-deps \
-      /tmp/flashinfer \
-    && rm -rf /tmp/flashinfer \
     && uv pip uninstall --system --break-system-packages flashinfer-jit-cache \
     && criu --version \
     && uv --version \
-    && python -c 'import flashinfer, importlib.metadata as m, torch; assert m.version("torch").startswith("2.11.0"); assert torch.version.cuda == "13.0"; assert m.version("flashinfer-python") == "0.6.13"; assert flashinfer.__git_version__ == "1ac01069632461c4a84110d2c9c630a95a4c77e3"; assert m.version("flashinfer-cubin") == "0.6.13"; assert m.version("nixl-cu13") == "1.1.0"; assert m.version("sglang-kernel") == "0.4.3"'
+    && python -c 'import importlib.metadata as m, torch; assert m.version("torch").startswith("2.11.0"); assert torch.version.cuda == "13.0"; assert m.version("flashinfer-python") == "0.6.12"; assert m.version("flashinfer-cubin") == "0.6.12"; assert m.version("sglang-kernel") == "0.4.3"'
 
 WORKDIR /workspace/sglang

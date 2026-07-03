@@ -79,27 +79,3 @@ def test_parse_process_start_time_handles_spaces_in_process_name():
     stat = f"123 (process with spaces) {' '.join(fields_after_name)}"
 
     assert MODULE.parse_process_start_time(stat) == 19
-
-
-def test_pinned_movin_commit_requires_one_immutable_git_revision(tmp_path):
-    commit = "a" * 40
-    pyproject = tmp_path / "pyproject.toml"
-    pyproject.write_text(
-        "[project.optional-dependencies]\n"
-        "criu = [\n"
-        f'  "movin @ git+https://github.com/NVIDIA-dev/warnold-movin.git@{commit}",\n'
-        "]\n"
-    )
-
-    assert MODULE.pinned_movin_commit(pyproject) == commit
-
-
-def test_pinned_movin_commit_rejects_mutable_dependency(tmp_path):
-    pyproject = tmp_path / "pyproject.toml"
-    pyproject.write_text(
-        "[project.optional-dependencies]\n"
-        'criu = ["movin @ git+https://github.com/NVIDIA-dev/warnold-movin.git@main"]\n'
-    )
-
-    with pytest.raises(ValueError, match="immutable Movin dependency"):
-        MODULE.pinned_movin_commit(pyproject)

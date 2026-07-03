@@ -482,32 +482,6 @@ def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManage
     )
 
 
-def create_flashinfer_raw_allreduce(control_group):
-    from movin import FlashInferAllReduce
-
-    return FlashInferAllReduce(
-        workspace_provider=_attn_tp_workspace_manager,
-        comm_module=_flashinfer_comm,
-        expected_group=control_group,
-    )
-
-
-def get_flashinfer_checkpoint_participants(
-    group_name: str,
-) -> dict[str, FlashInferWorkspaceManager]:
-    """Return workspace lifecycles owned by a process-group coordinator."""
-    if group_name == "tp":
-        return {
-            "flashinfer_attention": _attn_tp_workspace_manager,
-            "flashinfer_moe": _moe_tp_workspace_manager,
-        }
-    if group_name == "attention_tp":
-        return {"flashinfer_attention": _attn_tp_workspace_manager}
-    if group_name in ("moe_ep", "moe_tp"):
-        return {"flashinfer_moe": _moe_tp_workspace_manager}
-    return {}
-
-
 def _sync_allreduce_unavailable_across_tp():
     """Synchronize _flashinfer_allreduce_unavailable across all TP ranks.
 

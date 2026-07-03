@@ -70,14 +70,14 @@ class CriuCheckpointCoordinator:
         for index, collectives in enumerate(self._collective_sets()):
             for name, status in collectives.status().items():
                 statuses[f"{index}.{name}"] = status
-        logger.info("Movin collective status phase=%s: %s", phase, statuses)
+        logger.info("Native collective status phase=%s: %s", phase, statuses)
         failures = {
             name: status
             for name, status in statuses.items()
             if len(status) < 3 or status[1] != 0 or status[2] != 0
         }
         if require_clean and failures:
-            raise RuntimeError(f"Movin collective failure during {phase}: {failures}")
+            raise RuntimeError(f"Native collective failure during {phase}: {failures}")
         return statuses
 
     def prepare(self) -> None:
@@ -270,7 +270,7 @@ class CriuCheckpointCoordinator:
     def _collective_sets(self):
         seen = set()
         for group in self.groups:
-            collectives = getattr(group, "movin_collectives", None)
+            collectives = getattr(group, "checkpoint_collectives", None)
             if collectives is not None and id(collectives) not in seen:
                 seen.add(id(collectives))
                 yield collectives

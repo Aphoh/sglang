@@ -593,8 +593,16 @@ class CustomAllreduce {
     cudaStreamCaptureStatus status;
     CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
     if (status == cudaStreamCaptureStatusActive) {
-      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
-      graph_unreg_buffers_.push_back(input);
+      // Persistent staging buffers are registered before capture. Reuse their
+      // rank data directly so checkpointable graphs do not acquire IPC mappings
+      // to model tensors (or consume an uninitialized graph-data slot).
+      auto it = buffers_.find(input);
+      if (it != buffers_.end()) {
+        ptrs = it->second;
+      } else {
+        ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+        graph_unreg_buffers_.push_back(input);
+      }
     } else {
       auto it = buffers_.find(input);
       if (it == buffers_.end())

@@ -2,13 +2,12 @@
 set -euo pipefail
 
 sglang_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
-movin_root=${MOVIN_REPO:-/workspace/movin}
 state_root=${SGLANG_CRIU_STATE:-/checkpoint/sglang}
 timeout_seconds=${SGLANG_CRIU_TIMEOUT:-900}
 criu_timeout_seconds=${SGLANG_CRIU_OPERATION_TIMEOUT:-120}
 python_bin=${SGLANG_PYTHON:-/usr/bin/python}
 uv_bin=${UV_BIN:-uv}
-movin_deps_dir=${MOVIN_DEPS_DIR:-/var/cache/movin/deps}
+kernel_build_dir=${SGLANG_KERNEL_BUILD_DIR:-${sglang_root}/sgl-kernel/build}
 cuda_checkpoint_helper=${CUDA_CHECKPOINT_HELPER_BIN:-/usr/local/bin/cuda-checkpoint-helper}
 cuda_device_map=${SGLANG_CRIU_DEVICE_MAP:-}
 source_gpu_uuids=${SGLANG_CRIU_SOURCE_GPU_UUIDS:-}
@@ -22,41 +21,40 @@ plugin_dir="${state_dir}/plugins"
 dist_store="${run_dir}/torch-dist-store"
 mkdir -p "${run_dir}" "${images_dir}" "${plugin_dir}"
 
-expected_movin_commit=${MOVIN_EXPECTED_COMMIT:-}
-actual_movin_commit=${MOVIN_ACTUAL_COMMIT:-}
-if [[ -z "${expected_movin_commit}" || -z "${actual_movin_commit}" ]]; then
-  expected_movin_commit=$(
-    "${python_bin}" "${host_tools}" pinned-movin-commit \
-      "${sglang_root}/python/pyproject.toml"
-  )
-  actual_movin_commit=$(git -C "${movin_root}" rev-parse HEAD)
-  if [[ "${actual_movin_commit}" != "${expected_movin_commit}" ]]; then
-    if ! git -C "${movin_root}" merge-base --is-ancestor \
-        "${expected_movin_commit}" "${actual_movin_commit}" \
-        || ! git -C "${movin_root}" diff --quiet \
-          "${expected_movin_commit}" "${actual_movin_commit}" -- \
-          pyproject.toml uv.lock python kernels; then
-      echo "Movin package inputs differ from pin ${expected_movin_commit}" >&2
-      exit 1
-    fi
-  fi
-  if [[ -n "$(git -C "${movin_root}" status --porcelain)" ]]; then
-    echo "Movin checkout must be clean for a reproducible run" >&2
-    exit 1
-  fi
-elif [[ "${MOVIN_PACKAGE_INPUTS_VALIDATED:-}" != 1 ]]; then
-  echo "Host-provided Movin commits require validated package inputs" >&2
-  exit 1
+common_sm90="${kernel_build_dir}/sm90/common_ops.abi3.so"
+common_sm100="${kernel_build_dir}/sm100/common_ops.abi3.so"
+kernel_sources_newer_than() {
+  find \
+    "${sglang_root}/sgl-kernel/CMakeLists.txt" \
+    "${sglang_root}/sgl-kernel/csrc" \
+    "${sglang_root}/sgl-kernel/include" \
+    -type f -newer "$1" -print -quit | grep -q .
+}
+if [[ -f "${common_sm90}" && -f "${common_sm100}" ]] \
+    && ! kernel_sources_newer_than "${common_sm90}" \
+    && ! kernel_sources_newer_than "${common_sm100}"; then
+  echo "Reusing cached sgl-kernel common_ops libraries"
+elif [[ -f "${kernel_build_dir}/CMakeCache.txt" ]]; then
+  cmake --build "${kernel_build_dir}" --parallel \
+    --target common_ops_sm90_build common_ops_sm100_build
+else
+  CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_ENABLE_FA3=OFF" \
+  "${uv_bin}" pip install --system --break-system-packages --no-deps \
+    --reinstall --no-build-isolation \
+    -C "build-dir=${kernel_build_dir}" "${sglang_root}/sgl-kernel"
 fi
-echo "Movin package pin: ${expected_movin_commit}; checkout: ${actual_movin_commit}"
-"${uv_bin}" pip install --system --break-system-packages --no-deps \
-  --editable "${movin_root}" \
-  --editable "${sglang_root}/python"
-MOVIN_DEPS_DIR="${movin_deps_dir}" "${python_bin}" -m movin.build_deps
-"${python_bin}" -c 'import flashinfer, importlib.metadata as m, movin, sglang; assert m.version("flashinfer-python") == "0.6.13"; assert flashinfer.__git_version__ == "1ac01069632461c4a84110d2c9c630a95a4c77e3"; assert m.version("flashinfer-cubin") == "0.6.13"; print("movin package:", movin.__file__); print("sglang package:", sglang.__file__)'
+sm90_package_dir="${sglang_root}/sgl-kernel/python/sgl_kernel/sm90"
+sm100_package_dir="${sglang_root}/sgl-kernel/python/sgl_kernel/sm100"
+mkdir -p "${sm90_package_dir}" "${sm100_package_dir}"
+ln -sfn "$(realpath --relative-to="${sm90_package_dir}" "${common_sm90}")" \
+  "${sm90_package_dir}/common_ops.abi3.so"
+ln -sfn "$(realpath --relative-to="${sm100_package_dir}" "${common_sm100}")" \
+  "${sm100_package_dir}/common_ops.abi3.so"
+export PYTHONPATH="${sglang_root}/sgl-kernel/python:${sglang_root}/python${PYTHONPATH:+:${PYTHONPATH}}"
+"${python_bin}" -c 'import sgl_kernel, sglang; assert hasattr(sgl_kernel.allreduce, "custom_all_gather"); print("sgl-kernel package:", sgl_kernel.__file__); print("sglang package:", sglang.__file__)'
 
 cc -O2 -Wall -Wextra -Werror -shared -fPIC \
-  "${movin_root}/examples/cuda_checkpoint/nvidiactl_criu_plugin.c" \
+  "${sglang_root}/examples/experimental/criu/nvidiactl_criu_plugin.c" \
   -o "${plugin_dir}/nvidiactl_plugin.so"
 
 echo "checkpoint state: ${state_dir}"
@@ -71,7 +69,6 @@ controller_log="${state_dir}/controller.log"
       NCCL_IB_DISABLE=1 \
       UCX_TLS=cuda_ipc,cuda_copy,sm,self \
       UV_USE_IO_URING=0 \
-      MOVIN_DEPS_DIR="${movin_deps_dir}" \
       USE_LIBUV=0 \
       SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE="file://${dist_store}" \
       SGLANG_CRIU_REUSE_DEVICE_PROCESS_GROUPS=1 \
@@ -79,11 +76,9 @@ controller_log="${state_dir}/controller.log"
       SGLANG_CRIU_DISABLE_TORCH_NCCL=1 \
       SGLANG_CRIU_SUSPEND_DEVICE_PROCESS_GROUP=1 \
       SGLANG_CRIU_DEVICE_STORE="${run_dir}/torch-device-store" \
-      SGLANG_MOVIN_NIXL_MAX_ELEMS=262144 \
-      SGLANG_MOVIN_NIXL_ALLGATHER_MAX_ELEMS=262144 \
-      SGLANG_MOVIN_NIXL_ENABLE_ALLGATHER=1 \
-      SGLANG_TP_ALL_REDUCE_BACKEND="${SGLANG_TP_ALL_REDUCE_BACKEND:-flashinfer}" \
-      "${python_bin}" examples/experimental/criu/qwen3_tp2_movin.py \
+      SGLANG_CRIU_ALL_REDUCE_MAX_BYTES="${SGLANG_CRIU_ALL_REDUCE_MAX_BYTES:-33554432}" \
+      SGLANG_CRIU_ALL_GATHER_MAX_ELEMS="${SGLANG_CRIU_ALL_GATHER_MAX_ELEMS:-262144}" \
+      "${python_bin}" examples/experimental/criu/qwen3_tp2_criu.py \
         --model "${SGLANG_CRIU_MODEL:-Qwen/Qwen3-4B}" \
         --checkpoint-backend external-criu \
         --rendezvous "${run_dir}" \
@@ -97,7 +92,7 @@ controller_log="${state_dir}/controller.log"
         --gsm8k-min-accuracy "${SGLANG_CRIU_GSM8K_MIN_ACCURACY:-0.0}" \
         --max-total-tokens "${SGLANG_CRIU_MAX_TOTAL_TOKENS:-4096}" \
         --mem-fraction-static "${SGLANG_CRIU_MEM_FRACTION_STATIC:-0.60}" \
-        ${SGLANG_CRIU_DISABLE_FLASHINFER_FUSION:+--disable-flashinfer-allreduce-fusion}
+        --disable-flashinfer-allreduce-fusion
 ) >"${controller_log}" 2>&1 &
 launcher_pid=$!
 

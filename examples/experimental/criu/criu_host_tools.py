@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import subprocess
-import tomllib
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
@@ -38,21 +36,6 @@ def process_start_time(pid: int) -> int:
 
 def parse_process_start_time(stat: str) -> int:
     return int(stat.rsplit(")", 1)[1].split()[19])
-
-
-def pinned_movin_commit(pyproject_path: Path) -> str:
-    project = tomllib.loads(pyproject_path.read_text())
-    dependencies = project["project"]["optional-dependencies"]["criu"]
-    matches = [
-        re.search(r"warnold-movin\.git@([0-9a-f]{40})$", dependency)
-        for dependency in dependencies
-    ]
-    commits = [match.group(1) for match in matches if match is not None]
-    if len(commits) != 1:
-        raise ValueError(
-            f"expected exactly one immutable Movin dependency in {pyproject_path}"
-        )
-    return commits[0]
 
 
 def process_tree(root: int, workers: Iterable[int]) -> list[int]:
@@ -149,9 +132,6 @@ def main() -> None:
     migration_parser.add_argument("source_gpu_uuids")
     migration_parser.add_argument("pids", nargs="+", type=int)
 
-    pin_parser = subparsers.add_parser("pinned-movin-commit")
-    pin_parser.add_argument("pyproject_path", type=Path)
-
     args = parser.parse_args()
     if args.command == "process-start-time":
         print(process_start_time(args.pid))
@@ -171,8 +151,6 @@ def main() -> None:
         for pid in sorted(args.pids):
             if residency.get(pid, set()) & source_gpu_uuids:
                 print(pid)
-    elif args.command == "pinned-movin-commit":
-        print(pinned_movin_commit(args.pyproject_path))
 
 
 if __name__ == "__main__":

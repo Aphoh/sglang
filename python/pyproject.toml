@@ -28,8 +28,8 @@ dependencies = [
   "distro",
   "einops",
   "fastapi",
-  "flashinfer_python[cu13] @ git+https://github.com/Aphoh/flashinfer.git@1ac01069632461c4a84110d2c9c630a95a4c77e3",
-  "flashinfer_cubin==0.6.13",
+  "flashinfer_python[cu13]==0.6.12", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.12",
   "gguf",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
@@ -91,9 +91,6 @@ url = "https://pypi.org/simple"
 default = true
 
 [project.optional-dependencies]
-criu = [
-  "movin[all] @ git+https://github.com/NVIDIA-dev/warnold-movin.git@b2ac329d6504ab4d1e4c3b6dc71d054352d8025c",
-]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [

@@ -88,7 +88,8 @@ def make_checkpoint_coordinator(group: GroupCoordinator):
         hicache_storage_backend=None,
         enable_hisparse=False,
         disable_radix_cache=True,
-        disable_custom_all_reduce=True,
+        disable_custom_all_reduce=False,
+        enable_flashinfer_allreduce_fusion=False,
         enable_symm_mem=False,
     )
     model_config = SimpleNamespace(hf_text_config=SimpleNamespace())
@@ -110,8 +111,8 @@ def main() -> None:
     )
 
     coordinator = make_cpu_only_coordinator(local_rank)
-    coordinator.movin_collectives.close()
-    coordinator.movin_collectives = FakeCheckpointCollectives(
+    coordinator.checkpoint_collectives.close()
+    coordinator.checkpoint_collectives = FakeCheckpointCollectives(
         coordinator.cpu_group
     )
     checkpoint = make_checkpoint_coordinator(coordinator)
@@ -137,8 +138,10 @@ def main() -> None:
         assert dist.is_initialized()
         assert coordinator.device_group is dist.group.WORLD
         assert coordinator.cpu_group_generation == cycle + 1
-        assert coordinator.movin_collectives.control_group is coordinator.cpu_group
-        assert not coordinator.movin_collectives.detached
+        assert (
+            coordinator.checkpoint_collectives.control_group is coordinator.cpu_group
+        )
+        assert not coordinator.checkpoint_collectives.detached
         dist.barrier()
 
     assert_cpu_collective(coordinator, 4)

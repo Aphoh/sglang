@@ -89,6 +89,19 @@ std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs);
 void register_graph_buffers(
     fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets);
+// custom all-gather
+int64_t custom_all_gather_workspace_size(int64_t max_bytes, int64_t world_size);
+void custom_all_gather_initialize(
+    torch::Tensor& anchor, int64_t local_ptr, int64_t max_bytes, int64_t world_size);
+void custom_all_gather(
+    torch::Tensor& input,
+    torch::Tensor& output,
+    torch::Tensor& ticket,
+    const std::vector<int64_t>& peer_ptrs,
+    int64_t rank,
+    int64_t max_bytes);
+std::vector<int64_t> custom_all_gather_status(
+    torch::Tensor& anchor, int64_t local_ptr, int64_t max_bytes, int64_t world_size);
 #endif
 
 /*

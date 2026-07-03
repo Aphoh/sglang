@@ -1,92 +1,82 @@
 # Qwen3 TP2 CUDA graph checkpoint and restore
 
-This branch adds a scoped dense-TP checkpoint lifecycle to SGLang. It uses
-[`movin`](https://github.com/NVIDIA-dev/warnold-movin) for lifecycle
-coordination and a pinned
-[`Aphoh/flashinfer`](https://github.com/Aphoh/flashinfer/commit/1ac01069632461c4a84110d2c9c630a95a4c77e3)
-build for checkpointable TRT-LLM all-reduce and symmetric all-gather.
+This experiment checkpoints a dense Qwen3 TP=2 engine without an external
+collective package or a patched FlashInfer build. Both checkpoint-sensitive
+collectives are owned by SGLang:
 
-The authoritative, pinned reproduction lives in Movin:
+- `sgl-kernel` custom all-reduce, using renewable VMM-backed signal and staging
+  buffers during checkpoint mode;
+- `sgl-kernel` symmetric-memory all-gather, ported from the prior FlashInfer
+  workspace onto a renewable peer-mapped VMM buffer.
 
-<https://github.com/NVIDIA-dev/warnold-movin/tree/warnold/all-gather-kernel/recipes/sglang_qwen3_tp2_criu>
+The CUDA graph retains the same virtual addresses across restore. Before CRIU,
+SGLang synchronizes CUDA, unmaps and releases collective backing allocations,
+and destroys its Gloo/NCCL process groups. After restore it recreates the
+groups, creates new physical allocations, maps them at the reserved addresses,
+resets protocol state, and replays the original graph.
 
-## Validated Configuration
+## Validated scope
 
-- Qwen3-8B BF16, TP2
-- FlashInfer TRT-LLM raw and fused all-reduce
-- FlashInfer symmetric-VMM BF16 all-gather
-- restartable Gloo control groups
-- one decode graph captured before checkpoint and replayed after restore
+- dense Qwen3 BF16, TP=2;
+- one pre-checkpoint decode graph replayed after restore;
+- restartable Gloo control groups and the default NCCL device group;
+- optional complete physical-GPU UUID remapping on driver 580 or newer.
 
-The SGLang coordinator quiesces CUDA, detaches collective resources, destroys
-CPU and device process groups, waits for external checkpoint/restore, recreates
-the groups and collective backing, then releases the workers.
+Checkpoint mode rejects PP, DP, EP, CP, MoE, disaggregation, HiCache, HiSparse,
+radix-cache checkpointing, the separate `--enable-symm-mem` backend,
+FlashInfer all-reduce fusion, and owned non-WORLD device subgroups.
 
-The shell runner uses NVIDIA's external `cuda-checkpoint-helper`. It discovers
-CUDA-bearing PIDs and explicitly performs:
+## All-gather performance cost
 
-1. CUDA lock and checkpoint;
-2. CRIU process-tree dump and restore;
-3. CUDA restore and unlock.
+Qwen3 performs this all-gather once per normal decode forward, when the logits
+processor gathers the TP-sharded LM-head logits. For Qwen3-4B TP=2, the exact
+per-rank BF16 payload is 151,936 bytes. On two B200s, the slowest-rank median
+was 24.61 us for the checkpointable symmetric all-gather and 12.67 us for NCCL
+`all_gather_into_tensor`.
 
-On display driver 580 or newer, the runner also accepts a complete
-`SGLANG_CRIU_DEVICE_MAP` of `old-uuid=new-uuid` pairs. The Movin handoff recipe
-uses this to expose a source and destination pair, checkpoint TP2 on the source,
-and restore the same logical CUDA devices and captured graph onto the
-destination. On the validated privileged-container setup, the map is a
-host-wide bijection: selected source and destination UUIDs are swapped and all
-other physical GPUs are identity-mapped. The runner applies the map only to
-CUDA processes resident on source GPUs. `SGLANG_CRIU_SOURCE_GPU_UUIDS` and
-`SGLANG_CRIU_RESTORE_GPU_UUIDS` enable strict NVML residency checks around the
-checkpoint.
+The validated single-request decode run produced 245.48 tokens/s, or 4.07 ms
+per token. Relative to that observed decode/model-forward step:
 
-Before launch, the runner verifies that the mounted Movin checkout is clean,
-descends from SGLang's immutable `criu` extra pin, and has byte-identical
-package/build inputs (`pyproject.toml`, `uv.lock`, `python/`, and `kernels/`).
-This permits newer recipe-only commits without changing installed code. It
-installs both mounted packages as editable packages without a `PYTHONPATH`
-overlay. The image builds FlashInfer Python 0.6.13 from the immutable combined
-collectives commit and pairs it with `flashinfer-cubin==0.6.13`, matching
-`python/pyproject.toml`.
+- the **entire checkpointable all-gather is about 0.60%** of the step;
+- NCCL itself would be about 0.31%; and
+- the **incremental checkpointability cost versus NCCL is about 0.29%**
+  (11.94 us per token).
 
-The CRIU `nvidiactl` plugin compiled by the runner only reopens
-`/dev/nvidiactl` descriptors. It does not checkpoint CUDA state.
+Thus the custom all-gather is well below 1% of the measured Qwen3 decode path,
+and the performance premium paid for the renewable VMM/checkpoint lifecycle is
+roughly three-tenths of one percent. These figures are for BF16, TP=2,
+decode batch size 1 on B200 and should be remeasured for other workloads.
 
-## Build
+## Build and run
 
 ```bash
 docker build \
   -f examples/experimental/criu/Dockerfile \
-  -t sglang-movin-criu:handoff .
+  -t sglang-native-criu:latest .
+
+docker run --rm --privileged --gpus all \
+  -v "$PWD:/workspace/sglang" \
+  -v /tmp/sglang-checkpoints:/checkpoint/sglang \
+  sglang-native-criu:latest \
+  bash examples/experimental/criu/run_qwen3_tp2_criu.sh
 ```
 
-For standalone package installation:
+The runner builds the in-tree `sgl-kernel` before launch. Its CMake/object cache
+defaults to the git-ignored `sgl-kernel/build`; set `SGLANG_KERNEL_BUILD_DIR`
+to place the persistent cache elsewhere. A cold run installs the full package.
+Warm runs load the in-tree Python package against the cached `common_ops`
+artifacts, avoiding wheel repackaging; Ninja runs only when native kernel
+sources are newer than those libraries. The CRIU build disables the unrelated
+FA3 extension while retaining the common SGLang ops used by the model. Useful
+overrides include:
 
-```bash
-uv pip install -e './python[criu]'
-```
+- `SGLANG_CRIU_MODEL` (default `Qwen/Qwen3-4B`)
+- `SGLANG_CRIU_GPUS` (default `0,1`)
+- `SGLANG_CRIU_ALL_REDUCE_MAX_BYTES` (default 32 MiB)
+- `SGLANG_CRIU_ALL_GATHER_MAX_ELEMS` (default 262144)
+- `SGLANG_CRIU_DEVICE_MAP` (`old-uuid=new-uuid` pairs)
+- `SGLANG_CRIU_SOURCE_GPU_UUIDS` and `SGLANG_CRIU_RESTORE_GPU_UUIDS`
 
-The Movin recipe instead mounts an exact Movin checkout and records both git
-commits in the experiment provenance.
-
-## Historical Reference Result
-
-The June 14, 2026 run below predates the current FlashInfer 0.6.12 package pin;
-it used two NVIDIA B200 GPUs, driver 595.58.03, CUDA 13.0.1, PyTorch
-2.11.0+cu130, FlashInfer 0.6.11.post1, NIXL 1.1.0, and CRIU commit `00b4a49`.
-It is retained only as historical context, not as validation of the current
-dependency set. A current run writes its exact before/after result to
-`gsm8k-result.json`.
-
-| Metric | Before checkpoint | After restore |
-|---|---:|---:|
-| GSM8K accuracy | 0.93 | 0.93 |
-| Output throughput | 232.725 token/s | 234.023 token/s |
-
-All 200 predictions and generated texts were identical.
-
-## Scope
-
-Checkpoint mode rejects unsupported configurations before detaching resources.
-The validated scope excludes PP, DP, MoE all-to-all, disaggregation, HiCache,
-HiSparse, radix-cache checkpointing, and owned non-WORLD device subgroups.
+The local CRIU plugin only reopens `/dev/nvidiactl`; NVIDIA's
+`cuda-checkpoint-helper` handles CUDA state. Results and before/after GPU
+residency are written under the printed checkpoint state directory.

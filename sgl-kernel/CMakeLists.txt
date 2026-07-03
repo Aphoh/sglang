@@ -162,10 +162,16 @@ list(APPEND SGL_KERNEL_CUDA_FLAGS
     "--threads=${SGL_KERNEL_COMPILE_THREADS}"
 )
 
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
+    set(DEFAULT_SGL_KERNEL_ENABLE_FA3 ON)
+else()
+    set(DEFAULT_SGL_KERNEL_ENABLE_FA3 OFF)
+endif()
+
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
-option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
+option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SGL_KERNEL_ENABLE_FA3})
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 
@@ -222,8 +228,7 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
-    set(SGL_KERNEL_ENABLE_FA3 ON)
+if (SGL_KERNEL_ENABLE_FA3)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
@@ -238,6 +243,7 @@ endif()
 # All source files
 # NOTE: Please sort the filenames alphabetically
 set(SOURCES
+    "csrc/allreduce/custom_all_gather.cu"
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
