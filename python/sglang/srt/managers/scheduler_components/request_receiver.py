@@ -34,6 +34,7 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
@@ -50,13 +51,10 @@ class SchedulerRequestReceiver:
     input_blocker: Any
     mm_receiver: Any
     ps: ParallelState
-    tp_group: Any
-    tp_cpu_group: Any
-    attn_tp_group: Any
-    attn_tp_cpu_group: Any
-    attn_cp_group: Any
-    attn_cp_cpu_group: Any
-    world_group: Any
+    tp_group: GroupCoordinator
+    attn_tp_group: GroupCoordinator
+    attn_cp_group: GroupCoordinator
+    world_group: GroupCoordinator
     server_args: ServerArgs
     model_config: ModelConfig
     max_recv_per_poll: int
@@ -148,7 +146,7 @@ class SchedulerRequestReceiver:
                 work_reqs = broadcast_pyobj(
                     work_reqs,
                     self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
+                    self.attn_tp_group.cpu_group,
                     src=self.attn_tp_group.ranks[0],
                 )
 
@@ -156,7 +154,7 @@ class SchedulerRequestReceiver:
                 work_reqs = broadcast_pyobj(
                     work_reqs,
                     self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
+                    self.attn_cp_group.cpu_group,
                     src=self.attn_cp_group.ranks[0],
                 )
 
@@ -171,21 +169,21 @@ class SchedulerRequestReceiver:
                     control_reqs = broadcast_pyobj(
                         control_reqs,
                         self.attn_tp_group.rank,
-                        self.attn_tp_cpu_group,
+                        self.attn_tp_group.cpu_group,
                         src=self.attn_tp_group.ranks[0],
                     )
                 if self.ps.attn_cp_size != 1:
                     control_reqs = broadcast_pyobj(
                         control_reqs,
                         self.attn_cp_group.rank,
-                        self.attn_cp_cpu_group,
+                        self.attn_cp_group.cpu_group,
                         src=self.attn_cp_group.ranks[0],
                     )
             elif self.ps.tp_size != 1:
                 control_reqs = broadcast_pyobj(
                     control_reqs,
                     self.tp_group.rank,
-                    self.tp_cpu_group,
+                    self.tp_group.cpu_group,
                     src=self.tp_group.ranks[0],
                 )
             recv_reqs = work_reqs + control_reqs
@@ -193,7 +191,7 @@ class SchedulerRequestReceiver:
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
                 self.tp_group.rank,
-                self.tp_cpu_group,
+                self.tp_group.cpu_group,
                 src=self.tp_group.ranks[0],
             )
         return recv_reqs
@@ -255,7 +253,7 @@ class SchedulerRequestReceiver:
                 and self.model_config.is_multimodal
                 and has_shm_features(recv_reqs)
             ):
-                barrier(group=self.tp_cpu_group)
+                barrier(group=self.tp_group.cpu_group)
             for req in recv_reqs:
                 unwrap_shm_features(req)
 

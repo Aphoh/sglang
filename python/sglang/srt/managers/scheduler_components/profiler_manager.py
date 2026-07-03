@@ -25,6 +25,7 @@ from sglang.srt.utils.profile_utils import ProfileManager
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 _is_npu = is_npu()
@@ -49,14 +50,14 @@ logger = logging.getLogger(__name__)
 @dataclass(kw_only=True)
 class SchedulerProfilerManager:
     ps: Any
-    dp_tp_cpu_group: Any
+    dp_tp_group: GroupCoordinator
     get_forward_ct: Callable[[], int]
 
     def __post_init__(self) -> None:
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
                 ps=self.ps,
-                cpu_group=self.dp_tp_cpu_group,
+                group=self.dp_tp_group,
             )
             return
 
@@ -198,7 +199,7 @@ class SchedulerProfilerManager:
                 schema.writeSchema(connection)
                 connection.commit()
                 del connection
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            torch.distributed.barrier(self.dp_tp_group.cpu_group)
 
             self.rpd_profiler = rpdTracerControl()
             self.rpd_profiler.setPythonTrace(True)
@@ -328,14 +329,14 @@ class SchedulerProfilerManager:
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
                 )
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            torch.distributed.barrier(self.dp_tp_group.cpu_group)
 
         if self.rpd_profiler is not None:
             self.rpd_profiler.rangePop()
             self.rpd_profiler.stop()
             self.rpd_profiler.flush()
 
-            torch.distributed.barrier(self.dp_tp_cpu_group)
+            torch.distributed.barrier(self.dp_tp_group.cpu_group)
             if self.ps.tp_rank == 0:
                 from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 

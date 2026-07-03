@@ -6,7 +6,7 @@ import logging
 import os
 import pickle
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 from typing import List, Optional
@@ -142,10 +142,17 @@ class ShmRingBuffer:
         )
 
     def __del__(self):
-        if hasattr(self, "shared_memory"):
-            self.shared_memory.close()
-            if self.is_creator:
-                self.shared_memory.unlink()
+        self.close()
+
+    def close(self) -> None:
+        shared_memory = getattr(self, "shared_memory", None)
+        if shared_memory is None:
+            return
+        shared_memory.close()
+        if self.is_creator:
+            with suppress(FileNotFoundError):
+                shared_memory.unlink()
+        self.shared_memory = None
 
     @contextmanager
     def get_data(self, current_idx: int):
@@ -267,6 +274,22 @@ class MessageQueue:
 
     def export_handle(self) -> Handle:
         return self.handle
+
+    def close(self) -> None:
+        """Release queue sockets and shared memory; safe to call repeatedly."""
+        for socket_name in ("local_socket", "remote_socket"):
+            socket = getattr(self, socket_name, None)
+            if socket is not None:
+                setattr(self, socket_name, None)
+                socket.close(linger=0)
+
+        buffer = getattr(self, "buffer", None)
+        if buffer is not None:
+            buffer.close()
+            self.buffer = None
+        handle = getattr(self, "handle", None)
+        if handle is not None:
+            handle.buffer = None
 
     @staticmethod
     def create_from_handle(handle: Handle, rank) -> "MessageQueue":

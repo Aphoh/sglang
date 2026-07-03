@@ -41,7 +41,7 @@ def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):
     scheduler.server_args.constrained_json_disable_any_whitespace = False
 
     # Distributed group mocks
-    scheduler.dp_tp_cpu_group = MagicMock()
+    scheduler.dp_tp_group.cpu_group = MagicMock()
     scheduler.dp_tp_group.world_size = 1
     scheduler.dp_tp_group.first_rank = 0
     scheduler.dp_tp_group.is_first_rank = True
