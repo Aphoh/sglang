@@ -26,6 +26,7 @@ from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 SGLANG_RINGBUFFER_WARNING_INTERVAL = int(
     os.environ.get("SGLANG_RINGBUFFER_WARNING_INTERVAL", "60")
 )
+MESSAGE_QUEUE_READY_TIMEOUT = 60.0
 
 logger = logging.getLogger(__name__)
 
@@ -142,10 +143,24 @@ class ShmRingBuffer:
         )
 
     def __del__(self):
-        if hasattr(self, "shared_memory"):
-            self.shared_memory.close()
-            if self.is_creator:
-                self.shared_memory.unlink()
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        """Close this process's mapping and unlink creator-owned storage."""
+        shared_memory = getattr(self, "shared_memory", None)
+        if shared_memory is None:
+            return
+
+        shared_memory.close()
+        if self.is_creator:
+            try:
+                shared_memory.unlink()
+            except FileNotFoundError:
+                pass
+        self.shared_memory = None
 
     @contextmanager
     def get_data(self, current_idx: int):
@@ -268,6 +283,39 @@ class MessageQueue:
     def export_handle(self) -> Handle:
         return self.handle
 
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        """Release queue sockets and shared memory; safe to call repeatedly."""
+        errors = []
+        for socket_name in ("local_socket", "remote_socket"):
+            socket = getattr(self, socket_name, None)
+            if socket is None:
+                continue
+            try:
+                socket.close(linger=0)
+                setattr(self, socket_name, None)
+            except Exception as exc:
+                errors.append(exc)
+
+        buffer = getattr(self, "buffer", None)
+        if buffer is not None:
+            try:
+                buffer.close()
+                self.buffer = None
+                handle = getattr(self, "handle", None)
+                if handle is not None:
+                    handle.buffer = None
+            except Exception as exc:
+                errors.append(exc)
+
+        if errors:
+            raise RuntimeError("Failed to close message queue") from errors[0]
+
     @staticmethod
     def create_from_handle(handle: Handle, rank) -> "MessageQueue":
         self = MessageQueue.__new__(MessageQueue)
@@ -311,17 +359,25 @@ class MessageQueue:
 
         return self
 
-    def wait_until_ready(self):
+    def wait_until_ready(self, timeout: float = MESSAGE_QUEUE_READY_TIMEOUT):
         """This is a collective operation. All processes (including the
         readers and the writer) should call this function.
         """
+        deadline = time.monotonic() + timeout
+
+        def recv(socket):
+            remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1000)
+            if remaining_ms == 0 or socket.poll(timeout=remaining_ms) == 0:
+                raise TimeoutError("message queue readiness handshake timed out")
+            return socket.recv()
+
         if self._is_writer:
             # wait for all readers to connect
 
             # local readers
             for i in range(self.n_local_reader):
                 # wait for subscription messages from all local readers
-                self.local_socket.recv()
+                recv(self.local_socket)
             if self.n_local_reader > 0:
                 # send a message to all local readers
                 # to make sure the publish channel is working
@@ -330,19 +386,19 @@ class MessageQueue:
             # remote readers
             for i in range(self.n_remote_reader):
                 # wait for subscription messages from all remote readers
-                self.remote_socket.recv()
+                recv(self.remote_socket)
             if self.n_remote_reader > 0:
                 # send a message to all remote readers
                 # to make sure the publish channel is working
                 self.remote_socket.send(b"READY")
         elif self._is_local_reader:
             # wait for the writer to send a message
-            recv = self.local_socket.recv()
-            assert recv == b"READY"
+            ready = recv(self.local_socket)
+            assert ready == b"READY"
         elif self._is_remote_reader:
             # wait for the writer to send a message
-            recv = self.remote_socket.recv()
-            assert recv == b"READY"
+            ready = recv(self.remote_socket)
+            assert ready == b"READY"
 
     @contextmanager
     def acquire_write(self):
@@ -497,23 +553,33 @@ class MessageQueue:
         n_reader = group_world_size - 1
         n_local_reader = len(same_node_ranks) - 1
         local_reader_ranks = [i for i in same_node_ranks if i != writer_rank]
-        buffer_io: MessageQueue
-        if group_rank == writer_rank:
-            buffer_io = MessageQueue(
-                n_reader=n_reader,
-                n_local_reader=n_local_reader,
-                local_reader_ranks=local_reader_ranks,
-                max_chunk_bytes=max_chunk_bytes,
-                max_chunks=max_chunks,
-            )
-            handle = buffer_io.export_handle()
-            dist.broadcast_object_list(
-                [handle], src=global_ranks[writer_rank], group=pg
-            )
-        else:
-            recv = [None]
-            dist.broadcast_object_list(recv, src=global_ranks[writer_rank], group=pg)
-            handle = recv[0]  # type: ignore
-            buffer_io = MessageQueue.create_from_handle(handle, group_rank)
-        buffer_io.wait_until_ready()
-        return buffer_io
+        buffer_io: Optional[MessageQueue] = None
+        try:
+            if group_rank == writer_rank:
+                buffer_io = MessageQueue(
+                    n_reader=n_reader,
+                    n_local_reader=n_local_reader,
+                    local_reader_ranks=local_reader_ranks,
+                    max_chunk_bytes=max_chunk_bytes,
+                    max_chunks=max_chunks,
+                )
+                handle = buffer_io.export_handle()
+                dist.broadcast_object_list(
+                    [handle], src=global_ranks[writer_rank], group=pg
+                )
+            else:
+                recv = [None]
+                dist.broadcast_object_list(
+                    recv, src=global_ranks[writer_rank], group=pg
+                )
+                handle = recv[0]  # type: ignore
+                buffer_io = MessageQueue.create_from_handle(handle, group_rank)
+            buffer_io.wait_until_ready()
+            return buffer_io
+        except Exception:
+            if buffer_io is not None:
+                try:
+                    buffer_io.close()
+                except Exception:
+                    logger.exception("Failed to roll back message queue creation")
+            raise

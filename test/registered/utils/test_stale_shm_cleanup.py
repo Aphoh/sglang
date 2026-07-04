@@ -86,11 +86,12 @@ class TestCleanupStaleShm(unittest.TestCase):
         )
 
         buf = ShmRingBuffer(1, 64, 1)
-        try:
-            self.assertEqual(_creator_pid(buf.shared_memory.name), os.getpid())
-        finally:
-            buf.shared_memory.close()
-            buf.shared_memory.unlink()
+        name = buf.shared_memory.name
+        self.assertEqual(_creator_pid(name), os.getpid())
+        buf.close()
+        buf.close()
+        self.assertIsNone(buf.shared_memory)
+        self.assertFalse(os.path.exists(f"/dev/shm/{name}"))
 
     def test_run_by_path_without_sglang_importable(self):
         """ci_install_dependency.sh runs the module by file path before
