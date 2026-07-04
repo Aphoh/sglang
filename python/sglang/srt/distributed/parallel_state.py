@@ -44,6 +44,10 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.cpu_group_lifecycle import (
+    CpuGroupBinding,
+    CpuGroupRecipe,
+)
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -159,6 +163,32 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
+class _MessageQueueCpuGroupParticipant:
+    name = "mq_broadcaster"
+
+    def __init__(self, coordinator: "GroupCoordinator") -> None:
+        self._coordinator = weakref.proxy(coordinator)
+
+    def preflight(self, _group: ProcessGroup) -> None:
+        if self._coordinator.mq_broadcaster is None:
+            raise RuntimeError("message queue is unavailable")
+
+    def suspend(self) -> None:
+        queue = self._coordinator.mq_broadcaster
+        if queue is not None:
+            queue.close()
+            self._coordinator.mq_broadcaster = None
+
+    def resume(self, group: ProcessGroup) -> None:
+        from sglang.srt.distributed.device_communicators.shm_broadcast import (
+            MessageQueue,
+        )
+
+        self._coordinator.mq_broadcaster = MessageQueue.create_from_process_group(
+            group, 1 << 22, 6
+        )
+
+
 @register_custom_op(mutates_args=["tensor"])
 @register_split_op()
 def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
@@ -237,7 +267,6 @@ class GroupCoordinator:
     #   3     |   1  |  3   |     1      |       3
     local_rank: int  # local rank used to assign devices
     rank_in_group: int  # rank inside the group
-    cpu_group: ProcessGroup  # group for CPU communication
     device_group: ProcessGroup  # group for device communication
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_pymscclpp: bool  # a hint of whether to use PyMsccl
@@ -274,13 +303,20 @@ class GroupCoordinator:
         # Set group info
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
-        _register_group(self)
 
         # Set rank info
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
         self.device_group = None
-        self.cpu_group = None
+        active_cpu_group = None
+        active_cpu_ranks = None
+        cpu_group_recipe = CpuGroupRecipe(
+            group_ranks=tuple(tuple(ranks) for ranks in group_ranks),
+            torch_distributed_backend=str(torch_distributed_backend),
+            gloo_timeout=gloo_timeout,
+            model_parallel_timeout=_MODEL_PARALLEL_GROUP_TIMEOUT,
+            recovered_rank=recovered_rank,
+        )
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
         if is_cuda_alike():
@@ -300,7 +336,6 @@ class GroupCoordinator:
 
         for ranks in group_ranks:
             active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
-            active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
@@ -311,12 +346,6 @@ class GroupCoordinator:
                     pg_options=MooncakeBackendOptions(active_ranks, recovered_rank),
                     timeout=subgroup_timeout,
                 )
-                cpu_group = torch.distributed.new_group(
-                    ranks,
-                    backend="mooncake-cpu",
-                    pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank),
-                    timeout=subgroup_timeout,
-                )
             else:
                 pg_options = get_torch_distributed_pg_options(group_name)
                 device_group = torch.distributed.new_group(
@@ -325,22 +354,24 @@ class GroupCoordinator:
                     pg_options=pg_options,
                     timeout=subgroup_timeout,
                 )
-                # a group with `gloo` backend, to allow direct coordination
-                # between processes through the CPU.
-                cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo", timeout=gloo_timeout
-                )
+            cpu_group, active_ranks_cpu = cpu_group_recipe.create_group(tuple(ranks))
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
                 self.rank_in_group = ranks.index(self.rank)
                 self.device_group = device_group
-                self.cpu_group = cpu_group
                 self.active_ranks = active_ranks
-                self.active_ranks_cpu = active_ranks_cpu
+                active_cpu_group = cpu_group
+                active_cpu_ranks = active_ranks_cpu
 
-        assert self.cpu_group is not None
         assert self.device_group is not None
+        assert active_cpu_group is not None and active_cpu_ranks is not None
+        self._cpu_group_binding = CpuGroupBinding(
+            name=self.unique_name,
+            recipe=cpu_group_recipe,
+            group=active_cpu_group,
+            active_ranks=active_cpu_ranks,
+        )
 
         # Import communicators
         self.use_pynccl = use_pynccl
@@ -460,22 +491,42 @@ class GroupCoordinator:
         if use_npu_communicator and self.world_size > 1:
             self.npu_communicator = NpuCommunicator(group=self.device_group)
 
-        # Create message queue
-        from sglang.srt.distributed.device_communicators.shm_broadcast import (
-            MessageQueue,
-        )
+        self.mq_broadcaster: Optional[Any] = None
+        if use_message_queue_broadcaster and self.world_size > 1:
+            participant = _MessageQueueCpuGroupParticipant(self)
+            self._cpu_group_binding.register_participant(participant)
+            if not recovered_rank:
+                participant.resume(self.cpu_group)
 
-        self.mq_broadcaster: Optional[MessageQueue] = None
-        if use_message_queue_broadcaster and self.world_size > 1 and not recovered_rank:
-            # Recovered ranks create their mq_broadcaster in elastic_ep.py
-            self.mq_broadcaster = MessageQueue.create_from_process_group(
-                self.cpu_group, 1 << 22, 6
-            )
+        # Checkpoint-aware implementations replace their blocker with a participant.
+        for name, resource in (
+            ("pynccl_comm", self.pynccl_comm),
+            ("pymscclpp_comm", self.pymscclpp_comm),
+            ("ca_comm", self.ca_comm),
+            ("qr_comm", self.qr_comm),
+            ("torch_symm_mem_comm", self.torch_symm_mem_comm),
+        ):
+            if resource is not None:
+                self._cpu_group_binding.add_blocker(name)
+        _register_group(self)
+
+    @property
+    def cpu_group(self) -> ProcessGroup:
+        return self._cpu_group_binding.group
+
+    @property
+    def active_ranks_cpu(self) -> torch.Tensor:
+        return self._cpu_group_binding.active_ranks
+
+    @property
+    def cpu_group_lifecycle(self) -> CpuGroupBinding:
+        return self._cpu_group_binding
 
     def __repr__(self):
         return (
             f"ranks={self.ranks} rank={self.rank} local_rank={self.local_rank} use_pynccl={self.use_pynccl} "
-            f"device_group={self.device_group} cpu_group={self.cpu_group} unique_name={self.unique_name} "
+            f"device_group={self.device_group} cpu_group_state={self._cpu_group_binding.state.name} "
+            f"unique_name={self.unique_name} "
             f"world_size={self.world_size} rank_in_group={self.rank_in_group}"
         )
 
@@ -1226,18 +1277,19 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return obj
+        cpu_group = self.cpu_group
         if self.mq_broadcaster is not None:
             assert src == 0, "Message queue broadcaster only supports src=0"
             return self.mq_broadcaster.broadcast_object(obj)
         if self.rank_in_group == src:
             torch.distributed.broadcast_object_list(
-                [obj], src=self.ranks[src], group=self.cpu_group
+                [obj], src=self.ranks[src], group=cpu_group
             )
             return obj
         else:
             recv = [None]
             torch.distributed.broadcast_object_list(
-                recv, src=self.ranks[src], group=self.cpu_group
+                recv, src=self.ranks[src], group=cpu_group
             )
             return recv[0]
 
@@ -1583,20 +1635,17 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        _groups.pop(self.unique_name, None)
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
-        if self.cpu_group is not None:
-            torch.distributed.destroy_process_group(self.cpu_group)
-            self.cpu_group = None
+        self._cpu_group_binding.close()
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
         if self.pymscclpp_comm is not None:
             self.pymscclpp_comm.destroy()
         if self.ca_comm is not None:
             self.ca_comm = None
-        if self.mq_broadcaster is not None:
-            self.mq_broadcaster = None
 
 
 _WORLD: Optional[GroupCoordinator] = None
