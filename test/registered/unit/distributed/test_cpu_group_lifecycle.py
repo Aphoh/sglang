@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import socket
 import sys
 import time
 import types
@@ -21,6 +20,7 @@ from sglang.srt.distributed.cpu_group_lifecycle import (
     CpuGroupState,
     CpuGroupTransaction,
 )
+from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
@@ -43,7 +43,6 @@ class _Participant:
 
     def __init__(self, *, fail_resume=False):
         self.fail_resume = fail_resume
-        self.group = None
         self.suspend_calls = 0
 
     def preflight(self, _group):
@@ -51,10 +50,8 @@ class _Participant:
 
     def suspend(self):
         self.suspend_calls += 1
-        self.group = None
 
-    def resume(self, group):
-        self.group = group
+    def resume(self, _group):
         if self.fail_resume:
             raise RuntimeError("attach failed")
 
@@ -72,6 +69,7 @@ def _transaction(*, participant=None, consensus=_local_consensus):
         active_ranks=torch.ones(1, dtype=torch.int32),
     )
     if participant is not None:
+        binding.add_blocker(participant.name)
         binding.register_participant(participant)
     destroyed = []
     transaction = CpuGroupTransaction(
@@ -93,10 +91,6 @@ def test_attach_failure_is_fail_closed_and_cleans_candidate():
         participant=participant
     )
 
-    with pytest.raises(CpuGroupLifecycleError, match="external holders"):
-        transaction.suspend()
-    assert destroyed == []
-    binding.mark_external_holders_audited()
     transaction.suspend()
     assert destroyed == [old_group]
 
@@ -104,11 +98,9 @@ def test_attach_failure_is_fail_closed_and_cleans_candidate():
         transaction.resume()
 
     assert destroyed == [old_group, candidate]
-    assert transaction.state is CpuGroupState.FAILED
-    assert binding.state is CpuGroupState.FAILED
-    assert binding.generation == 0
+    assert binding.state is CpuGroupState.TERMINAL
     assert participant.suspend_calls == 2
-    with pytest.raises(CpuGroupLifecycleError, match="FAILED"):
+    with pytest.raises(CpuGroupLifecycleError, match="TERMINAL"):
         _ = binding.group
 
 
@@ -121,14 +113,13 @@ def test_rank_local_create_failure_requires_restart_and_skips_group_teardown():
     binding, transaction, destroyed, old_group, _candidate = _transaction(
         consensus=peer_fails
     )
-    binding.mark_external_holders_audited()
     transaction.suspend()
 
     with pytest.raises(CpuGroupLifecycleError, match="restart required"):
         transaction.resume()
     assert destroyed == [old_group]
 
-    binding.close(destroyed.append)
+    binding.close()
     assert destroyed == [old_group]
     assert binding.state is CpuGroupState.CLOSED
 
@@ -211,14 +202,13 @@ def _run_lifecycle_rank(rank, port):
             group_name="renew_full",
             use_message_queue_broadcaster=True,
         )
+        coordinators.append(full)
         singleton = coordinator(group_ranks=[[0], [1]], group_name="renew_singleton")
-        coordinators.extend((singleton, full))
+        coordinators.append(singleton)
 
         world = dist.group.WORLD
         device_groups = (full.device_group, singleton.device_group)
         bindings = [full.cpu_group_lifecycle, singleton.cpu_group_lifecycle]
-        for binding in bindings:
-            binding.mark_external_holders_audited()
         if rank:
             bindings.reverse()  # Transaction order must not depend on callers.
         transaction = CpuGroupTransaction(bindings)
@@ -226,17 +216,14 @@ def _run_lifecycle_rank(rank, port):
         old_cpu = full.cpu_group
         if rank == 0:
             full.cpu_group_lifecycle.add_blocker("rank_zero_blocker")
-        try:
+        with pytest.raises(CpuGroupLifecycleError) as exc_info:
             transaction.suspend()
-        except CpuGroupLifecycleError as exc:
-            assert "rank 0" in str(exc)
-            assert "rank_zero_blocker" in str(exc)
-        else:
-            raise AssertionError("one-rank blocker did not stop every rank")
+        assert "rank 0" in str(exc_info.value)
+        assert "rank_zero_blocker" in str(exc_info.value)
         if rank == 0:
             full.cpu_group_lifecycle.remove_blocker("rank_zero_blocker")
 
-        assert transaction.state is CpuGroupState.ACTIVE
+        assert all(binding.state is CpuGroupState.ACTIVE for binding in bindings)
         assert full.cpu_group is old_cpu
         _assert_full_group_collective(full.cpu_group, rank, 0)
 
@@ -248,21 +235,18 @@ def _run_lifecycle_rank(rank, port):
             assert full.broadcast_object(payload) == {"cycle": cycle}
 
             transaction.suspend()
-            assert transaction.state is CpuGroupState.SUSPENDED
+            assert all(binding.state is CpuGroupState.SUSPENDED for binding in bindings)
             assert dist.is_initialized() and dist.group.WORLD is world
             assert (full.device_group, singleton.device_group) == device_groups
-            dist.barrier(group=world)
             assert old_queue.local_socket is None
             assert old_queue.remote_socket is None
             assert old_queue.buffer is None
             old_queue.close()  # Explicit resource cleanup must be idempotent.
 
             transaction.resume()
-            assert transaction.state is CpuGroupState.ACTIVE
+            assert all(binding.state is CpuGroupState.ACTIVE for binding in bindings)
             assert full.cpu_group is not old_groups[0]
             assert singleton.cpu_group is not old_groups[1]
-            assert full.cpu_group_generation == cycle
-            assert singleton.cpu_group_generation == cycle
             assert full.mq_broadcaster is not None
             assert full.mq_broadcaster is not old_queue
             _assert_full_group_collective(full.cpu_group, rank, cycle)
@@ -271,20 +255,14 @@ def _run_lifecycle_rank(rank, port):
             dist.all_reduce(singleton_value, group=singleton.cpu_group)
             assert singleton_value.item() == rank
     finally:
-        for coordinator in coordinators:
+        for coordinator in reversed(coordinators):
             coordinator.destroy()
         if dist.is_initialized():
             dist.destroy_process_group()
 
 
-def _free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def test_two_rank_gloo_lifecycle_is_converged_and_repeatable():
-    port = _free_port()
+    port = get_free_port()
     context = mp.spawn(_run_lifecycle_rank, args=(port,), nprocs=2, join=False)
     deadline = time.monotonic() + _PROCESS_TIMEOUT
     try:

@@ -23,6 +23,7 @@ class CpuGroupState(Enum):
     SUSPENDED = auto()
     RESTORING = auto()
     FAILED = auto()
+    TERMINAL = auto()
     CLOSED = auto()
 
 
@@ -54,7 +55,7 @@ class CpuGroupRecipe:
     def create_group(self, ranks: tuple[int, ...]) -> tuple[ProcessGroup, torch.Tensor]:
         """Create one subgroup while preserving the caller's global order."""
         ranks_active = torch.ones(len(ranks), dtype=torch.int32)
-        if "mooncake" in str(self.torch_distributed_backend):
+        if "mooncake" in self.torch_distributed_backend:
             from mooncake.ep import MooncakeBackendOptions
 
             group = dist.new_group(
@@ -96,21 +97,13 @@ class CpuGroupBinding:
         self.recipe = recipe
         self._group: ProcessGroup | None = group
         self._active_ranks: torch.Tensor | None = active_ranks
-        self._pending: tuple[ProcessGroup, torch.Tensor] | None = None
         self._participants: dict[str, CpuGroupParticipant] = {}
         self._blockers: set[str] = set()
-        self._external_holders_audited = False
-        self._terminal_failure = False
         self._state = CpuGroupState.ACTIVE
-        self._generation = 0
 
     @property
     def state(self) -> CpuGroupState:
         return self._state
-
-    @property
-    def generation(self) -> int:
-        return self._generation
 
     @property
     def group(self) -> ProcessGroup:
@@ -134,6 +127,7 @@ class CpuGroupBinding:
         if not participant.name or participant.name in self._participants:
             raise ValueError(f"duplicate or empty participant: {participant.name!r}")
         self._participants[participant.name] = participant
+        self._blockers.discard(participant.name)
 
     def add_blocker(self, name: str) -> None:
         if not name:
@@ -143,22 +137,15 @@ class CpuGroupBinding:
     def remove_blocker(self, name: str) -> None:
         self._blockers.discard(name)
 
-    def mark_external_holders_audited(self) -> None:
-        """Confirm that no unregistered code retains this binding's group."""
-        if self._state is not CpuGroupState.ACTIVE:
-            raise CpuGroupLifecycleError("holder audits require an active CPU group")
-        self._external_holders_audited = True
-
-    def manifest(self) -> tuple[object, ...]:
+    def _manifest(self) -> tuple[object, ...]:
         return (
             self.name,
             self.recipe,
             tuple(sorted(self._participants)),
             tuple(sorted(self._blockers)),
-            self._external_holders_audited,
         )
 
-    def close(self, destroy_group: DestroyGroup | None = None) -> None:
+    def close(self) -> None:
         """Destroy held groups during ordinary coordinator teardown."""
         if self._state is CpuGroupState.CLOSED:
             return
@@ -170,33 +157,21 @@ class CpuGroupBinding:
                 errors.append(f"{participant.name}: {_format_error(exc)}")
 
         # Divergent process groups can only be cleaned safely by process exit.
-        if self._terminal_failure:
-            self._group = self._active_ranks = self._pending = None
+        if self._state is CpuGroupState.TERMINAL:
+            self._group = self._active_ranks = None
             self._state = CpuGroupState.CLOSED
             if errors:
                 raise CpuGroupLifecycleError("; ".join(errors))
             return
 
-        destroy = destroy_group or dist.destroy_process_group
         current_group = self._group
         if current_group is not None:
             try:
-                destroy(current_group)
+                dist.destroy_process_group(current_group)
             except Exception as exc:
                 errors.append(_format_error(exc))
             else:
                 self._group = self._active_ranks = None
-
-        pending_group = self._pending[0] if self._pending is not None else None
-        if pending_group is current_group and self._group is None:
-            self._pending = None
-        elif pending_group is not None and pending_group is not current_group:
-            try:
-                destroy(pending_group)
-            except Exception as exc:
-                errors.append(_format_error(exc))
-            else:
-                self._pending = None
 
         if errors:
             self._state = CpuGroupState.FAILED
@@ -207,10 +182,6 @@ class CpuGroupBinding:
         assert self._group is not None
         if self._group is dist.group.WORLD:
             raise CpuGroupLifecycleError(f"CPU group {self.name} is the control group")
-        if not self._external_holders_audited:
-            raise CpuGroupLifecycleError(
-                f"CPU group {self.name} external holders were not audited"
-            )
         if self._blockers:
             blockers = ", ".join(sorted(self._blockers))
             raise CpuGroupLifecycleError(
@@ -240,21 +211,15 @@ class CpuGroupTransaction:
         consensus: Consensus | None = None,
     ) -> None:
         self._bindings = tuple(bindings)
-        self._rank = rank
+        self._rank = dist.get_rank() if rank is None else rank
         self._create = create_group or (
             lambda recipe, group_rank: recipe.create_for_rank(group_rank)
         )
         self._destroy = destroy_group or dist.destroy_process_group
         self._consensus = consensus or self._distributed_consensus
-        self._state = CpuGroupState.ACTIVE
-
-    @property
-    def state(self) -> CpuGroupState:
-        return self._state
 
     def suspend(self) -> None:
         bindings = self._preflight(CpuGroupState.ACTIVE, "suspend")
-        self._state = CpuGroupState.SUSPENDING
         for binding in bindings:
             binding._state = CpuGroupState.SUSPENDING
         for binding in bindings:
@@ -267,46 +232,33 @@ class CpuGroupTransaction:
                 f"suspend.{binding.name}.group",
                 partial(self._suspend, binding),
             )
-        self._state = CpuGroupState.SUSPENDED
 
     def resume(self) -> None:
         bindings = self._preflight(CpuGroupState.SUSPENDED, "resume")
-        self._state = CpuGroupState.RESTORING
         for binding in bindings:
             binding._state = CpuGroupState.RESTORING
-        assert self._rank is not None
-        created: list[CpuGroupBinding] = []
+        candidates: dict[CpuGroupBinding, tuple[ProcessGroup, torch.Tensor]] = {}
         attempted: list[CpuGroupParticipant] = []
         try:
             for binding in bindings:
-                self._exchange(
-                    f"resume.{binding.name}.group",
-                    partial(self._restore, binding),
-                )
-                created.append(binding)
+                candidates[binding] = self._create_candidate(binding)
             for binding in bindings:
-                assert binding._pending is not None
-                group = binding._pending[0]
+                group = candidates[binding][0]
                 for participant in binding._ordered_participants():
                     attempted.append(participant)
                     self._exchange(
                         f"resume.{binding.name}.participant.{participant.name}",
                         partial(participant.resume, group),
                     )
-            self._exchange("resume.commit", lambda: None)
         except Exception as exc:
-            errors = self._cleanup_restore(tuple(created), attempted)
+            errors = self._cleanup_restore(candidates, attempted)
             message = str(exc)
             if errors:
                 message += "; restore cleanup: " + "; ".join(errors)
             raise CpuGroupLifecycleError(message) from exc
         for binding in bindings:
-            assert binding._pending is not None
-            binding._group, binding._active_ranks = binding._pending
-            binding._pending = None
-            binding._generation += 1
+            binding._group, binding._active_ranks = candidates[binding]
             binding._state = CpuGroupState.ACTIVE
-        self._state = CpuGroupState.ACTIVE
 
     def _preflight(
         self, expected: CpuGroupState, operation: str
@@ -314,15 +266,9 @@ class CpuGroupTransaction:
         bindings = tuple(sorted(self._bindings, key=lambda binding: binding.name))
 
         def local_manifest() -> tuple[object, ...]:
-            if self._state is not expected:
-                raise CpuGroupLifecycleError(
-                    f"cannot {operation} from {self._state.name}"
-                )
             names = [binding.name for binding in bindings]
             if len(names) != len(set(names)):
                 raise CpuGroupLifecycleError("CPU group names must be unique")
-            if self._rank is None:
-                self._rank = dist.get_rank()
             for binding in bindings:
                 if binding.state is not expected:
                     raise CpuGroupLifecycleError(
@@ -331,7 +277,7 @@ class CpuGroupTransaction:
                     )
                 if operation == "suspend":
                     binding._preflight_suspend()
-            return tuple(binding.manifest() for binding in bindings)
+            return tuple(binding._manifest() for binding in bindings)
 
         manifests = self._exchange(
             f"{operation}.preflight", local_manifest, mutate_started=False
@@ -387,13 +333,22 @@ class CpuGroupTransaction:
         binding._group = None
         binding._state = CpuGroupState.SUSPENDED
 
-    def _restore(self, binding: CpuGroupBinding) -> None:
-        assert self._rank is not None
-        binding._pending = self._create(binding.recipe, self._rank)
+    def _create_candidate(
+        self, binding: CpuGroupBinding
+    ) -> tuple[ProcessGroup, torch.Tensor]:
+        candidate = None
+
+        def create() -> None:
+            nonlocal candidate
+            candidate = self._create(binding.recipe, self._rank)
+
+        self._exchange(f"resume.{binding.name}.group", create)
+        assert candidate is not None
+        return candidate
 
     def _cleanup_restore(
         self,
-        bindings: tuple[CpuGroupBinding, ...],
+        candidates: dict[CpuGroupBinding, tuple[ProcessGroup, torch.Tensor]],
         attempted: list[CpuGroupParticipant],
     ) -> list[str]:
         errors = []
@@ -402,10 +357,7 @@ class CpuGroupTransaction:
                 participant.suspend()
             except Exception as exc:
                 errors.append(f"{participant.name}: {_format_error(exc)}")
-        for binding in reversed(bindings):
-            if binding._pending is None:
-                continue
-            group, binding._pending = binding._pending[0], None
+        for binding, (group, _) in reversed(candidates.items()):
             try:
                 self._destroy(group)
             except Exception as exc:
@@ -413,7 +365,5 @@ class CpuGroupTransaction:
         return errors
 
     def _fail(self) -> None:
-        self._state = CpuGroupState.FAILED
         for binding in self._bindings:
-            binding._terminal_failure = True
-            binding._state = CpuGroupState.FAILED
+            binding._state = CpuGroupState.TERMINAL

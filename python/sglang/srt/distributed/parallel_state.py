@@ -46,7 +46,6 @@ from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.cpu_group_lifecycle import (
     CpuGroupBinding,
-    CpuGroupParticipant,
     CpuGroupRecipe,
 )
 from sglang.srt.distributed.utils import set_global_tcp_store
@@ -168,23 +167,26 @@ class _MessageQueueCpuGroupParticipant:
     name = "mq_broadcaster"
 
     def __init__(self, coordinator: "GroupCoordinator") -> None:
-        self._coordinator = weakref.ref(coordinator)
-
-    def _owner(self) -> "GroupCoordinator":
-        owner = self._coordinator()
-        if owner is None:
-            raise RuntimeError("GroupCoordinator was destroyed")
-        return owner
+        self._coordinator = weakref.proxy(coordinator)
 
     def preflight(self, _group: ProcessGroup) -> None:
-        if self._owner().mq_broadcaster is None:
+        if self._coordinator.mq_broadcaster is None:
             raise RuntimeError("message queue is unavailable")
 
     def suspend(self) -> None:
-        self._owner()._close_message_queue()
+        queue = self._coordinator.mq_broadcaster
+        if queue is not None:
+            queue.close()
+            self._coordinator.mq_broadcaster = None
 
     def resume(self, group: ProcessGroup) -> None:
-        self._owner()._create_message_queue(group)
+        from sglang.srt.distributed.device_communicators.shm_broadcast import (
+            MessageQueue,
+        )
+
+        self._coordinator.mq_broadcaster = MessageQueue.create_from_process_group(
+            group, 1 << 22, 6
+        )
 
 
 @register_custom_op(mutates_args=["tensor"])
@@ -491,9 +493,10 @@ class GroupCoordinator:
 
         self.mq_broadcaster: Optional[Any] = None
         if use_message_queue_broadcaster and self.world_size > 1:
+            participant = _MessageQueueCpuGroupParticipant(self)
+            self._cpu_group_binding.register_participant(participant)
             if not recovered_rank:
-                self._create_message_queue(self.cpu_group)
-            self.register_cpu_group_participant(_MessageQueueCpuGroupParticipant(self))
+                participant.resume(self.cpu_group)
 
         # Checkpoint-aware implementations replace their blocker with a participant.
         for name, resource in (
@@ -516,30 +519,8 @@ class GroupCoordinator:
         return self._cpu_group_binding.active_ranks
 
     @property
-    def cpu_group_generation(self) -> int:
-        return self._cpu_group_binding.generation
-
-    @property
     def cpu_group_lifecycle(self) -> CpuGroupBinding:
         return self._cpu_group_binding
-
-    def register_cpu_group_participant(self, participant: CpuGroupParticipant) -> None:
-        self._cpu_group_binding.register_participant(participant)
-        self._cpu_group_binding.remove_blocker(participant.name)
-
-    def _create_message_queue(self, group: ProcessGroup) -> None:
-        from sglang.srt.distributed.device_communicators.shm_broadcast import (
-            MessageQueue,
-        )
-
-        queue = MessageQueue.create_from_process_group(group, 1 << 22, 6)
-        self.mq_broadcaster = queue
-
-    def _close_message_queue(self) -> None:
-        queue = self.mq_broadcaster
-        if queue is not None:
-            queue.close()
-            self.mq_broadcaster = None
 
     def __repr__(self):
         return (
@@ -1665,8 +1646,6 @@ class GroupCoordinator:
             self.pymscclpp_comm.destroy()
         if self.ca_comm is not None:
             self.ca_comm = None
-        if self.mq_broadcaster is not None:
-            self.mq_broadcaster = None
 
 
 _WORLD: Optional[GroupCoordinator] = None
