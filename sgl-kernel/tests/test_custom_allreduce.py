@@ -1,6 +1,5 @@
 import ctypes
 import multiprocessing as mp
-import random
 import socket
 import unittest
 from typing import Any, List, Optional
@@ -63,6 +62,82 @@ def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes)
         if meta_ptrs:
             TestCustomAllReduce.free_shared_buffer(meta_ptrs, group)
 
+        dist.destroy_process_group(group=group)
+
+
+def _run_all_gather_worker(world_size, rank, distributed_init_port):
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{distributed_init_port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    group = dist.group.WORLD
+    max_bytes = 1 << 20
+    workspace_ptrs = []
+
+    try:
+        workspace_bytes = custom_ops.custom_all_gather_workspace_size(
+            max_bytes, world_size
+        )
+        workspace_ptrs = TestCustomAllReduce.create_shared_buffer(
+            workspace_bytes, group=group
+        )
+        anchor = torch.empty(0, device=device)
+        custom_ops.custom_all_gather_initialize(
+            anchor, workspace_ptrs[rank], max_bytes, world_size
+        )
+        dist.barrier(group=group)
+
+        for size in (1, 2560, 65536):
+            for dtype in (torch.float32, torch.float16, torch.bfloat16):
+                inp = torch.full((size,), rank + 1, dtype=dtype, device=device)
+                actual = torch.empty(size * world_size, dtype=dtype, device=device)
+                expected = torch.empty_like(actual)
+                ticket = torch.empty(1, dtype=torch.uint64, device=device)
+
+                custom_ops.custom_all_gather(
+                    inp, actual, ticket, workspace_ptrs, rank, max_bytes
+                )
+                dist.all_gather_into_tensor(expected, inp, group=group)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        graph_input = torch.empty(2560, dtype=torch.bfloat16, device=device)
+        graph_output = torch.empty(
+            2560 * world_size, dtype=torch.bfloat16, device=device
+        )
+        graph_ticket = torch.empty(1, dtype=torch.uint64, device=device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            custom_ops.custom_all_gather(
+                graph_input,
+                graph_output,
+                graph_ticket,
+                workspace_ptrs,
+                rank,
+                max_bytes,
+            )
+        for value in (7, 11):
+            graph_input.fill_(rank + value)
+            dist.barrier(group=group)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            expected = torch.cat(
+                [
+                    torch.full_like(graph_input, source_rank + value)
+                    for source_rank in range(world_size)
+                ]
+            )
+            torch.testing.assert_close(graph_output, expected, rtol=0, atol=0)
+
+        assert custom_ops.custom_all_gather_status(
+            anchor, workspace_ptrs[rank], max_bytes, world_size
+        ) == [0, 0, 0, 0]
+    finally:
+        if workspace_ptrs:
+            TestCustomAllReduce.free_shared_buffer(workspace_ptrs, group)
         dist.destroy_process_group(group=group)
 
 
@@ -179,6 +254,11 @@ class TestCustomAllReduce(unittest.TestCase):
                 world_size, _run_correctness_worker, target_args=(self.test_sizes,)
             )
             print(f"custom allreduce tp = {world_size}: OK")
+
+    def test_all_gather_correctness(self):
+        if torch.cuda.device_count() < 2:
+            self.skipTest("custom all-gather requires two CUDA devices")
+        multi_process_parallel(2, _run_all_gather_worker)
 
 
 if __name__ == "__main__":
