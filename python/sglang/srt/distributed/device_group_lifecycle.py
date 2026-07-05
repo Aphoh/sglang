@@ -56,7 +56,7 @@ class DefaultDeviceGroupTransaction:
     def state(self) -> DeviceGroupState:
         return self._state
 
-    def suspend(self) -> None:
+    def preflight(self) -> tuple[DeviceGroupBorrower, ...]:
         if self._state is not DeviceGroupState.ACTIVE:
             raise DeviceGroupLifecycleError(
                 f"cannot suspend device WORLD from {self._state.name}"
@@ -66,12 +66,17 @@ class DefaultDeviceGroupTransaction:
 
         world = dist.group.WORLD
         borrowers = self._preflight(world)
+        self._check_manifest(borrowers)
+        return borrowers
+
+    def suspend(self) -> None:
+        borrowers = self.preflight()
+        world = dist.group.WORLD
         backend = str(dist.get_backend(world))
         rank = dist.get_rank(world)
         world_size = dist.get_world_size(world)
         self._generation += 1
         store_path = f"{self._store_prefix}.{self._generation}"
-        self._check_manifest(borrowers)
         if rank == 0:
             Path(store_path).unlink(missing_ok=True)
         dist.barrier(group=world)
