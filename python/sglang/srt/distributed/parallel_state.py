@@ -299,6 +299,7 @@ class GroupCoordinator:
         group_name: Optional[str] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
         recovered_rank: bool = False,
+        use_checkpointable_collectives: bool = False,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -382,6 +383,16 @@ class GroupCoordinator:
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
+        self.use_checkpointable_collectives = use_checkpointable_collectives
+        if use_checkpointable_collectives and (
+            use_pynccl
+            or use_pymscclpp
+            or not use_custom_allreduce
+            or use_torch_symm_mem_all_reduce
+        ):
+            raise ValueError(
+                "checkpointable collectives require only sgl-kernel communicators"
+            )
 
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
@@ -432,15 +443,30 @@ class GroupCoordinator:
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
-                CAClass = dispatch_custom_allreduce(
-                    group=self.cpu_group,
-                    device=self.device,
-                )
-                self.ca_comm = CAClass(
-                    group=self.cpu_group,
-                    device=self.device,
-                )
+                if use_checkpointable_collectives:
+                    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                        CustomAllreduce,
+                    )
+
+                    self.ca_comm = CustomAllreduce(
+                        group=self.cpu_group,
+                        device=self.device,
+                        lifecycle=self._cpu_group_binding,
+                    )
+                else:
+                    CAClass = dispatch_custom_allreduce(
+                        group=self.cpu_group,
+                        device=self.device,
+                    )
+                    self.ca_comm = CAClass(
+                        group=self.cpu_group,
+                        device=self.device,
+                    )
             except Exception as e:
+                if use_checkpointable_collectives:
+                    raise RuntimeError(
+                        "checkpointable custom all-reduce setup failed"
+                    ) from e
                 logger.warning(
                     f"Setup Custom allreduce failed with {e}. To silence this "
                     "warning, specify --disable-custom-all-reduce explicitly."
@@ -466,6 +492,19 @@ class GroupCoordinator:
             self.torch_symm_mem_comm = TorchSymmMemCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+            )
+
+        self.ag_comm: Optional[Any] = None
+        if use_checkpointable_collectives and self.world_size > 1:
+            from sglang.srt.distributed.device_communicators.renewable_all_gather import (
+                RenewableAllGather,
+            )
+
+            assert self.ca_comm is not None
+            self.ag_comm = RenewableAllGather(
+                self._cpu_group_binding,
+                self.device,
+                max_bytes=self.ca_comm.max_size,
             )
 
         # Create communicator for other hardware backends
@@ -684,6 +723,11 @@ class GroupCoordinator:
             and self.ca_comm.should_custom_ar(input_)
         ):
             outplace_all_reduce_method = "ca"
+        elif self.use_checkpointable_collectives:
+            raise RuntimeError(
+                "checkpointable all-reduce does not support "
+                f"shape={tuple(input_.shape)} dtype={input_.dtype}"
+            )
         elif (
             self.qr_comm is not None
             and not self.qr_comm.disabled
@@ -1019,6 +1063,16 @@ class GroupCoordinator:
             else:
                 ca_comm.all_gather_unreg(input, out=output, dim=0)
                 return
+
+        if self.ag_comm is not None:
+            if self.ag_comm.should_all_gather(input, output):
+                self.ag_comm.all_gather(input, output)
+                return
+            raise RuntimeError(
+                "checkpointable all-gather does not support "
+                f"input={tuple(input.shape)} output={tuple(output.shape)} "
+                f"dtype={input.dtype}"
+            )
 
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
@@ -1646,6 +1700,9 @@ class GroupCoordinator:
             self.pymscclpp_comm.destroy()
         if self.ca_comm is not None:
             self.ca_comm = None
+        if self.ag_comm is not None:
+            self.ag_comm.close()
+            self.ag_comm = None
 
 
 _WORLD: Optional[GroupCoordinator] = None
@@ -1686,7 +1743,19 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
+    use_checkpointable_collectives: bool = False,
 ) -> GroupCoordinator:
+    if use_checkpointable_collectives:
+        if use_pynccl is True or use_mscclpp_allreduce is True:
+            raise ValueError(
+                "checkpointable collectives cannot use external communicators"
+            )
+        if use_torch_symm_mem_allreduce is True or use_custom_allreduce is False:
+            raise ValueError("checkpointable collectives require sgl-kernel all-reduce")
+        use_pynccl = False
+        use_mscclpp_allreduce = False
+        use_custom_allreduce = True
+        use_torch_symm_mem_allreduce = False
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
     if use_mscclpp_allreduce is None:
@@ -1711,6 +1780,7 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         recovered_rank=recovered_rank,
+        use_checkpointable_collectives=use_checkpointable_collectives,
     )
 
 

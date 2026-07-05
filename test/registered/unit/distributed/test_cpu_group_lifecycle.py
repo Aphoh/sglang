@@ -104,6 +104,18 @@ def test_attach_failure_is_fail_closed_and_cleans_candidate():
         _ = binding.group
 
 
+def test_registered_participant_is_not_readded_as_a_blocker():
+    participant = _Participant()
+    binding, transaction, destroyed, old_group, _candidate = _transaction()
+    binding.register_participant(participant)
+    binding.add_blocker(participant.name)
+
+    transaction.suspend()
+
+    assert binding.state is CpuGroupState.SUSPENDED
+    assert destroyed == [old_group]
+
+
 def test_rank_local_create_failure_requires_restart_and_skips_group_teardown():
     def peer_fails(phase, payload):
         if phase == "resume.test:0.group":
