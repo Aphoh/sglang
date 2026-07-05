@@ -163,6 +163,12 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
+def registered_groups() -> tuple["GroupCoordinator", ...]:
+    return tuple(
+        group for name in sorted(_groups) if (group := _groups[name]()) is not None
+    )
+
+
 class _MessageQueueCpuGroupParticipant:
     name = "mq_broadcaster"
 
