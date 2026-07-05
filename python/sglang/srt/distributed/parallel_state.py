@@ -189,6 +189,23 @@ class _MessageQueueCpuGroupParticipant:
         )
 
 
+class _CpuDeviceGroupParticipant:
+    name = "device_group"
+
+    def __init__(self, coordinator: "GroupCoordinator") -> None:
+        self._coordinator = weakref.proxy(coordinator)
+
+    def preflight(self, group: ProcessGroup) -> None:
+        if self._coordinator.device_group is not group:
+            raise RuntimeError("device group is not the active CPU group")
+
+    def suspend(self) -> None:
+        self._coordinator.device_group = None
+
+    def resume(self, group: ProcessGroup) -> None:
+        self._coordinator.device_group = group
+
+
 @register_custom_op(mutates_args=["tensor"])
 @register_split_op()
 def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
@@ -300,6 +317,8 @@ class GroupCoordinator:
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
         recovered_rank: bool = False,
         use_checkpointable_collectives: bool = False,
+        device_group_override: Optional[ProcessGroup] = None,
+        create_device_group: bool = True,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -338,7 +357,11 @@ class GroupCoordinator:
         for ranks in group_ranks:
             active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
-            if "mooncake" in torch_distributed_backend:
+            if device_group_override is not None:
+                device_group = device_group_override
+            elif not create_device_group:
+                device_group = None
+            elif "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
 
                 device_group = torch.distributed.new_group(
@@ -360,7 +383,11 @@ class GroupCoordinator:
                 self.ranks = ranks
                 self.world_size = len(ranks)
                 self.rank_in_group = ranks.index(self.rank)
-                self.device_group = device_group
+                self.device_group = device_group or cpu_group
+                self.owns_device_group = (
+                    device_group_override is None and create_device_group
+                )
+                self.device_group_is_cpu_alias = device_group is None
                 self.active_ranks = active_ranks
                 active_cpu_group = cpu_group
                 active_cpu_ranks = active_ranks_cpu
@@ -373,6 +400,10 @@ class GroupCoordinator:
             group=active_cpu_group,
             active_ranks=active_cpu_ranks,
         )
+        if self.device_group_is_cpu_alias:
+            self._cpu_group_binding.register_participant(
+                _CpuDeviceGroupParticipant(self)
+            )
 
         # Import communicators
         self.use_pynccl = use_pynccl
@@ -1690,9 +1721,9 @@ class GroupCoordinator:
 
     def destroy(self):
         _groups.pop(self.unique_name, None)
-        if self.device_group is not None:
+        if self.device_group is not None and self.owns_device_group:
             torch.distributed.destroy_process_group(self.device_group)
-            self.device_group = None
+        self.device_group = None
         self._cpu_group_binding.close()
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
@@ -1714,7 +1745,11 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int], local_rank: int, backend: str, recovered_rank: bool = False
+    ranks: List[int],
+    local_rank: int,
+    backend: str,
+    recovered_rank: bool = False,
+    reuse_device_group: bool = False,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -1729,6 +1764,9 @@ def init_world_group(
         use_npu_communicator=False,
         group_name="world",
         recovered_rank=recovered_rank,
+        device_group_override=(
+            torch.distributed.group.WORLD if reuse_device_group else None
+        ),
     )
 
 
@@ -1744,6 +1782,7 @@ def init_model_parallel_group(
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
     use_checkpointable_collectives: bool = False,
+    reuse_device_group: bool = False,
 ) -> GroupCoordinator:
     if use_checkpointable_collectives:
         if use_pynccl is True or use_mscclpp_allreduce is True:
@@ -1756,12 +1795,19 @@ def init_model_parallel_group(
         use_mscclpp_allreduce = False
         use_custom_allreduce = True
         use_torch_symm_mem_allreduce = False
+        reuse_device_group = True
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
     if use_mscclpp_allreduce is None:
         use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
+    full_world_group = group_ranks == [get_world_group().ranks]
+    singleton_groups = all(len(ranks) == 1 for ranks in group_ranks)
+    if reuse_device_group and not (full_world_group or singleton_groups):
+        raise ValueError(
+            "device-group reuse requires WORLD-equivalent or singleton groups"
+        )
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -1781,6 +1827,12 @@ def init_model_parallel_group(
         group_name=group_name,
         recovered_rank=recovered_rank,
         use_checkpointable_collectives=use_checkpointable_collectives,
+        device_group_override=(
+            get_world_group().device_group
+            if reuse_device_group and full_world_group
+            else None
+        ),
+        create_device_group=not (reuse_device_group and singleton_groups),
     )
 
 

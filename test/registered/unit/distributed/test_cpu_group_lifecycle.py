@@ -215,11 +215,16 @@ def _run_lifecycle_rank(rank, port):
             use_message_queue_broadcaster=True,
         )
         coordinators.append(full)
-        singleton = coordinator(group_ranks=[[0], [1]], group_name="renew_singleton")
+        singleton = coordinator(
+            group_ranks=[[0], [1]],
+            group_name="renew_singleton",
+            create_device_group=False,
+        )
         coordinators.append(singleton)
 
         world = dist.group.WORLD
-        device_groups = (full.device_group, singleton.device_group)
+        full_device_group = full.device_group
+        assert singleton.device_group is singleton.cpu_group
         bindings = [full.cpu_group_lifecycle, singleton.cpu_group_lifecycle]
         if rank:
             bindings.reverse()  # Transaction order must not depend on callers.
@@ -249,7 +254,8 @@ def _run_lifecycle_rank(rank, port):
             transaction.suspend()
             assert all(binding.state is CpuGroupState.SUSPENDED for binding in bindings)
             assert dist.is_initialized() and dist.group.WORLD is world
-            assert (full.device_group, singleton.device_group) == device_groups
+            assert full.device_group is full_device_group
+            assert singleton.device_group is None
             assert old_queue.local_socket is None
             assert old_queue.remote_socket is None
             assert old_queue.buffer is None
@@ -259,6 +265,7 @@ def _run_lifecycle_rank(rank, port):
             assert all(binding.state is CpuGroupState.ACTIVE for binding in bindings)
             assert full.cpu_group is not old_groups[0]
             assert singleton.cpu_group is not old_groups[1]
+            assert singleton.device_group is singleton.cpu_group
             assert full.mq_broadcaster is not None
             assert full.mq_broadcaster is not old_queue
             _assert_full_group_collective(full.cpu_group, rank, cycle)
