@@ -94,6 +94,43 @@ if torch.version.hip is not None:
 
 else:
 
+    def custom_all_gather_workspace_size(max_bytes: int, world_size: int) -> int:
+        return torch.ops.sgl_kernel.custom_all_gather_workspace_size.default(
+            max_bytes, world_size
+        )
+
+    def custom_all_gather_initialize(
+        anchor: torch.Tensor,
+        local_ptr: int,
+        max_bytes: int,
+        world_size: int,
+    ) -> None:
+        torch.ops.sgl_kernel.custom_all_gather_initialize.default(
+            anchor, local_ptr, max_bytes, world_size
+        )
+
+    def custom_all_gather(
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        ticket: torch.Tensor,
+        peer_ptrs: List[int],
+        rank: int,
+        max_bytes: int,
+    ) -> None:
+        torch.ops.sgl_kernel.custom_all_gather.default(
+            inp, out, ticket, peer_ptrs, rank, max_bytes
+        )
+
+    def custom_all_gather_status(
+        anchor: torch.Tensor,
+        local_ptr: int,
+        max_bytes: int,
+        world_size: int,
+    ) -> List[int]:
+        return torch.ops.sgl_kernel.custom_all_gather_status.default(
+            anchor, local_ptr, max_bytes, world_size
+        )
+
     def init_custom_ar(
         ipc_tensors: List[int], rank_data: torch.Tensor, rank: int, full_nvlink: bool
     ) -> int:
