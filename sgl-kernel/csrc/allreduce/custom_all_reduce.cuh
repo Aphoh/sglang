@@ -593,8 +593,13 @@ class CustomAllreduce {
     cudaStreamCaptureStatus status;
     CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
     if (status == cudaStreamCaptureStatusActive) {
-      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
-      graph_unreg_buffers_.push_back(input);
+      auto it = buffers_.find(input);
+      if (it != buffers_.end()) {
+        ptrs = it->second;
+      } else {
+        ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+        graph_unreg_buffers_.push_back(input);
+      }
     } else {
       auto it = buffers_.find(input);
       if (it == buffers_.end())
