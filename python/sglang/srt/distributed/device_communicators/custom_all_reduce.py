@@ -13,10 +13,14 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
+from sglang.srt.distributed.cpu_group_lifecycle import CpuGroupBinding
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
     is_weak_contiguous,
+)
+from sglang.srt.distributed.device_communicators.renewable_vmm import (
+    RenewableVmmBuffer,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -38,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 class CustomAllreduce:
+    name = "ca_comm"
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
     _MAX_CAR_SIZE = 8192 * 1024
     if _is_hip:
@@ -53,6 +58,8 @@ class CustomAllreduce:
         group: ProcessGroup,
         device: Union[int, str, torch.device],
         max_size=_MAX_CAR_SIZE,
+        *,
+        lifecycle: Optional[CpuGroupBinding] = None,
     ) -> None:
         """
         Args:
@@ -68,8 +75,17 @@ class CustomAllreduce:
         self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
         self.original_disabled = True  # To store the original state
         self.use_amd_deterministic_impl = _use_amd_deterministic_impl()
+        self.renewable = lifecycle is not None
+        self._ptr = 0
+        self.meta_memory: RenewableVmmBuffer | None = None
+        self.buffer_memory: RenewableVmmBuffer | None = None
+
+        if self.renewable and not _is_cuda:
+            raise RuntimeError("renewable custom all-reduce requires CUDA")
 
         if not ops.IS_CUSTOM_AR_AVAILABLE:
+            if self.renewable:
+                raise RuntimeError("sgl-kernel custom all-reduce is unavailable")
             # disable because of missing custom allreduce library
             # e.g. in a non-cuda environment
             return
@@ -91,8 +107,12 @@ class CustomAllreduce:
             cls_name="CustomAllreduce",
         )
         if full_nvlink is None:
+            if self.renewable:
+                raise RuntimeError("renewable custom all-reduce requires peer access")
             return  # fail to get nvlink status
 
+        if lifecycle is not None and lifecycle.group is not group:
+            raise ValueError("all-reduce lifecycle is bound to a different group")
         self.group = group
         self.max_size = max_size
         self.rank = rank
@@ -103,24 +123,50 @@ class CustomAllreduce:
             # Buffers memory are owned by this Python class and passed to C++.
             # Meta data composes of two parts: meta data for synchronization and a
             # temporary buffer for storing intermediate allreduce results.
-            self.meta_ptrs = self.create_shared_buffer(
-                ops.meta_size() + max_size, group=group
-            )
-            # This is a pre-registered IPC buffer. In eager mode, input tensors
-            # are first copied into this buffer before allreduce is performed
-            self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
-            # This is a buffer for storing the tuples of pointers pointing to
-            # IPC buffers from all ranks. Each registered tuple has size of
-            # 8*world_size bytes where world_size is at most 8. Allocating 8MB
-            # is enough for 131072 such tuples. The largest model I've seen only
-            # needs less than 10000 of registered tuples.
-            self.rank_data = torch.empty(
-                max_size, dtype=torch.uint8, device=self.device
-            )
-            self._ptr = ops.init_custom_ar(
-                self.meta_ptrs, self.rank_data, rank, self.full_nvlink
-            )
-            ops.register_buffer(self._ptr, self.buffer_ptrs)
+            if lifecycle is not None:
+                lifecycle.add_blocker(self.name)
+            try:
+                if self.renewable:
+                    self.meta_memory = RenewableVmmBuffer(
+                        ops.meta_size() + max_size, group, self.device
+                    )
+                    self.meta_ptrs = list(self.meta_memory.ptrs)
+                else:
+                    self.meta_ptrs = self.create_shared_buffer(
+                        ops.meta_size() + max_size, group=group
+                    )
+                # This is a pre-registered IPC buffer. In eager mode, input tensors
+                # are first copied into this buffer before allreduce is performed
+                if self.renewable:
+                    self.buffer_memory = RenewableVmmBuffer(
+                        max_size, group, self.device
+                    )
+                    self.buffer_ptrs = list(self.buffer_memory.ptrs)
+                else:
+                    self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
+                # This is a buffer for storing the tuples of pointers pointing to
+                # IPC buffers from all ranks. Each registered tuple has size of
+                # 8*world_size bytes where world_size is at most 8. Allocating 8MB
+                # is enough for 131072 such tuples. The largest model I've seen only
+                # needs less than 10000 of registered tuples.
+                self.rank_data = torch.empty(
+                    max_size, dtype=torch.uint8, device=self.device
+                )
+                self._ptr = ops.init_custom_ar(
+                    self.meta_ptrs, self.rank_data, rank, self.full_nvlink
+                )
+                ops.register_buffer(self._ptr, self.buffer_ptrs)
+            except Exception:
+                if self._ptr:
+                    ops.dispose(self._ptr)
+                    self._ptr = 0
+                if self.buffer_memory is not None:
+                    self.buffer_memory.close()
+                if self.meta_memory is not None:
+                    self.meta_memory.close()
+                if lifecycle is not None:
+                    lifecycle.remove_blocker(self.name)
+                raise
         else:
             # meta data buffers need to be "uncached" for signal on MI200
             self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
@@ -142,6 +188,13 @@ class CustomAllreduce:
         self.disabled = False
         self.original_disabled = False  # Ensure original_disabled == disabled
         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        if lifecycle is not None:
+            try:
+                lifecycle.register_participant(self)
+            except Exception:
+                self.close()
+                lifecycle.remove_blocker(self.name)
+                raise
 
     @staticmethod
     def create_shared_buffer(
@@ -190,7 +243,7 @@ class CustomAllreduce:
             yield
         finally:
             self._IS_CAPTURING = False
-            if not self.disabled:
+            if not self.disabled and not self.renewable:
                 self.register_graph_buffers()
 
     def _get_ipc_meta(self, inp: torch.Tensor):
@@ -313,7 +366,9 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self._all_reduce_impl(input, registered=not self.tms_cudagraph)
+                return self._all_reduce_impl(
+                    input, registered=not self.tms_cudagraph and not self.renewable
+                )
             else:
                 # Could be warmup OR piecewise cuda graph split op execution.
                 # In piecewise cuda graph, split ops run eagerly outside the graph
@@ -328,14 +383,63 @@ class CustomAllreduce:
         else:
             return self._all_reduce_impl(input, registered=False)
 
+    def preflight(self, group: ProcessGroup) -> None:
+        if not self._ptr:
+            return
+        assert self.meta_memory is not None and self.buffer_memory is not None
+        if (
+            not self.meta_memory.attached
+            or not self.buffer_memory.attached
+            or self.meta_memory.control_group is not group
+            or self.buffer_memory.control_group is not group
+        ):
+            raise RuntimeError("custom all-reduce is not attached to the CPU group")
+
+    def suspend(self) -> None:
+        if not self._ptr:
+            return
+        assert self.meta_memory is not None and self.buffer_memory is not None
+        torch.cuda.synchronize(self.device)
+        self.buffer_memory.detach()
+        self.meta_memory.detach()
+        self.buffer_memory.set_control_group(None)
+        self.meta_memory.set_control_group(None)
+        self.group = None
+
+    def resume(self, group: ProcessGroup) -> None:
+        if not self._ptr:
+            return
+        if (
+            dist.get_rank(group) != self.rank
+            or dist.get_world_size(group) != self.world_size
+        ):
+            raise RuntimeError("restored all-reduce group geometry changed")
+        assert self.meta_memory is not None and self.buffer_memory is not None
+        self.group = group
+        self.meta_memory.set_control_group(group)
+        self.buffer_memory.set_control_group(group)
+        self.meta_memory.restore()
+        self.buffer_memory.restore()
+        dist.barrier(group=group)
+
     def close(self):
         if not self.disabled and self._ptr:
+            if self.renewable:
+                torch.cuda.synchronize(self.device)
             if ops is not None:
                 ops.dispose(self._ptr)
             if _is_cuda:
-                self.free_shared_buffer(self.meta_ptrs)
-                self.free_shared_buffer(self.buffer_ptrs)
+                if self.renewable:
+                    assert (
+                        self.meta_memory is not None and self.buffer_memory is not None
+                    )
+                    self.buffer_memory.close()
+                    self.meta_memory.close()
+                else:
+                    self.free_shared_buffer(self.meta_ptrs)
+                    self.free_shared_buffer(self.buffer_ptrs)
             self._ptr = 0
+            self.disabled = True
 
     def __del__(self):
         self.close()

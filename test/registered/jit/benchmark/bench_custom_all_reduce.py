@@ -71,7 +71,7 @@ MAX_BYTES = max(MESSAGE_SIZES_BYTES)
 FI_SUPPORTED_WORLD_SIZES = (2, 4, 8)
 # AOT custom_all_reduce (v1) only supports these world sizes.
 AOT_SUPPORTED_WORLD_SIZES = (2, 4, 6, 8)
-PROVIDERS = ["nccl", "aot", "jit", "fi"]
+PROVIDERS = ["nccl", "aot", "aot-renewable", "jit", "fi"]
 WORLD_SIZES = get_benchmark_range(WORLD_SIZES, [2, 4, 8])
 
 # ---------------------------------------------------------------------------
@@ -148,13 +148,20 @@ class JITAllReduceBackend:
 
 
 class AOTAllReduceBackend:
-    def __init__(self) -> None:
+    def __init__(self, *, renewable: bool = False) -> None:
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
         )
 
         device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-        self.comm = CustomAllreduce(_init_cpu_group(), device, max_size=MAX_BYTES)
+        group = _init_cpu_group()
+        lifecycle = ps._WORLD.cpu_group_lifecycle if renewable else None
+        self.comm = CustomAllreduce(
+            group,
+            device,
+            max_size=MAX_BYTES,
+            lifecycle=lifecycle,
+        )
         if self.comm.disabled:
             raise RuntimeError("AOT CustomAllreduce is disabled on this system")
         register_comm_cleanup(self.comm)
@@ -218,6 +225,11 @@ def _init_aot_backend() -> AOTAllReduceBackend:
 
 
 @cache_once
+def _init_renewable_aot_backend() -> AOTAllReduceBackend:
+    return AOTAllReduceBackend(renewable=True)
+
+
+@cache_once
 def _init_fi_backend() -> FlashInferAllReduceBackend:
     return FlashInferAllReduceBackend()
 
@@ -226,6 +238,7 @@ BACKEND_FACTORY = {
     "nccl": _init_nccl_backend,
     "jit": _init_jit_backend,
     "aot": _init_aot_backend,
+    "aot-renewable": _init_renewable_aot_backend,
     "fi": _init_fi_backend,
 }
 
@@ -261,7 +274,7 @@ def benchmark(message_bytes: int, provider: str):
             f"flashinfer trtllm allreduce_fusion needs world_size in "
             f"{FI_SUPPORTED_WORLD_SIZES}"
         )
-    if provider == "aot" and world_size not in AOT_SUPPORTED_WORLD_SIZES:
+    if provider.startswith("aot") and world_size not in AOT_SUPPORTED_WORLD_SIZES:
         marker.skip(
             f"AOT custom_all_reduce needs world_size in " f"{AOT_SUPPORTED_WORLD_SIZES}"
         )
