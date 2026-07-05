@@ -53,7 +53,9 @@ def test_checkpointable_all_gather_fails_closed_for_unsupported_input():
 
 def test_checkpointable_group_disables_external_communicators(monkeypatch):
     constructor = Mock(return_value=object())
+    world = Mock(ranks=[0, 1], device_group=object())
     monkeypatch.setattr(parallel_state, "GroupCoordinator", constructor)
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: world)
 
     parallel_state.init_model_parallel_group(
         [[0, 1]],
@@ -68,6 +70,8 @@ def test_checkpointable_group_disables_external_communicators(monkeypatch):
     assert kwargs["use_custom_allreduce"] is True
     assert kwargs["use_torch_symm_mem_all_reduce"] is False
     assert kwargs["use_checkpointable_collectives"] is True
+    assert kwargs["device_group_override"] is world.device_group
+    assert kwargs["create_device_group"] is True
 
 
 def test_checkpointable_group_rejects_explicit_external_communicator():
@@ -78,4 +82,39 @@ def test_checkpointable_group_rejects_explicit_external_communicator():
             backend="nccl",
             use_pynccl=True,
             use_checkpointable_collectives=True,
+        )
+
+
+def test_singleton_group_can_alias_its_renewable_cpu_group(monkeypatch):
+    constructor = Mock(return_value=object())
+    world = Mock(ranks=[0, 1], device_group=object())
+    monkeypatch.setattr(parallel_state, "GroupCoordinator", constructor)
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: world)
+
+    parallel_state.init_model_parallel_group(
+        [[0], [1]],
+        local_rank=0,
+        backend="nccl",
+        use_pynccl=False,
+        use_custom_allreduce=False,
+        use_mscclpp_allreduce=False,
+        use_torch_symm_mem_allreduce=False,
+        reuse_device_group=True,
+    )
+
+    kwargs = constructor.call_args.kwargs
+    assert kwargs["device_group_override"] is None
+    assert kwargs["create_device_group"] is False
+
+
+def test_device_group_reuse_rejects_partial_subgroup(monkeypatch):
+    world = Mock(ranks=[0, 1, 2, 3], device_group=object())
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: world)
+
+    with pytest.raises(ValueError, match="WORLD-equivalent or singleton"):
+        parallel_state.init_model_parallel_group(
+            [[0, 1], [2, 3]],
+            local_rank=0,
+            backend="nccl",
+            reuse_device_group=True,
         )

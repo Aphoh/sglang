@@ -12,7 +12,6 @@ import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as parallel_state
 from sglang.srt.distributed.cpu_group_lifecycle import CpuGroupTransaction
-from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 
 def main() -> None:
@@ -22,23 +21,20 @@ def main() -> None:
     dist.init_process_group("nccl", device_id=device)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    world = parallel_state.init_world_group(list(range(world_size)), local_rank, "nccl")
+    world = parallel_state.init_world_group(
+        list(range(world_size)), local_rank, "nccl", reuse_device_group=True
+    )
     parallel_state._WORLD = world
 
-    coordinator = GroupCoordinator(
-        group_ranks=[list(range(world_size))],
-        local_rank=local_rank,
-        torch_distributed_backend="nccl",
-        use_pynccl=False,
-        use_pymscclpp=False,
-        use_custom_allreduce=True,
-        use_torch_symm_mem_all_reduce=False,
-        use_hpu_communicator=False,
-        use_xpu_communicator=False,
-        use_npu_communicator=False,
+    coordinator = parallel_state.init_model_parallel_group(
+        [list(range(world_size))],
+        local_rank,
+        "nccl",
         group_name="checkpointable_collective_test",
         use_checkpointable_collectives=True,
     )
+    assert coordinator.device_group is dist.group.WORLD
+    assert not coordinator.owns_device_group
     assert coordinator.pynccl_comm is None
     assert coordinator.ca_comm is not None
     assert coordinator.ag_comm is not None
