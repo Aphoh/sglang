@@ -132,7 +132,8 @@ class CpuGroupBinding:
     def add_blocker(self, name: str) -> None:
         if not name:
             raise ValueError("CPU-group blocker name must not be empty")
-        self._blockers.add(name)
+        if name not in self._participants:
+            self._blockers.add(name)
 
     def remove_blocker(self, name: str) -> None:
         self._blockers.discard(name)
