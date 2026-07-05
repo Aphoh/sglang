@@ -83,6 +83,8 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # Reuse the user-provided distributed timeout for model-parallel subgroup
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
+_CHECKPOINT_ALL_REDUCE_MAX_BYTES = 64 * 1024 * 1024
+_CHECKPOINT_ALL_GATHER_MAX_BYTES = 8 * 1024 * 1024
 
 
 def get_torch_distributed_pg_options(group_name=None):
@@ -488,6 +490,7 @@ class GroupCoordinator:
                     self.ca_comm = CustomAllreduce(
                         group=self.cpu_group,
                         device=self.device,
+                        max_size=_CHECKPOINT_ALL_REDUCE_MAX_BYTES,
                         lifecycle=self._cpu_group_binding,
                     )
                 else:
@@ -541,7 +544,7 @@ class GroupCoordinator:
             self.ag_comm = RenewableAllGather(
                 self._cpu_group_binding,
                 self.device,
-                max_bytes=self.ca_comm.max_size,
+                max_bytes=_CHECKPOINT_ALL_GATHER_MAX_BYTES,
             )
 
         # Create communicator for other hardware backends
@@ -2063,6 +2066,7 @@ def init_distributed_environment(
     timeout: Optional[int] = None,
     moe_a2a_backend: Optional[str] = None,
     recovered_rank: bool = False,
+    enable_criu_checkpoint: bool = False,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
@@ -2133,7 +2137,11 @@ def init_distributed_environment(
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
         _WORLD = init_world_group(
-            ranks, local_rank, backend, recovered_rank=recovered_rank
+            ranks,
+            local_rank,
+            backend,
+            recovered_rank=recovered_rank,
+            reuse_device_group=enable_criu_checkpoint,
         )
     else:
         assert (
@@ -2153,6 +2161,7 @@ def initialize_model_parallel(
     duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
+    enable_criu_checkpoint: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -2253,6 +2262,7 @@ def initialize_model_parallel(
         use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
         group_name="tp",
         recovered_rank=recovered_rank,
+        use_checkpointable_collectives=enable_criu_checkpoint,
     )
 
     if duplicate_tp_group:
@@ -2267,6 +2277,7 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="pdmux_prefill_tp",
             recovered_rank=recovered_rank,
+            reuse_device_group=enable_criu_checkpoint,
         )
         if _TP.pynccl_comm:
             _TP.pynccl_comm.disabled = False
@@ -2289,6 +2300,7 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="dcp",
             recovered_rank=recovered_rank,
+            reuse_device_group=enable_criu_checkpoint,
         )
         if get_tensor_model_parallel_rank() == 0:
             logger.info(
@@ -2334,6 +2346,7 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attn_cp",
             recovered_rank=recovered_rank,
+            reuse_device_group=enable_criu_checkpoint,
         )
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
@@ -2370,6 +2383,7 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
             recovered_rank=recovered_rank,
+            reuse_device_group=enable_criu_checkpoint,
         )
 
     moe_ep_size = expert_model_parallel_size
@@ -2401,6 +2415,7 @@ def initialize_model_parallel(
             backend,
             group_name="moe_dp",
             recovered_rank=recovered_rank,
+            reuse_device_group=enable_criu_checkpoint,
         )
 
     global _MOE_EP
@@ -2428,6 +2443,7 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="moe_ep",
             recovered_rank=recovered_rank,
+            reuse_device_group=enable_criu_checkpoint,
         )
 
     global _MOE_TP
@@ -2456,6 +2472,7 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="moe_tp",
             recovered_rank=recovered_rank,
+            reuse_device_group=enable_criu_checkpoint,
         )
 
     # Build the pipeline model-parallel groups.
@@ -2476,6 +2493,7 @@ def initialize_model_parallel(
         use_custom_allreduce=False,
         group_name="pp",
         recovered_rank=recovered_rank,
+        reuse_device_group=enable_criu_checkpoint,
     )
 
 

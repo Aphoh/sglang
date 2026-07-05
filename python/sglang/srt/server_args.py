@@ -2197,6 +2197,14 @@ class ServerArgs:
         bool,
         "Allow saving memory using release_memory_occupation and resume_memory_occupation",
     ] = False
+    enable_criu_checkpoint: A[
+        bool,
+        "Enable the experimental dense-TP CUDA/CRIU checkpoint lifecycle.",
+    ] = False
+    criu_store_prefix: A[
+        str,
+        "Shared file-store prefix used to recreate process groups after CRIU restore.",
+    ] = "/tmp/sglang-criu"
     enable_weights_cpu_backup: A[
         bool,
         "Save model weights (both main model and draft model, if any) to CPU memory during release_weights_occupation and resume_weights_occupation",
@@ -2572,6 +2580,7 @@ class ServerArgs:
         self._handle_legacy_cp_arguments()
         self._validate_prefill_only_disable_kv_cache_args()
         self._handle_dcp_validation()
+        self._handle_criu_checkpoint_validation()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -3240,6 +3249,34 @@ class ServerArgs:
             f"Please set --attention-backend flashinfer when using --enable-mis. "
             f"Current backends: prefill={prefill_backend}, decode={decode_backend}"
         )
+
+    def _handle_criu_checkpoint_validation(self) -> None:
+        if not self.enable_criu_checkpoint:
+            return
+        unsupported = {
+            "pipeline parallelism": self.pp_size != 1,
+            "data parallelism": self.dp_size != 1,
+            "expert parallelism": self.ep_size != 1,
+            "MoE data parallelism": self.moe_dp_size != 1,
+            "context parallelism": self.attn_cp_size != 1,
+            "decode context parallelism": self.dcp_size != 1,
+            "DP attention": self.enable_dp_attention,
+            "PD multiplexing": self.enable_pdmux,
+            "MoE all-to-all": self.moe_a2a_backend != "none",
+            "PD disaggregation": self.disaggregation_mode != "null",
+            "MSCCL++": self.enable_mscclpp,
+            "symmetric memory": self.enable_symm_mem,
+            "torch symmetric memory": self.enable_torch_symm_mem,
+            "disabled custom all-reduce": self.disable_custom_all_reduce,
+        }
+        enabled = [name for name, value in unsupported.items() if value]
+        if enabled:
+            raise ValueError(
+                "--enable-criu-checkpoint currently supports dense TP only; "
+                f"unsupported: {', '.join(enabled)}"
+            )
+        if not self.criu_store_prefix:
+            raise ValueError("--criu-store-prefix must not be empty")
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """

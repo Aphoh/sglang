@@ -9,10 +9,10 @@ import argparse
 import ctypes
 import os
 
+import sgl_kernel.allreduce as custom_ops
 import torch
 import torch.distributed as dist
 
-import sgl_kernel.allreduce as custom_ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 
 

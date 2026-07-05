@@ -1240,6 +1240,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 timeout=self.server_args.dist_timeout,
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
                 recovered_rank=self.server_args.elastic_ep_rejoin,
+                enable_criu_checkpoint=self.server_args.enable_criu_checkpoint,
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
@@ -1252,6 +1253,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 enable_symm_mem=self.server_args.enable_symm_mem,
                 recovered_rank=self.server_args.elastic_ep_rejoin,
+                enable_criu_checkpoint=self.server_args.enable_criu_checkpoint,
             )
             initialize_dp_attention(
                 server_args=self.server_args,

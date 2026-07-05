@@ -1241,6 +1241,12 @@ class Engine(EngineScoreMixin, EngineBase):
         assert isinstance(recv_req, RpcReqOutput)
         assert recv_req.success, recv_req.message
 
+    def suspend_checkpoint(self):
+        self.collective_rpc("suspend_checkpoint")
+
+    def resume_checkpoint(self):
+        self.collective_rpc("resume_checkpoint")
+
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)
 
