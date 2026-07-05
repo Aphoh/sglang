@@ -12,6 +12,9 @@ import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as parallel_state
 from sglang.srt.distributed.cpu_group_lifecycle import CpuGroupTransaction
+from sglang.srt.distributed.device_group_lifecycle import (
+    DefaultDeviceGroupTransaction,
+)
 
 
 def main() -> None:
@@ -94,9 +97,19 @@ def main() -> None:
         torch.testing.assert_close(graph_gather_output, expected, rtol=0, atol=0)
 
     replay(3)
-    transaction = CpuGroupTransaction([coordinator.cpu_group_lifecycle])
-    transaction.suspend()
-    transaction.resume()
+    cpu_transaction = CpuGroupTransaction(
+        [world.cpu_group_lifecycle, coordinator.cpu_group_lifecycle]
+    )
+    device_transaction = DefaultDeviceGroupTransaction(
+        [world, coordinator],
+        store_prefix="/tmp/sglang-device-world-test",
+        synchronize=lambda: torch.cuda.synchronize(device),
+    )
+    cpu_transaction.suspend()
+    device_transaction.suspend()
+    assert not dist.is_initialized()
+    device_transaction.resume()
+    cpu_transaction.resume()
     replay(7)
 
     coordinator.destroy()
