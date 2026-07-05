@@ -25,6 +25,7 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
@@ -35,6 +36,7 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
+import zmq
 from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
@@ -938,6 +940,25 @@ class Scheduler(
         self.attn_cp_group = get_attention_cp_group()
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+        self.checkpoint_lifecycle = None
+        if self.server_args.enable_criu_checkpoint:
+            from sglang.srt.distributed.checkpoint_lifecycle import (
+                CheckpointLifecycle,
+            )
+            from sglang.srt.distributed.parallel_state import (
+                get_torch_distributed_pg_options,
+                registered_groups,
+            )
+
+            self.checkpoint_lifecycle = CheckpointLifecycle(
+                registered_groups(),
+                store_prefix=self.server_args.criu_store_prefix,
+                pg_options_factory=get_torch_distributed_pg_options,
+                synchronize=lambda: torch.cuda.synchronize(self.device),
+            )
+        self._checkpoint_resume_path = Path(
+            f"{self.server_args.criu_store_prefix}.resume"
+        )
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
@@ -1535,10 +1556,14 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+            if self._poll_checkpoint_resume():
+                continue
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self._checkpoint_is_suspended():
+                continue
             if self._engine_paused:
                 continue
 
@@ -1574,10 +1599,14 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+            if self._poll_checkpoint_resume():
+                continue
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self._checkpoint_is_suspended():
+                continue
             if self._engine_paused:
                 continue
 
@@ -3821,6 +3850,67 @@ class Scheduler(
     def save_sharded_model(self, **kwargs):
         self.weight_updater.save_sharded_model(kwargs)
 
+    def suspend_checkpoint(self):
+        if self.checkpoint_lifecycle is None:
+            raise RuntimeError("CRIU checkpointing is not enabled")
+        if not self.is_fully_idle():
+            raise RuntimeError("checkpoint suspend requires an idle scheduler")
+        if torch.distributed.get_rank() == 0:
+            self._checkpoint_resume_path.unlink(missing_ok=True)
+        barrier()
+        self.checkpoint_lifecycle.suspend()
+
+    def resume_checkpoint(self):
+        if self.checkpoint_lifecycle is None:
+            raise RuntimeError("CRIU checkpointing is not enabled")
+        self.checkpoint_lifecycle.resume()
+        barrier()
+        if torch.distributed.get_rank() == 0:
+            self._checkpoint_resume_path.unlink(missing_ok=True)
+
+    def _checkpoint_is_suspended(self) -> bool:
+        if self.checkpoint_lifecycle is None:
+            return False
+        from sglang.srt.distributed.checkpoint_lifecycle import CheckpointState
+
+        return self.checkpoint_lifecycle.state is CheckpointState.SUSPENDED
+
+    def _poll_checkpoint_resume(self) -> bool:
+        if not self._checkpoint_is_suspended():
+            return False
+
+        request = None
+        socket = self.ipc_channels.recv_from_rpc
+        if socket is not None:
+            try:
+                request = socket.recv_pyobj(flags=zmq.NOBLOCK)
+            except zmq.Again:
+                pass
+            if request is not None and not (
+                isinstance(request, RpcReqInput)
+                and request.method == "resume_checkpoint"
+            ):
+                sock_send(
+                    socket,
+                    RpcReqOutput(
+                        success=False,
+                        message="only resume_checkpoint is accepted while suspended",
+                    ),
+                )
+                request = None
+            elif request is not None:
+                self._checkpoint_resume_path.touch()
+
+        if not self._checkpoint_resume_path.exists():
+            time.sleep(0.01)
+            return True
+        if request is None:
+            request = RpcReqInput(method="resume_checkpoint")
+        output = self.handle_rpc_request(request)
+        if socket is not None:
+            sock_send(socket, output)
+        return True
+
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests
         logger.info(
@@ -3840,7 +3930,8 @@ class Scheduler(
             exec = e
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
 
-        barrier()
+        if recv_req.method not in {"suspend_checkpoint", "resume_checkpoint"}:
+            barrier()
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
