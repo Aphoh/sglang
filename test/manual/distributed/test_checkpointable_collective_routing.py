@@ -11,10 +11,7 @@ import torch
 import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as parallel_state
-from sglang.srt.distributed.cpu_group_lifecycle import CpuGroupTransaction
-from sglang.srt.distributed.device_group_lifecycle import (
-    DefaultDeviceGroupTransaction,
-)
+from sglang.srt.distributed.checkpoint_lifecycle import CheckpointLifecycle
 
 
 def main() -> None:
@@ -97,19 +94,14 @@ def main() -> None:
         torch.testing.assert_close(graph_gather_output, expected, rtol=0, atol=0)
 
     replay(3)
-    cpu_transaction = CpuGroupTransaction(
-        [world.cpu_group_lifecycle, coordinator.cpu_group_lifecycle]
-    )
-    device_transaction = DefaultDeviceGroupTransaction(
+    checkpoint = CheckpointLifecycle(
         [world, coordinator],
         store_prefix="/tmp/sglang-device-world-test",
         synchronize=lambda: torch.cuda.synchronize(device),
     )
-    cpu_transaction.suspend()
-    device_transaction.suspend()
+    checkpoint.suspend()
     assert not dist.is_initialized()
-    device_transaction.resume()
-    cpu_transaction.resume()
+    checkpoint.resume()
     replay(7)
 
     coordinator.destroy()
