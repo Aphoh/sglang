@@ -16,6 +16,7 @@ _is_musa = is_musa()
 
 IS_CUSTOM_AR_AVAILABLE = _is_cuda or _is_hip or _is_musa
 IS_QUICK_AR_AVAILABLE = _is_hip
+IS_CUSTOM_AG_AVAILABLE = False
 
 try:
     import sgl_kernel.allreduce as _custom_ar
@@ -24,6 +25,43 @@ except ImportError as e:
         logger.warning("Failed to import from custom_ar with %r", e)
     IS_CUSTOM_AR_AVAILABLE = False
     IS_QUICK_AR_AVAILABLE = False
+
+if _is_cuda and IS_CUSTOM_AR_AVAILABLE:
+    IS_CUSTOM_AG_AVAILABLE = hasattr(_custom_ar, "custom_all_gather")
+
+    def custom_all_gather_workspace_size(max_bytes: int, world_size: int) -> int:
+        return _custom_ar.custom_all_gather_workspace_size(max_bytes, world_size)
+
+    def custom_all_gather_initialize(
+        anchor: torch.Tensor,
+        local_ptr: int,
+        max_bytes: int,
+        world_size: int,
+    ) -> None:
+        _custom_ar.custom_all_gather_initialize(
+            anchor, local_ptr, max_bytes, world_size
+        )
+
+    def custom_all_gather(
+        inp: torch.Tensor,
+        out: torch.Tensor,
+        ticket: torch.Tensor,
+        peer_ptrs: List[int],
+        rank: int,
+        max_bytes: int,
+    ) -> None:
+        _custom_ar.custom_all_gather(inp, out, ticket, peer_ptrs, rank, max_bytes)
+
+    def custom_all_gather_status(
+        anchor: torch.Tensor,
+        local_ptr: int,
+        max_bytes: int,
+        world_size: int,
+    ) -> List[int]:
+        return _custom_ar.custom_all_gather_status(
+            anchor, local_ptr, max_bytes, world_size
+        )
+
 
 # region IS_CUSTOM_AR_AVAILABLE
 
