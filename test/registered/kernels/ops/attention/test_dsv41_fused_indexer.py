@@ -3,9 +3,7 @@
 import unittest
 
 import torch
-from sglang.srt.layers.attention.dsv4.fused_indexer_splits import (
-    fused_indexer_splits,
-)
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -318,6 +316,10 @@ def _assert_case(
 
 class TestDSV41FusedIndexerSplits(CustomTestCase):
     def test_rhino_split_rule(self):
+        from sglang.kernels.ops.attention.dsv4.fused_indexer_sm100 import (
+            fused_indexer_splits,
+        )
+
         cases = [
             (1, 512, 148),
             (4, 64, 37),
@@ -394,3 +396,7 @@ class TestDSV41FusedIndexer(CustomTestCase):
             scores,
             expected_raw,
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

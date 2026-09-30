@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
@@ -60,7 +61,6 @@ class FullTopKIndexer:
         k_cache: torch.Tensor,
         metadata,
         out: Selection,
-        rows: slice | None = None,
     ) -> bool:
         """Return false for unsupported shapes."""
         if (
@@ -77,24 +77,24 @@ class FullTopKIndexer:
         ):
             return False
 
-        row_slice = slice(0, q_fp4.shape[0]) if rows is None else rows
-        q_fp4 = q_fp4[row_slice].reshape(-1, 32, 64)
-        q_sf = q_sf[row_slice]
+        num_rows = q_fp4.shape[0]
+        q_fp4 = q_fp4[:num_rows].reshape(-1, 32, 64)
+        q_sf = q_sf[:num_rows]
         if q_sf.ndim == 3 and q_sf.shape[1] == 1:
             q_sf = q_sf.squeeze(1)
         if q_sf.ndim != 2 or q_sf.shape[1] != 32:
             return False
-        weights = weights[row_slice]
+        weights = weights[:num_rows]
         lengths = metadata.compressed_seq_lens
         if lengths.ndim == 2 and lengths.shape[1] == 1:
             lengths = lengths.squeeze(1)
         if lengths.ndim != 1:
             return False
-        lengths = lengths[row_slice]
-        page_table = metadata.page_table[row_slice]
-        page_indices = out.page_indices[row_slice]
+        lengths = lengths[:num_rows]
+        page_table = metadata.page_table[:num_rows]
+        page_indices = out.page_indices[:num_rows]
         raw_indices = (
-            out.raw_indices[row_slice] if out.raw_indices is not None else None
+            out.raw_indices[:num_rows] if out.raw_indices is not None else None
         )
         if page_indices.shape[0] != q_fp4.shape[0]:
             return False

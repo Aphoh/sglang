@@ -1,9 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from ai-dynamo/rhino crates/models/rhino-model-deepseek-v4-kernels/kernels/dsv4p1_fused_indexer/fused_indexer.py
-"""DeepSeek V4.1 fused indexer for FP4 scoring and top-k selection.
+"""DeepSeek V4.1 fused indexer.
 
-The kernel scores paged keys and selects the best 512 tokens for each row.
+Score: Each tcgen05 block-scaled MMA scores one 128-token page. Each split
+selects the top 512 candidates in shared memory and writes them to an int64
+workspace.
+Merge: The kernel reduces split results, maps selected tokens through the page
+table, and writes them in ascending order. It fills unused outputs with -1.
+Numerics: ReLU output rounds to BF16, BF16-weight products round to BF16, sums
+use F32, scores round to BF16, and ties select the lower token.
 """
 
 from __future__ import annotations
@@ -23,9 +29,6 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.memory import SmemAllocator
 
 from sglang.kernels.jit.cute_aot_cache import get_jit_cache
-from sglang.srt.layers.attention.dsv4.fused_indexer_splits import (
-    fused_indexer_splits,
-)
 
 HEADS = 32
 HEAD_DIM = 128
@@ -1340,25 +1343,15 @@ def _compile_indexer(entrypoint: str, has_raw: bool):
     return _FUSED_INDEXER_CACHE[key]
 
 
+def fused_indexer_splits(rows: int, page_count: int, sm_count: int) -> int:
+    block_q = 1 if rows <= 128 else 4
+    ctas = max((rows + block_q - 1) // block_q, 1)
+    return min(max(sm_count // ctas, 1), max(page_count, 1))
+
+
 @functools.cache
 def _device_sm_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
-def _to_cute(
-    tensor: torch.Tensor,
-    *,
-    compact_dynamic_modes: tuple[int, ...] = (),
-    layout_dynamic_mode: int | None = None,
-):
-    from cutlass.cute.runtime import from_dlpack
-
-    result = from_dlpack(tensor, assumed_align=16)
-    for mode in compact_dynamic_modes:
-        result = result.mark_compact_shape_dynamic(mode=mode)
-    if layout_dynamic_mode is not None:
-        result = result.mark_layout_dynamic(layout_dynamic_mode)
-    return result
 
 
 def fused_indexer_topk(
@@ -1417,21 +1410,19 @@ def fused_indexer_topk(
         entrypoint, raw_indices is not None
     )
     compiled_score(
-        _to_cute(query, compact_dynamic_modes=(0,)),
-        _to_cute(query_scales, compact_dynamic_modes=(0,)),
-        _to_cute(weights, compact_dynamic_modes=(0,)),
-        _to_cute(cache, compact_dynamic_modes=(0,)),
-        _to_cute(lengths, compact_dynamic_modes=(0,)),
-        _to_cute(page_table, compact_dynamic_modes=(0, 1)),
-        _to_cute(partial, compact_dynamic_modes=(0, 1)),
+        query,
+        query_scales,
+        weights,
+        cache,
+        lengths,
+        page_table,
+        partial,
     )
     output_page_indices = page_indices[:rows]
     output_raw_indices = raw_indices[:rows] if raw_indices is not None else None
     compiled_merge(
-        _to_cute(partial, compact_dynamic_modes=(0, 1)),
-        _to_cute(page_table, compact_dynamic_modes=(0, 1)),
-        _to_cute(output_page_indices, layout_dynamic_mode=1),
-        _to_cute(output_raw_indices, layout_dynamic_mode=1)
-        if output_raw_indices is not None
-        else None,
+        partial,
+        page_table,
+        output_page_indices,
+        output_raw_indices,
     )

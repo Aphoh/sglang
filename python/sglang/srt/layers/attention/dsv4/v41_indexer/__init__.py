@@ -5,7 +5,7 @@ DeepGEMM sparse table (``sparse_table``) or dense block ids (``dense_blocks``)."
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 
@@ -103,7 +103,7 @@ def make_candidate_indexer(
     page_size: int,
     candidate_topk_blocks: int,
     candidate_block_size: int,
-) -> tuple[PrefillCandidates, DecodeCandidates]:
+) -> Tuple[PrefillCandidates, DecodeCandidates]:
     from sglang.srt.runtime_context import get_parallel
 
     from .dense_blocks import DenseBlocksBackend
