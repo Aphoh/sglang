@@ -26,7 +26,6 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.common import OperandMajorMode
 from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass.memory import SmemAllocator
 
 from sglang.kernels.jit.cute_aot_cache import get_jit_cache
 
@@ -511,7 +510,7 @@ def score_partial_kernel(
     splits = partial.shape[1]
     row0 = row_block * block_q
 
-    allocator = SmemAllocator()
+    allocator = utils.SmemAllocator()
     sA = allocator.allocate_tensor(
         cutlass.Float4E2M1FN,
         a_smem_layout.outer,
@@ -1110,7 +1109,7 @@ def merge_pages_kernel(
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane = cute.arch.lane_idx()
     lane_lt = cute.arch.lanemask_lt()
-    allocator = SmemAllocator()
+    allocator = utils.SmemAllocator()
     hist = allocator.allocate_tensor(
         cutlass.Int32, cute.make_layout((HIST_SLOTS,)), byte_alignment=16
     )
