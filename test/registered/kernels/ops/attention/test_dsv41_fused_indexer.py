@@ -254,7 +254,7 @@ def _raw_from_pages(
             device=page_indices.device,
         )
         inverse[case["page_table"][row].long()] = torch.arange(
-            case["page_table"].shape[1], device=page_indices.device
+            case["page_table"].shape[1], dtype=torch.int32, device=page_indices.device
         )
         valid = page_indices[row, :TOPK] >= 0
         mapped = page_indices[row, :TOPK][valid]

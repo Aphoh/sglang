@@ -1269,8 +1269,9 @@ _FUSED_INDEXER_CACHE = get_jit_cache("dsv41_fused_indexer", source_paths=(__file
 
 
 def _compile_indexer(entrypoint: str, has_raw: bool):
-    key = (entrypoint, has_raw)
-    if key not in _FUSED_INDEXER_CACHE:
+    score_key = (entrypoint, has_raw)
+    merge_key = ("merge_pages", has_raw)
+    if score_key not in _FUSED_INDEXER_CACHE or merge_key not in _FUSED_INDEXER_CACHE:
         rows = cute.sym_int()
         splits = cute.sym_int()
         pages = cute.sym_int()
@@ -1338,8 +1339,9 @@ def _compile_indexer(entrypoint: str, has_raw: bool):
             stream,
             options="--enable-tvm-ffi",
         )
-        _FUSED_INDEXER_CACHE[key] = compiled_score, compiled_merge
-    return _FUSED_INDEXER_CACHE[key]
+        _FUSED_INDEXER_CACHE[score_key] = compiled_score
+        _FUSED_INDEXER_CACHE[merge_key] = compiled_merge
+    return _FUSED_INDEXER_CACHE[score_key], _FUSED_INDEXER_CACHE[merge_key]
 
 
 def fused_indexer_splits(rows: int, page_count: int, sm_count: int) -> int:
