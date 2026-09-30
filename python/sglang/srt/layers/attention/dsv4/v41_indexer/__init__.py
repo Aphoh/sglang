@@ -5,7 +5,7 @@ DeepGEMM sparse table (``sparse_table``) or dense block ids (``dense_blocks``)."
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -72,6 +72,16 @@ def _use_deep_gemm_prefill() -> bool:
     )
 
 
+@functools.cache
+def _use_fused_indexer() -> bool:
+    from sglang.srt.environ import envs
+
+    return (
+        torch.cuda.get_device_capability()[0] == 10
+        and envs.SGLANG_DSV41_FUSED_INDEXER.get()
+    )
+
+
 def make_full_topk_indexer(
     *,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
@@ -82,6 +92,7 @@ def make_full_topk_indexer(
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
         use_deep_gemm_decode=is_sm100_or_newer(),
+        use_fused_indexer=_use_fused_indexer(),
     )
 
 
@@ -92,7 +103,7 @@ def make_candidate_indexer(
     page_size: int,
     candidate_topk_blocks: int,
     candidate_block_size: int,
-) -> Tuple[PrefillCandidates, DecodeCandidates]:
+) -> tuple[PrefillCandidates, DecodeCandidates]:
     from sglang.srt.runtime_context import get_parallel
 
     from .dense_blocks import DenseBlocksBackend
