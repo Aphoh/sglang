@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Protocol, TypeVar
+from typing import TYPE_CHECKING, Dict, List, Optional, Protocol, TypeVar
 
 import msgspec
 import torch
@@ -61,6 +61,9 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     # None when this forward's attention reads only the positions (sparse prefill).
     out_raw_indices: torch.Tensor
     out_page_indices: Optional[torch.Tensor]
+    # Per-batch memo of kv_page_table's expansions to the index-K page sizes,
+    # shared by the layers of one forward (see scoring.index_page_table_of).
+    index_tables: Optional[Dict] = None
 
     def reset_outputs(self) -> None:
         self.out_raw_indices.fill_(-1)

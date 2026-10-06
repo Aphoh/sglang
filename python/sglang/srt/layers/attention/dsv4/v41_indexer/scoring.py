@@ -4,7 +4,9 @@ a selection back into pool slots."""
 
 from __future__ import annotations
 
+import functools
 import itertools
+import math
 from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 
 import msgspec
@@ -15,12 +17,30 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     fp4_index_logits_decode,
     fp4_index_logits_paged,
 )
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_fused import (
+    BLOCK_PARTIAL_WIDTH,
+    CANDIDATE_BLOCKS,
+)
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_fused import HEADS as FUSED_HEADS
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_fused import (
+    INDEX_PAGE_SLOTS,
+    SLOT_PAGE,
+)
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_fused import TOPK as FUSED_TOPK
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_fused import (
+    fused_index_merge_blocks,
+    fused_index_merge_pages,
+    fused_index_score,
+    fused_index_splits,
+    fused_indexer_available,
+)
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
@@ -245,6 +265,166 @@ def dense_prefill_topk(
         )
         # Free this tile's logits before the generator scores the next one.
         del logits
+
+
+# ---------- fused ----------
+
+
+@functools.cache
+def _fused_prefill_min_rows() -> Optional[int]:
+    """Rows from which eager prefill takes the fused pass; None when it is off
+    or the device lacks the kernels."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_DSV41_FUSED_PREFILL_INDEXER.get():
+        return None
+    if not fused_indexer_available():
+        return None
+    return envs.SGLANG_DSV41_FUSED_PREFILL_INDEXER_MIN_ROWS.get()
+
+
+def use_fused_prefill(
+    data: DeepGEMMPrefillData,
+    *,
+    compress_ratio: int,
+    page_size: int,
+    index_page_size: int,
+    topk: int,
+    topk_blocks: int = 0,
+) -> bool:
+    """Whether the fused pass serves this chunk: enough rows for its one CTA per
+    row merge, the kernel's head count and selection widths, and index-K pages
+    of the kernel's size that tile the KV pages."""
+    min_rows = _fused_prefill_min_rows()
+    return (
+        min_rows is not None
+        and data.num_rows >= min_rows
+        and data.q_fp4.shape[1] == FUSED_HEADS
+        and topk == FUSED_TOPK
+        and topk_blocks in (0, CANDIDATE_BLOCKS)
+        and index_page_size == INDEX_PAGE_SLOTS
+        and (page_size // compress_ratio) % INDEX_PAGE_SLOTS == 0
+    )
+
+
+def index_page_table_of(
+    kv_page_table: torch.Tensor,
+    tables: Optional[dict],
+    *,
+    rows: int,
+    page_size: int,
+    compress_ratio: int,
+    index_page_size: int,
+) -> torch.Tensor:
+    """``kv_page_table[:rows]`` at ``index_page_size`` compressed positions per
+    entry, contiguous; ``tables`` (one dict per batch) memoizes it for the next
+    layer of the same ratio."""
+    key = (compress_ratio, index_page_size, rows)
+    if tables is not None and key in tables:
+        return tables[key]
+    table = expand_index_page_table(
+        kv_page_table[:rows],
+        full_page_size=page_size,
+        compress_ratio=compress_ratio,
+        index_page_size=index_page_size,
+    ).contiguous()
+    if tables is not None:
+        tables[key] = table
+    return table
+
+
+@functools.cache
+def _sm_count(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+_identity_pages_cache: dict = {}
+
+
+def _identity_pages(n: int, device: torch.device) -> torch.Tensor:
+    """``arange`` as a shared slot table, so the merge emits positions as they are."""
+    pages = _identity_pages_cache.get(device)
+    if pages is None or pages.numel() < n:
+        pages = torch.arange(max(n, 1 << 14), dtype=torch.int32, device=device)
+        _identity_pages_cache[device] = pages
+    return pages
+
+
+def fused_prefill_topk(
+    data: DeepGEMMPrefillData,
+    *,
+    k_cache: torch.Tensor,
+    kv_page_table: torch.Tensor,
+    page_size: int,
+    compress_ratio: int,
+    out_positions: torch.Tensor,
+    out_slots: Optional[torch.Tensor] = None,
+    topk_blocks: int = 0,
+    tables: Optional[dict] = None,
+) -> Optional[torch.Tensor]:
+    """Score the chunk against its paged index K and select in one pass:
+    request-local compressed positions into ``out_positions`` ``[>= rows, topk]``,
+    the same picks as pool slots into ``out_slots`` when given, and for a
+    candidate source the ``[rows, topk_blocks]`` block ids it returns; all
+    unordered, -1 padded. ``k_cache`` is the layer's index-K pool, one
+    ``INDEX_PAGE_SLOTS``-position page per row; ``kv_page_table`` ``[>= rows,
+    n]`` is at the KV ``page_size``."""
+    rows = data.num_rows
+    device = data.q_fp4.device
+    k_cache = k_cache.reshape(k_cache.shape[0], -1)
+    index_pages = index_page_table_of(
+        kv_page_table,
+        tables,
+        rows=rows,
+        page_size=page_size,
+        compress_ratio=compress_ratio,
+        index_page_size=INDEX_PAGE_SLOTS,
+    )
+    page_count = math.ceil(max(data.lens_per_request) / INDEX_PAGE_SLOTS)
+    splits = fused_index_splits(rows, page_count, sm_count=_sm_count(device))
+    partial = torch.empty(rows, splits, FUSED_TOPK, dtype=torch.int64, device=device)
+    block_partial = (
+        torch.empty(rows, splits, BLOCK_PARTIAL_WIDTH, dtype=torch.int64, device=device)
+        if topk_blocks
+        else None
+    )
+    fused_index_score(
+        q_fp4=data.q_fp4,
+        q_sf=data.q_sf,
+        weights=data.weights,
+        lengths=data.compress_lens,
+        page_table=index_pages,
+        k_cache=k_cache,
+        partial=partial,
+        block_partial=block_partial,
+        splits=splits,
+    )
+    fused_index_merge_pages(
+        partial=partial,
+        pages=_identity_pages(page_count * INDEX_PAGE_SLOTS // SLOT_PAGE, device),
+        table_width=0,
+        out=out_positions,
+    )
+    if out_slots is not None:
+        slot_pages = index_page_table_of(
+            kv_page_table,
+            tables,
+            rows=rows,
+            page_size=page_size,
+            compress_ratio=compress_ratio,
+            index_page_size=SLOT_PAGE,
+        )
+        fused_index_merge_pages(
+            partial=partial,
+            pages=slot_pages,
+            table_width=slot_pages.shape[1],
+            out=out_slots,
+        )
+    if block_partial is None:
+        return None
+    blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
+    fused_index_merge_blocks(block_partial=block_partial, out=blocks)
+    return blocks
 
 
 # ---------- torch ----------

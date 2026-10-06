@@ -16,12 +16,14 @@ from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_m
 from .scoring import (
     decode_scores,
     dense_prefill_topk,
+    fused_prefill_topk,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
     get_index_k_cache,
     prefill_requests,
     quantize_index_q,
     select_decode,
+    use_fused_prefill,
     write_prefill,
 )
 from .types import (
@@ -68,9 +70,27 @@ class FullTopKIndexer:
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return
-        kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-            inputs.layer_id, data.k_slots
-        )
+        pool = self.token_to_kv_pool
+        ratio = inputs.compress_ratio
+        if use_fused_prefill(
+            data,
+            compress_ratio=ratio,
+            page_size=pool.page_size,
+            index_page_size=pool.get_index_k_page_size(ratio),
+            topk=inputs.indexer.index_topk,
+        ):
+            fused_prefill_topk(
+                data,
+                k_cache=pool.get_index_k_with_scale_buffer(inputs.layer_id),
+                kv_page_table=inputs.kv_page_table,
+                page_size=pool.page_size,
+                compress_ratio=ratio,
+                out_positions=inputs.out_raw_indices,
+                out_slots=inputs.out_page_indices,
+                tables=inputs.index_tables,
+            )
+            return
+        kv = pool.get_low_ratio_index_k_fp4(inputs.layer_id, data.k_slots)
         dense_prefill_topk(data, kv, out=inputs.out_raw_indices[: data.num_rows])
         data.write_page_indices(inputs)
 

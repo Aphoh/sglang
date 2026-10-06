@@ -22,6 +22,13 @@ from .elementwise import (
     fused_q_norm_rope,
     fused_rope_inplace,
 )
+from .fp4_indexer_fused import (
+    fused_index_merge_blocks,
+    fused_index_merge_pages,
+    fused_index_score,
+    fused_index_splits,
+    fused_indexer_available,
+)
 from .fp8_wo_a import sglang_per_token_group_quant_fp8_dsv4_wo_a
 from .topk import (
     plan_topk_v2,
@@ -45,6 +52,11 @@ __all__ = [
     "fused_q_indexer_rope_hadamard_fp4_quant",
     "fused_q_indexer_rope_hadamard_quant",
     "fused_k_norm_rope_flashmla",
+    "fused_index_merge_blocks",
+    "fused_index_merge_pages",
+    "fused_index_score",
+    "fused_index_splits",
+    "fused_indexer_available",
     "sglang_per_token_group_quant_fp8_dsv4_wo_a",
     "make_name",
     "get_paged_mqa_logits_metadata",

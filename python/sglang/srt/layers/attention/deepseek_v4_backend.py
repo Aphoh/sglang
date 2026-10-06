@@ -399,6 +399,9 @@ class DSV4AttnMetadata:
 
     # Combined decode tables. Only the c4 tail and lens vary by layer.
     trtllm_swa_lens: Optional[torch.Tensor] = None
+    # page_table expanded to the index-K page sizes, built once per batch by the
+    # first low-ratio prefill indexer that needs it.
+    index_tables: Dict = field(default_factory=dict)
     trtllm_c4_indices: Optional[torch.Tensor] = None
     trtllm_c4_lens: Optional[torch.Tensor] = None
     trtllm_c128_indices: Optional[torch.Tensor] = None
@@ -3286,6 +3289,7 @@ class DeepseekV4AttnBackend(
             req_rows=req,
             req_pool_indices=forward_batch.req_pool_indices,
             kv_page_table=core.page_table,
+            index_tables=core.index_tables,
             seq_lens_cpu=_as_int_list(forward_batch.seq_lens_cpu),
             rows_per_request=rows_per_request,
             rows_per_request_device=rows_per_request_device,

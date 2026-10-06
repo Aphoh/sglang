@@ -29,16 +29,18 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_sparse,
 )
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
-from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 from sglang.srt.utils.common import async_h2d
 
 from .scoring import (
     DeepGEMMDecodeData,
     DeepGEMMPrefillData,
+    fused_prefill_topk,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
     get_index_k_cache,
+    index_page_table_of,
     score_tiles,
+    use_fused_prefill,
 )
 from .types import (
     CandidateMetadata,
@@ -123,20 +125,47 @@ class SparseTableBackend:
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return None
-        index_page_size = self.token_to_kv_pool.get_index_k_page_size(
-            inputs.compress_ratio
+        pool = self.token_to_kv_pool
+        ratio = inputs.compress_ratio
+        index_page_size = pool.get_index_k_page_size(ratio)
+        index_page_table = index_page_table_of(
+            inputs.kv_page_table,
+            inputs.index_tables,
+            rows=data.num_rows,
+            page_size=self.page_size,
+            compress_ratio=ratio,
+            index_page_size=index_page_size,
         )
+        if use_fused_prefill(
+            data,
+            compress_ratio=ratio,
+            page_size=self.page_size,
+            index_page_size=index_page_size,
+            topk=inputs.indexer.index_topk,
+            topk_blocks=self.topk_blocks,
+        ):
+            blocks = fused_prefill_topk(
+                data,
+                k_cache=pool.get_index_k_with_scale_buffer(inputs.layer_id),
+                kv_page_table=inputs.kv_page_table,
+                page_size=self.page_size,
+                compress_ratio=ratio,
+                out_positions=inputs.out_raw_indices,
+                out_slots=inputs.out_page_indices,
+                topk_blocks=self.topk_blocks,
+                tables=inputs.index_tables,
+            )
+            return publish_prefill_blocks(
+                data=data,
+                blocks=blocks,
+                index_page_table=index_page_table,
+                index_page_size=index_page_size,
+                topk_blocks=self.topk_blocks,
+            )
         table = publish_prefill_table(
             data=data,
-            kv=self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-                inputs.layer_id, data.k_slots
-            ),
-            index_page_table=expand_index_page_table(
-                inputs.kv_page_table[: data.num_rows],
-                full_page_size=self.page_size,
-                compress_ratio=inputs.compress_ratio,
-                index_page_size=index_page_size,
-            ).contiguous(),
+            kv=pool.get_low_ratio_index_k_fp4(inputs.layer_id, data.k_slots),
+            index_page_table=index_page_table,
             index_page_size=index_page_size,
             topk_blocks=self.topk_blocks,
             out_positions=inputs.out_raw_indices[: data.num_rows],
@@ -430,6 +459,30 @@ def publish_prefill_table(
         page_table=index_page_table,
         page_size=index_page_size,
         request_ids=_row_pair_ids(data.rows_per_request, device=device),
+        rows_per_request=data.rows_per_request,
+        q_dtype=data.q_fp4.dtype,
+        valid_lens=valid_lens,
+    )
+
+
+def publish_prefill_blocks(
+    *,
+    data: DeepGEMMPrefillData,
+    blocks: torch.Tensor,
+    index_page_table: torch.Tensor,
+    index_page_size: int,
+    topk_blocks: int,
+) -> _SparsePrefillTable:
+    """The chunk's table from block ids already selected (``[rows, topk_blocks]``
+    int32, unordered, -1 padded), as ``publish_prefill_table`` builds it from its
+    own."""
+    _, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)
+    return _build_prefill_table(
+        blocks=blocks,
+        compress_lens=data.compress_lens,
+        page_table=index_page_table,
+        page_size=index_page_size,
+        request_ids=_row_pair_ids(data.rows_per_request, device=blocks.device),
         rows_per_request=data.rows_per_request,
         q_dtype=data.q_fp4.dtype,
         valid_lens=valid_lens,

@@ -1600,6 +1600,12 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # DeepSeek-V4.1 ratio-1/2 eager prefill indexer on SM100: score and select in
+    # one fused CuTe DSL pass over the paged index K instead of the DeepGEMM dense
+    # logits tiles plus top-k, for chunks of at least MIN_ROWS query rows (the
+    # merge runs one CTA per row, so decode-sized chunks keep the DeepGEMM path).
+    SGLANG_DSV41_FUSED_PREFILL_INDEXER = EnvBool(True)
+    SGLANG_DSV41_FUSED_PREFILL_INDEXER_MIN_ROWS = EnvInt(128)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
