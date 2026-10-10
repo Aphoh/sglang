@@ -113,6 +113,10 @@ def fused_index_score(
     else:
         assert block_partial.shape == (rows, splits, BLOCK_PARTIAL_WIDTH)
         program = _program("candidates")
+    # The score entry can also run the merge of a single split itself
+    # (``fused``); this wrapper always merges separately, so the attention page
+    # table and the output are placeholders.
+    unused = partial.new_empty(2, dtype=torch.int32)
     # TMA extents are element counts, innermost first; strides in 16-byte units.
     program(
         _flat(q_fp4, torch.uint8),
@@ -134,9 +138,14 @@ def fused_index_score(
         _flat(page_table, torch.int32),
         _flat(partial, torch.int64),
         _flat(block_partial, torch.int64),
+        unused,
+        unused,
         rows,
         page_table.shape[1],
         splits,
+        0,  # attention_width
+        0,  # out_stride
+        0,  # fused
         math.ceil(rows / ROWS_PER_CTA) * splits,
         1,
         1,
