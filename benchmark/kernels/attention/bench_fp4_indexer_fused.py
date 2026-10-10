@@ -79,7 +79,9 @@ def main() -> None:
         def dense():
             dense_prefill_topk(data, case.kv, out=ref)
             data_slots = data.k_slots[(ref + data.request_starts[:, None]).clamp_min(0)]
-            torch.where(ref >= 0, data_slots.to(torch.int32), -1, out=slots)
+            torch.where(
+                ref >= 0, data_slots.to(torch.int32), slots.new_tensor(-1), out=slots
+            )
 
         def fused():
             fused_prefill_topk(
