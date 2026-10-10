@@ -56,6 +56,26 @@ def time_cuda(fn, iters: int) -> float:
     return statistics.median(times)
 
 
+def kernel_split(fn, iters: int) -> list:
+    """CUDA time per kernel name in microseconds, averaged over ``iters`` calls
+    of ``fn``, largest first."""
+    fn()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        for _ in range(iters):
+            fn()
+        torch.cuda.synchronize()
+    per_kernel = {}
+    for event in prof.events():
+        if event.device_type == torch.autograd.DeviceType.CUDA:
+            per_kernel[event.name] = (
+                per_kernel.get(event.name, 0.0) + event.device_time / iters
+            )
+    return sorted(per_kernel.items(), key=lambda item: -item[1])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=4096)
@@ -64,6 +84,12 @@ def main() -> None:
     )
     parser.add_argument("--ratio", type=int, default=2)
     parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument(
+        "--kernels",
+        type=int,
+        default=0,
+        help="also print the CUDA time of the N largest kernels of each path",
+    )
     args = parser.parse_args()
     tests = _load_test_module()
     print(f"rows={args.rows} ratio={args.ratio} device={torch.cuda.get_device_name()}")
@@ -99,6 +125,9 @@ def main() -> None:
         print(
             f"{cached:>8} {dense_us:>10.0f} {fused_us:>10.0f} {fused_us / dense_us:>12.3f}"
         )
+        for label, fn in (("dense", dense), ("fused", fused)):
+            for name, us in kernel_split(fn, args.iters)[: args.kernels]:
+                print(f"{'':>8} {label} {us:>8.0f} us  {name[:90]}")
         torch.cuda.empty_cache()
 
 
