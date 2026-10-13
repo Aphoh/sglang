@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import itertools
+import logging
 import math
 from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 
@@ -45,6 +46,8 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
 from .types import DecodeInputs, PrefillInputs
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
@@ -355,6 +358,23 @@ def _identity_pages(n: int, device: torch.device) -> torch.Tensor:
     return pages
 
 
+_fused_prefill_logged: set = set()
+
+
+def _log_fused_prefill_once(rows: int, positions: int, compress_ratio: int) -> None:
+    """One log line per compress ratio when the fused pass first serves a chunk."""
+    if compress_ratio in _fused_prefill_logged:
+        return
+    _fused_prefill_logged.add(compress_ratio)
+    logger.info(
+        "DeepSeek-V4.1 fused prefill indexer in use (ratio %d, first chunk %d rows, "
+        "%d positions)",
+        compress_ratio,
+        rows,
+        positions,
+    )
+
+
 def fused_prefill_topk(
     data: DeepGEMMPrefillData,
     *,
@@ -374,6 +394,7 @@ def fused_prefill_topk(
     unordered, -1 padded. ``k_cache`` is the layer's index-K pool, one
     ``INDEX_PAGE_SLOTS``-position page per row; ``kv_page_table`` ``[>= rows,
     n]`` is at the KV ``page_size``."""
+    _log_fused_prefill_once(data.num_rows, max(data.lens_per_request), compress_ratio)
     rows = data.num_rows
     device = data.q_fp4.device
     k_cache = k_cache.reshape(k_cache.shape[0], -1)
