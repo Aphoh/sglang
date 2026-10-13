@@ -1603,9 +1603,14 @@ class Envs:
     # DeepSeek-V4.1 ratio-1/2 eager prefill indexer on SM100: score and select in
     # one fused CuTe DSL pass over the paged index K instead of the DeepGEMM dense
     # logits tiles plus top-k, for chunks of at least MIN_ROWS query rows (the
-    # merge runs one CTA per row, so decode-sized chunks keep the DeepGEMM path).
+    # merge runs one CTA per row, so decode-sized chunks keep the DeepGEMM path)
+    # whose longest request scores at least MIN_POSITIONS compressed positions:
+    # below that the DeepGEMM pair is faster on B200 (fused/stock 1.3 at 32K
+    # positions, 1.17 at 64K, 0.93 at 128K, 0.79 at 256K); 96K positions is
+    # 192K tokens at compress ratio 2. Set MIN_POSITIONS=0 to fuse every chunk.
     SGLANG_DSV41_FUSED_PREFILL_INDEXER = EnvBool(True)
     SGLANG_DSV41_FUSED_PREFILL_INDEXER_MIN_ROWS = EnvInt(128)
+    SGLANG_DSV41_FUSED_PREFILL_INDEXER_MIN_POSITIONS = EnvInt(96 * 1024)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

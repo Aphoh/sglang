@@ -293,12 +293,17 @@ def use_fused_prefill(
     topk_blocks: int = 0,
 ) -> bool:
     """Whether the fused pass serves this chunk: enough rows for its one CTA per
-    row merge, the kernel's head count and selection widths, and index-K pages
-    of the kernel's size that tile the KV pages."""
+    row merge, a request long enough that fusing beats the DeepGEMM tiles plus
+    top-k, the kernel's head count and selection widths, and index-K pages of
+    the kernel's size that tile the KV pages."""
     min_rows = _fused_prefill_min_rows()
+    if min_rows is None or data.num_rows < min_rows:
+        return False
+    from sglang.srt.environ import envs
+
+    min_positions = envs.SGLANG_DSV41_FUSED_PREFILL_INDEXER_MIN_POSITIONS.get()
     return (
-        min_rows is not None
-        and data.num_rows >= min_rows
+        max(data.lens_per_request) >= min_positions
         and data.q_fp4.shape[1] == FUSED_HEADS
         and topk == FUSED_TOPK
         and topk_blocks in (0, CANDIDATE_BLOCKS)

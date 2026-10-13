@@ -21,12 +21,14 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_fused import (
     TOPK,
     fused_indexer_available,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
     DeepGEMMPrefillData,
     dense_prefill_topk,
     fused_prefill_topk,
     score_tiles,
+    use_fused_prefill,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -315,6 +317,26 @@ class TestFusedIndexer(CustomTestCase):
             f"{positions.ties} ties, blocks {blocks.rows_differing} rows / "
             f"{blocks.ties} ties"
         )
+
+    def test_min_positions_gate(self):
+        # the fused pass serves a chunk only when its longest request scores at
+        # least MIN_POSITIONS compressed positions; shorter chunks keep DeepGEMM
+        case = make_case([(256, 3000), (256, 20000)], ratio=2, seed=6)
+        longest = max(case.data.lens_per_request)
+        gate = dict(
+            compress_ratio=case.ratio,
+            page_size=PAGE_SIZE,
+            index_page_size=INDEX_PAGE_SLOTS,
+            topk=TOPK,
+        )
+        env = envs.SGLANG_DSV41_FUSED_PREFILL_INDEXER_MIN_POSITIONS
+        with env.override(longest + 1):
+            self.assertFalse(use_fused_prefill(case.data, **gate))
+        with env.override(longest):
+            self.assertTrue(use_fused_prefill(case.data, **gate))
+        with env.override(0):
+            self.assertTrue(use_fused_prefill(case.data, **gate))
+            self.assertFalse(use_fused_prefill(case.data, **{**gate, "topk": 256}))
 
     def test_candidate_source_short_context(self):
         # fewer blocks than the budget: every block is a candidate
