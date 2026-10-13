@@ -643,6 +643,7 @@ class DSV4AttnMetadata:
                 "trtllm_prefill_swa_lens",
                 "trtllm_prefill_c4_indices",
                 "trtllm_prefill_c128",
+                "index_tables",
             ],
         )
 
